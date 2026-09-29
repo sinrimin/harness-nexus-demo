@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Field, Note, Panel, PanelBody } from '@/components/kit';
 import { Brand } from '@/components/brand-mark';
+import { DemoStrip } from '@/components/demo-banner';
 
 /**
  * Create an account (P5, same pass as sign-in): panel material, the brand
@@ -64,7 +65,12 @@ export function RegisterPage() {
   const closed = registrationOpen === false;
 
   return (
-    <div className="bg-background flex min-h-svh flex-col items-center justify-center gap-6 p-4">
+    <>
+      {/* Demo overlay strip (fork builds) — pinned top like on the login page. */}
+      <div className="fixed inset-x-0 top-0 z-40">
+        <DemoStrip />
+      </div>
+      <div className="bg-background flex min-h-svh flex-col items-center justify-center gap-6 p-4">
       <Brand size={30} />
       <Panel className="w-full max-w-sm">
         <PanelBody variant="wide" className="flex flex-col gap-5">
@@ -125,5 +131,6 @@ export function RegisterPage() {
         </PanelBody>
       </Panel>
     </div>
+    </>
   );
 }

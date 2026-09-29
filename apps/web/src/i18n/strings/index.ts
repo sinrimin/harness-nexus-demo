@@ -23,6 +23,7 @@ import { machineDetailStrings } from './machineDetail.js';
 import { skillHubStrings } from './skillHub.js';
 import { chatStrings } from './chat.js';
 import { kitStrings } from './kit.js';
+import { demoStrings } from './demo.js';
 
 export const en = {
   common: commonStrings.en,
@@ -43,6 +44,7 @@ export const en = {
   skillHub: skillHubStrings.en,
   chat: chatStrings.en,
   kit: kitStrings.en,
+  demo: demoStrings.en,
 };
 
 export const zh: typeof en = {
@@ -64,6 +66,7 @@ export const zh: typeof en = {
   skillHub: skillHubStrings.zh,
   chat: chatStrings.zh,
   kit: kitStrings.zh,
+  demo: demoStrings.zh,
 };
 
 /** Dot-path union of every key in the English dictionary (e.g. `common.save`). */

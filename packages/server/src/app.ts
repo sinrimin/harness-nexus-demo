@@ -7,6 +7,7 @@ import { isAppError } from '@harness-nexus/shared';
 
 import type { ServerConfig } from './config.js';
 import { createStorage } from './infra/storage/index.js';
+import { seedDemo } from './demo-seed.js';
 import { createJwtService } from './infra/jwt.js';
 import { registerAuthHook, requireAuth, requireAdmin } from './plugins/auth.js';
 import { registerRealtime } from './plugins/realtime.js';
@@ -108,6 +109,9 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
   app.decorate('requireAdmin', requireAdmin);
   app.decorate('credentialEncryptionKey', config.credentialEncryptionKey);
   app.decorate('publicBaseUrl', config.publicBaseUrl);
+  // Demo overlay (the harness-nexus-demo fork only): claim the admin seat
+  // before any route can serve. Inert unless DEMO_MODE=true. See demo-seed.ts.
+  if (config.demoMode) await seedDemo(uow, app.log);
   // #23 D2 — posture aggregate cache behind the readout strip. Invalidated from
   // the realtime plugin on machine presence transitions.
   app.decorate('posture', new PostureCache(config.postureCacheTtlMs));

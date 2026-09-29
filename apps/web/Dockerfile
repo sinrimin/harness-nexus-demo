@@ -41,6 +41,15 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.base.json ./
 COPY packages/ packages/
 COPY apps/web/ apps/web/
+
+# Demo overlay build-time vars (demo branch; demo-images.yml passes them).
+# Defaults keep upstream builds banner-free — components/demo-banner.tsx
+# renders nothing unless VITE_DEMO_MODE=1.
+ARG VITE_DEMO_MODE=0
+ARG VITE_DEMO_REPO=""
+ARG VITE_GIT_SHA=""
+ENV VITE_DEMO_MODE=${VITE_DEMO_MODE} VITE_DEMO_REPO=${VITE_DEMO_REPO} VITE_GIT_SHA=${VITE_GIT_SHA}
+
 RUN pnpm --filter @harness-nexus/core run build \
  && pnpm --filter @harness-nexus/shared run build \
  && pnpm --filter @harness-nexus/sdk run build \

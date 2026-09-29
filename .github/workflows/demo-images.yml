@@ -1,0 +1,96 @@
+name: demo-images
+
+# Demo overlay builds (the `demo` branch only): the CI quartet first, then
+# the two images to GHCR — the public demo server pulls
+# ghcr.io/sinrimin/harness-nexus-demo-{server,web}. No registry secrets:
+# GITHUB_TOKEN + packages:write.
+#
+# The web build bakes the demo overlay (VITE_DEMO_MODE=1 + this repo's URL
+# and the exact commit SHA), so the banner links visitors to the very code
+# the site runs. After the FIRST push, flip both GHCR packages to public in
+# package settings (they default to private) or give the demo server a
+# read:packages token instead.
+
+on:
+  push:
+    branches: [demo]
+  workflow_dispatch:
+
+concurrency:
+  group: demo-images
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  verify-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20 # the documented engine floor
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm -r typecheck
+      - run: pnpm -r test
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- server image (same Dockerfile as upstream, demo overlay via env) --
+      - uses: docker/metadata-action@v5
+        id: meta-server
+        with:
+          images: ghcr.io/${{ github.repository }}-server
+          tags: |
+            type=raw,value=demo
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta-server.outputs.tags }}
+          labels: ${{ steps.meta-server.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- web image (demo overlay baked at build time) ----------------------
+      - uses: docker/metadata-action@v5
+        id: meta-web
+        with:
+          images: ghcr.io/${{ github.repository }}-web
+          tags: |
+            type=raw,value=demo
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            VITE_DEMO_MODE=1
+            VITE_DEMO_REPO=https://github.com/${{ github.repository }}
+            VITE_GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.meta-web.outputs.tags }}
+          labels: ${{ steps.meta-web.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

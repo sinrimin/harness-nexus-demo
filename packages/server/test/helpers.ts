@@ -37,6 +37,7 @@ export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     // lands inside the window; the expiry test waits past it.
     chatReconnectGraceMs: 2000,
     adaptersReportTimeoutMs: 400,
+    demoMode: false,
     ...overrides,
   };
 }

@@ -7,6 +7,7 @@ import { ThemeProvider } from '@/components/theme-provider';
 import { SkinProvider } from '@/components/skin-provider';
 import { Toaster } from '@/components/ui/sonner';
 import { AppShell } from '@/components/app-shell';
+import { DemoGate } from '@/components/demo-banner';
 import { ROUTES, routeById, type RouteId } from '@/nav';
 import { LoginPage } from '@/pages/Login';
 import { RegisterPage } from '@/pages/Register';
@@ -102,6 +103,9 @@ export function App() {
               </Routes>
             </BrowserRouter>
             <Toaster closeButton />
+            {/* Demo overlay (fork builds only): first-visit notice, mounted
+                above routing so it also covers the login/register pages. */}
+            <DemoGate />
           </AuthProvider>
         </SkinProvider>
       </ThemeProvider>

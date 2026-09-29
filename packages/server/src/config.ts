@@ -110,6 +110,12 @@ export interface ServerConfig {
    * aggregated-endpoint + PAT-env output (the no-`hnx` fallback).
    */
   emitterMode: 'client' | 'server';
+  /**
+   * Demo overlay (the harness-nexus-demo fork only): claim the admin seat at
+   * boot with a disabled seeded account, so no public-demo registrant can
+   * ever bootstrap into admin. See demo-seed.ts and DEMO.md.
+   */
+  demoMode: boolean;
 }
 
 export class ConfigError extends Error {
@@ -188,5 +194,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     chatReconnectGraceMs: Number(env.CHAT_RECONNECT_GRACE_MS ?? '8000'),
     chatIdleTtlMs: Number(env.CHAT_IDLE_TTL_MS ?? '0'),
     emitterMode: (env.EMITTER_MODE as ServerConfig['emitterMode']) ?? 'client',
+    demoMode: env.DEMO_MODE === 'true',
   };
 }

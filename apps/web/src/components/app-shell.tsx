@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '@/auth';
 import { useI18n } from '@/i18n';
 import { Brand } from '@/components/brand-mark';
+import { DemoStrip } from '@/components/demo-banner';
 import { MobileNav } from '@/components/mobile-nav';
 import { UserBlock } from '@/components/user-block';
 import { Plate } from '@/components/shell/plate';
@@ -84,6 +85,8 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* Content column — the only column that scrolls (or, for `panes` pages,
           the column that holds panes which scroll themselves). */}
       <div className="flex min-w-0 flex-1 flex-col">
+        {/* Demo overlay strip (fork builds only) — above everything in-app. */}
+        <DemoStrip />
         <Topbar
           route={route}
           isAdmin={isAdmin}
