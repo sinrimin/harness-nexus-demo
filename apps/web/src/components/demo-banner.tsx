@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useI18n } from '@/i18n';
 import { Button } from '@/components/ui/button';
 import {
@@ -20,6 +20,8 @@ const DEMO = import.meta.env.VITE_DEMO_MODE === '1';
 const REPO = import.meta.env.VITE_DEMO_REPO ?? '';
 const SHA = import.meta.env.VITE_GIT_SHA ?? '';
 const ACK_KEY = 'hnx.demo-ack';
+/** Reopen signal: the strip's 详情 button wakes the first-visit modal. */
+const NOTICE_EVENT = 'hnx:demo-notice';
 
 function repoUrl(): string {
   return SHA ? `${REPO}/tree/${SHA}` : REPO;
@@ -43,6 +45,13 @@ export function DemoStrip() {
       className="flex flex-wrap items-center gap-x-3 gap-y-0.5 border-b bg-background px-4 py-1.5 text-xs text-muted-foreground"
     >
       <span className="font-medium text-foreground">{t('demo.strip')}</span>
+      <button
+        type="button"
+        onClick={() => window.dispatchEvent(new CustomEvent(NOTICE_EVENT))}
+        className="text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground"
+      >
+        {t('demo.details')}
+      </button>
       {REPO ? (
         <a
           href={repoUrl()}
@@ -64,6 +73,12 @@ export function DemoGate() {
   const [open, setOpen] = useState(
     DEMO && typeof localStorage !== 'undefined' && !localStorage.getItem(ACK_KEY),
   );
+  useEffect(() => {
+    if (!DEMO) return;
+    const onNotice = () => setOpen(true);
+    window.addEventListener(NOTICE_EVENT, onNotice);
+    return () => window.removeEventListener(NOTICE_EVENT, onNotice);
+  }, []);
   if (!DEMO) return null;
   const ack = () => {
     try {

@@ -2,6 +2,7 @@
 const en = {
   strip: 'Public demo · data resets daily · use throwaway credentials · open code',
   stripLink: 'view code',
+  details: 'details',
   modalTitle: 'Public demo instance',
   modalP1: 'This is the public demo of Harness Nexus — anyone can register and explore.',
   modalP2:
@@ -15,6 +16,7 @@ const en = {
 const zh: typeof en = {
   strip: '公开演示 · 数据每日清空 · 推荐一次性凭据 · 代码可查',
   stripLink: '查看代码',
+  details: '详情',
   modalTitle: '公开演示实例',
   modalP1: '这里是 Harness Nexus 的公开演示，任何人都可以注册体验。',
   modalP2:
