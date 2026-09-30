@@ -22,10 +22,22 @@ compare the branches: `main...demo` (or on GitHub, compare `main` … `demo`).
   first-visit notice and the always-on strip, and every link leads back to
   the commit the site is running.
 
-## Staying current
+## Upgrade policy (set 2026-09-30)
+
+The demo tracks **releases only** — never upstream `main`:
+
+1. The `demo` branch merges an upstream `vX.Y.Z` tag and nothing else.
+   Between releases the demo stays put, whatever lands on main.
+2. The demo server's daily-reset cron runs `docker compose pull` +
+   `--force-recreate` on the server/web services: the morning after a
+   release-merge lands here, the site is already on the new image — no
+   manual deploy step, and the memory wipe happens either way.
+
+After a release tag is pushed upstream:
 
 ```bash
-git fetch upstream
-git checkout main && git merge --ff-only upstream/main && git push origin main
-git checkout demo && git merge main && git push origin demo   # CI rebuilds
+git fetch upstream --tags
+git checkout main && git merge --ff-only vX.Y.Z && git push origin main
+git checkout demo && git merge main && git push origin demo   # CI rebuilds; :demo moves
 ```
+
