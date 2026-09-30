@@ -1,5 +1,5 @@
 import type { Socket } from 'socket.io-client';
-import { spawn } from 'node:child_process';
+import { spawn } from '../proc.js';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import {
   type JobView,
   type MarketplaceDeployArm,
 } from '@harness-nexus/shared';
+import { logOp } from './logbook.js';
 
 /**
  * claude-code marketplace deploy executor (#6).
@@ -68,6 +69,13 @@ export async function runMarketplaceDeploy(
   };
   const result = (ok: boolean, extra: { error?: string; data?: unknown }): void => {
     socket.emit('job:result', { jobId: job.id, ok, ...extra });
+    // #38 — CC plugin deploys ride CC's own CLI; the trail records what ran.
+    logOp({
+      op: 'cc-marketplace-deploy',
+      target: 'claude-code',
+      outcome: ok ? 'ok' : 'error',
+      ...(extra.error !== undefined ? { detail: extra.error } : {}),
+    });
   };
 
   // No trailing-slash games: PUBLIC_BASE_URL is normalized server-side, but a
@@ -169,7 +177,10 @@ async function runClaude(
     try {
       // Inherit the daemon's environment: NODE_EXTRA_CA_CERTS (self-signed
       // marketplace origins) and proxy vars must reach the claude CLI.
-      child = spawn('claude', args, { env: opts.env ?? process.env });
+      child = spawn('claude', args, {
+        env: opts.env ?? process.env,
+        windowsHide: true, // #33 — no console window on Windows
+      });
     } catch (e) {
       resolve({ ok: false, tail: e instanceof Error ? e.message : String(e) });
       return;

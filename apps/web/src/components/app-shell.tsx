@@ -6,6 +6,7 @@ import { Brand } from '@/components/brand-mark';
 import { DemoStrip } from '@/components/demo-banner';
 import { MobileNav } from '@/components/mobile-nav';
 import { UserBlock } from '@/components/user-block';
+import { VersionLine } from '@/components/version-line';
 import { Plate } from '@/components/shell/plate';
 import { Spine } from '@/components/shell/spine';
 import { Topbar } from '@/components/shell/topbar';
@@ -77,6 +78,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
           <Plate activeRouteId={route?.id} isAdmin={isAdmin} posture={posture} />
           <div className="shrink-0 p-2.5">
+            {/* #37 — build version, the plate foot's quiet first line. */}
+            <VersionLine />
             <UserBlock />
           </div>
         </aside>

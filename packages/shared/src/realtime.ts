@@ -49,10 +49,23 @@ export const machineHelloSchema = z.object({
 export const machineHelloAckSchema = z.object({
   proto: z.number().int().min(1),
   machineId: z.string().min(1),
+  /** #37 — the server build version, so an older daemon can warn locally. */
+  serverVersion: z.string().min(1).max(64).optional(),
 });
 
 /** Ack error shape for any malformed event (`proto:invalid`). */
 export const protoErrorAckSchema = z.object({ error: z.string().min(1) });
+
+/**
+ * #45 — server → daemon, fatal. A second live daemon socket for this machine
+ * connected (bypassed/deleted lock): the newcomer is being refused, or — via
+ * this event — told to stand down because it lost the connection race. Every
+ * room broadcast reaches every socket, so two sockets mean prompts AND
+ * dispatched jobs run twice; the daemon exits on this event.
+ */
+export const ctlDuplicateEventSchema = z.object({
+  reason: z.literal('machine-already-connected'),
+});
 
 // ---- /app events (C1) ----
 
@@ -553,6 +566,20 @@ export const chatStreamEventSchema = z.discriminatedUnion('kind', [
     inputTokens: z.number().int().min(0).optional(),
     outputTokens: z.number().int().min(0).optional(),
     /**
+     * #39 — prompt-cache accounting, normalized from the per-target dialects
+     * (Anthropic cache_creation/cache_read, deepseek prompt_cache_hit, …) by
+     * the daemon. Optional because not every target reports them: a consumer
+     * must treat absence as "unknown", never zero.
+     */
+    cacheReadTokens: z.number().int().min(0).optional(),
+    cacheWriteTokens: z.number().int().min(0).optional(),
+    /**
+     * #44 — session-CUMULATIVE spend from `usage_update.cost.amount` (the
+     * ACP session-usage RFD defines cost as cumulative session state). The
+     * daemon converts to increments before accounting; absent = unknown.
+     */
+    costUsd: z.number().min(0).optional(),
+    /**
      * dsh's ACP adapter reports CONTEXT OCCUPANCY instead of per-turn token
      * counts (`used` / `size` on its usage_update) — surfaced verbatim for
      * the turn tail's "ctx 8.5k/262k" readout.
@@ -591,6 +618,24 @@ export const chatStreamEventSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('turn_result'),
     stopReason: z.enum(['end_turn', 'cancelled', 'max_tokens', 'refusal']),
+    /**
+     * #44 — per-turn token usage, read off the agent's `session/prompt`
+     * RESPONSE (the carrier the ACP end-turn-token-usage RFD proposes for
+     * v1). Optional: adapters whose response carries no usage report through
+     * `usage` events instead (dsh/pi), or not at all (codex on the wire
+     * today). Cumulative-vs-per-turn is a per-adaptor dialect — consumers
+     * must not assume either without knowing the source.
+     */
+    usage: z
+      .object({
+        inputTokens: z.number().int().min(0).optional(),
+        outputTokens: z.number().int().min(0).optional(),
+        cacheReadTokens: z.number().int().min(0).optional(),
+        cacheWriteTokens: z.number().int().min(0).optional(),
+        thoughtTokens: z.number().int().min(0).optional(),
+        totalTokens: z.number().int().min(0).optional(),
+      })
+      .optional(),
   }),
   z.object({ kind: z.literal('session_status'), state: z.enum(['active', 'idle']) }),
   // #10 — the live Sender's send queue (SERVER-owned, depth 1). Emitted by
@@ -1027,6 +1072,7 @@ export type ChatChannelsPush = z.infer<typeof chatChannelsPushSchema>;
 
 export type CtlHandshakeAuth = z.infer<typeof ctlHandshakeAuthSchema>;
 export type AppHandshakeAuth = z.infer<typeof appHandshakeAuthSchema>;
+export type CtlDuplicateEvent = z.infer<typeof ctlDuplicateEventSchema>;
 export type MachineHello = z.infer<typeof machineHelloSchema>;
 export type MachineHelloAck = z.infer<typeof machineHelloAckSchema>;
 export type MachineStatusEvent = z.infer<typeof machineStatusEventSchema>;

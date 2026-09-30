@@ -1,6 +1,6 @@
 {
   "name": "@harness-nexus/shared",
-  "version": "0.1.0-alpha.7",
+  "version": "0.1.0-alpha.8",
   "description": "Shared JSON schemas, validation, and utilities for Harness Nexus packages.",
   "type": "module",
   "main": "./dist/index.js",
@@ -9,7 +9,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"

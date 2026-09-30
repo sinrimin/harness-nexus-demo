@@ -19,6 +19,8 @@ let jwt: string;
 let machineId: string;
 let machineToken: string;
 let daemon: Socket;
+/** #45 — tracks whether `daemon` is still connected (serializes connectDaemon). */
+let daemonConnected = false;
 let appSock: Socket;
 const jobUpdates: JobUpdateEvent[] = [];
 
@@ -80,6 +82,14 @@ async function connectDaemon(
   beforeConnect?: (sock: Socket) => void,
   capabilities: string[] = ['inventory', 'deploy'],
 ): Promise<Socket> {
+  // #45 — the server refuses a second live socket per machine, so the suite
+  // keeps EXACTLY ONE daemon socket at a time: connecting first closes (and
+  // waits out) any previous one; `daemon` always aliases the live socket.
+  if (daemonConnected) {
+    daemon.close();
+    await waitFor(() => !app.realtime.presence.isOnline(machineId));
+    daemonConnected = false;
+  }
   const sock = io(`${baseUrl}/ctl`, {
     auth: { token: machineToken, machineId },
     transports: ['websocket'],
@@ -90,6 +100,8 @@ async function connectDaemon(
     daemonVersion: '0.3.0-test',
     capabilities,
   });
+  daemon = sock;
+  daemonConnected = true;
   return sock;
 }
 
@@ -294,6 +306,13 @@ describe('recovery', () => {
 
   it('ack-timeout sweep reverts a dispatched job the daemon never started', async () => {
     // A daemon that acks nothing: dispatch, then don't run the job.
+    // #45 — one live socket per machine: drop the tracked daemon first, then
+    // this bespoke silent one is the machine's only daemon.
+    if (daemonConnected) {
+      daemon.close();
+      await waitFor(() => !app.realtime.presence.isOnline(machineId));
+      daemonConnected = false;
+    }
     const silent = io(`${baseUrl}/ctl`, {
       auth: { token: machineToken, machineId },
       transports: ['websocket'],
@@ -311,8 +330,6 @@ describe('recovery', () => {
         payload: { profileId: deployProfileId },
       });
       const job = created.json().job as JobView;
-      // daemon (main) may also be in the room; close it so only `silent` hears.
-      daemon.close();
       const heard = await once(silent, 'job:dispatch');
       expect((heard as { job: JobView }).job.id).toBe(job.id);
       // No progress arrives → sweep reverts after ackTimeout (700ms).
@@ -374,7 +391,7 @@ describe('gates', () => {
     expect(res.json().error).toBe('DAEMON_NO_HARNESS');
   });
 
-  it('harness job is owner-only — an admin may view the machine but not run installers', async () => {
+  it('harness job is owner-only — an admin does not even see the machine (#36)', async () => {
     // Make the requesting user an admin (bootstrap 'root' already is — so use
     // a second user owning a second machine, and have root (admin) try).
     const reg = await app.inject({
@@ -390,22 +407,23 @@ describe('gates', () => {
       payload: { name: 'harness-box' },
     });
     const otherMachine = enroll.json().machine.id;
-    // Admin CAN read the machine (existence visible to admins)…
+    // The admin cannot read the machine (404, no existence leak)…
     const view = await app.inject({
       method: 'GET',
       url: `/api/machines/${otherMachine}`,
       headers: authed(jwt),
     });
-    expect(view.statusCode).toBe(200);
-    // …but a harness job is a mutation on someone else's machine → 403.
+    expect(view.statusCode).toBe(404);
+    // …so the job route hides it too — the harness branch is unreachable for
+    // a non-owner, no 403 needed anymore.
     const res = await app.inject({
       method: 'POST',
       url: `/api/machines/${otherMachine}/jobs`,
       headers: authed(jwt),
       payload: { type: 'harness', action: 'install', target: 'codex' },
     });
-    expect(res.statusCode).toBe(403);
-    expect(res.json().error).toBe('MACHINE_OWNER_ONLY');
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe('MACHINE_NOT_FOUND');
     // The owner would be allowed — but the daemon is offline, so it queues
     // (capability is only knowable once the daemon says hello).
     const ownerRes = await app.inject({
@@ -608,10 +626,10 @@ describe('claude-code marketplace deploy (#6)', () => {
     expect(unknown.statusCode).toBe(404);
   });
 
-  it("a foreign personal claude-code profile is not in the owner's marketplace → 409", async () => {
-    // alice's personal profile; root (admin) can SEE it, but the machine's
-    // marketplace belongs to the machine owner (root) — alice's profile is
-    // not in that catalog, so the deploy must refuse up front.
+  it("a foreign personal claude-code profile is not in the owner's marketplace → 404", async () => {
+    // alice's personal profile is invisible to root (admin included, #36) —
+    // and the machine's marketplace belongs to the machine owner (root), so
+    // alice's profile could never deploy there anyway.
     const reg = await app.inject({
       method: 'POST',
       url: '/api/auth/register',
@@ -630,8 +648,8 @@ describe('claude-code marketplace deploy (#6)', () => {
       headers: authed(jwt),
       payload: { profileId: profile.json().profile.id },
     });
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe('PROFILE_NOT_IN_OWNER_MARKETPLACE');
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe('PROFILE_NOT_FOUND');
   });
 
   it('PATCH /api/profiles/:id ignores client versions; entry changes are the publish switch (#18)', async () => {

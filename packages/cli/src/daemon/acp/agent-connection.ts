@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
+import { spawn } from '../../proc.js';
 import { createInterface } from 'node:readline';
-import { groupIsAlive } from '../adapter-ledger.js';
+import { groupIsAlive, groupSignalTarget } from '../adapter-ledger.js';
 
 /**
  * Minimal ACP client over a subprocess's stdio (Phase 8 C5) — JSON-RPC 2.0,
@@ -185,11 +186,18 @@ export class AcpAgentConnection implements AgentConnection {
         cwd: opts.cwd,
         env: { ...process.env, ...(opts.env ?? {}) },
         stdio: ['pipe', 'pipe', 'pipe'],
+        // #33: no console window per child on Windows (each session spawn
+        // otherwise pops one up on the user's desktop).
+        windowsHide: true,
         // Own process group: adapters spawn their own trees (npm → sh →
         // wrapper → the vendor binary). Signaling only the direct child
         // orphaned the grandchildren — a bare `claude` binary survived every
         // teardown, parented to init. kill() takes the whole group down.
-        detached: true,
+        // POSIX-only: kill(-pgid) has no Windows equivalent (it just throws
+        // into the catch), and detaching there only detaches the console —
+        // grandchildren then get auto-allocated VISIBLE consoles (#35).
+        // Attached on win32, the tree inherits the daemon's console.
+        detached: process.platform !== 'win32',
       });
     } catch (e) {
       throw new Error(`failed to spawn ACP adapter '${command}': ${errText(e)}`);
@@ -335,7 +343,9 @@ export class AcpAgentConnection implements AgentConnection {
     const sigGroup = (sig: NodeJS.Signals): void => {
       if (pid === undefined) return;
       try {
-        process.kill(-pid, sig); // negative pid = the process group
+        // Negative pid = the process group on POSIX; the bare leader on
+        // win32 (#42 — no process groups there, -pid just throws).
+        process.kill(groupSignalTarget(pid), sig);
       } catch {
         // group already gone
       }

@@ -35,6 +35,7 @@ import {
   workspaceListEventSchema,
 } from '@harness-nexus/shared';
 import { hashToken, PAT_PREFIX, generateId } from '../infra/crypto.js';
+import { serverVersion } from '../version.js';
 import { MachinePresence } from '../realtime/presence.js';
 import { InventoryCoordinator } from '../realtime/inventory.js';
 import { ConfigViewerCoordinator } from '../realtime/config-viewer.js';
@@ -52,8 +53,10 @@ import { JobService } from '../jobs/service.js';
  * One bidirectional namespace per client role (wiki design-phase-8-client.md):
  *   /ctl — daemon, authenticated by a machine PAT (scopes ['machine-ctl'])
  *          whose PAT record must map to the claimed machineId.
- *   /app — browser, authenticated by JWT or api PAT; joins `user:<id>`
- *          (+ `admins` for admins) and receives `machine:status` pushes.
+ *   /app — browser, authenticated by JWT or api PAT; joins `user:<id>` and
+ *          receives `machine:status` pushes (its owner's machines only — #36
+ *          removed the `admins` fan-out room: no role sees another tenant's
+ *          machines).
  *
  * Machine tokens are rejected by the REST auth hook, so their blast radius is
  * exactly this channel.
@@ -75,7 +78,7 @@ export interface RealtimeService {
   sessions: SessionsCoordinator;
   /** Adapter-report waiters (Phase 9 W11 C machine panel). */
   adapters: AdaptersReportCoordinator;
-  /** Push a machine's presence change to its owner (+ admins) on /app. */
+  /** Push a machine's presence change to its owner on /app. */
   broadcastStatus(machine: Machine, online: boolean): void;
   /** Force-drop a machine's daemon sockets (revoke) and push offline if it was online. */
   disconnectMachine(machine: Machine): void;
@@ -155,7 +158,7 @@ export async function registerRealtime(
         app.io.of('/ctl').to(`machine:${job.machineId}`).emit('job:dispatch', { job });
       },
       update: (job: JobView) => {
-        appNs.to([`user:${job.ownerId}`, 'admins']).emit('job:update', { job });
+        appNs.to(`user:${job.ownerId}`).emit('job:update', { job });
       },
     },
     {
@@ -186,9 +189,7 @@ export async function registerRealtime(
     sessions,
     adapters,
     broadcastStatus(machine, online) {
-      appNs
-        .to([`user:${machine.ownerId}`, 'admins'])
-        .emit('machine:status', statusEvent(machine, online));
+      appNs.to(`user:${machine.ownerId}`).emit('machine:status', statusEvent(machine, online));
     },
     disconnectMachine(machine) {
       const wasOnline = presence.forceOffline(machine.id);
@@ -228,6 +229,15 @@ export async function registerRealtime(
     const machine = await app.uow.machines.findByEnrollmentPatId(record.id);
     if (!machine || machine.id !== machineId) return next(new Error('machine mismatch'));
 
+    // #45 — one daemon per machine, enforced HERE (the pid lock is advisory
+    // and deletable). A second live socket would receive every room
+    // broadcast: prompts would bill N× and dispatched jobs would run N×. The
+    // NEWCOMER is refused — first-come stays; a genuine restart drops its old
+    // socket before reconnecting, and a transport blip recovers once the
+    // stale socket times out (the client retries connect_error with backoff).
+    const existing = await ctl.in(`machine:${machine.id}`).fetchSockets();
+    if (existing.length > 0) return next(new Error('machine already connected'));
+
     socket.data.machineId = machine.id;
     next();
   });
@@ -247,6 +257,28 @@ export async function registerRealtime(
     app.posture.invalidate();
 
     void (async () => {
+      // #45 second fence — two sockets can both pass the middleware when
+      // they arrive in the same tick (each saw an empty room). Whoever lost
+      // the race is told to stand down. Presence is un-registered BEFORE the
+      // disconnect (the handler's first line then finds nothing and returns),
+      // so the keeper's channels are not reaped as if the daemon left, and the
+      // teardown is delayed one beat so the `ctl:duplicate` event flushes.
+      const others = (await ctl.in(`machine:${machineId}`).fetchSockets()).filter(
+        (s) => s.id !== socket.id,
+      );
+      if (others.length > 0) {
+        app.log.warn(
+          { machineId, socketId: socket.id, kept: others[0]?.id },
+          'duplicate /ctl socket refused post-handshake',
+        );
+        socket.emit('ctl:duplicate', { reason: 'machine-already-connected' });
+        presence.disconnected(socket.id);
+        const doomed = socket;
+        const t = setTimeout(() => doomed.disconnect(true), 100);
+        t.unref();
+        return;
+      }
+
       const machine = await app.uow.machines.findById(machineId);
       if (!machine) {
         // Deleted between handshake and connection — drop immediately (the
@@ -292,7 +324,7 @@ export async function registerRealtime(
           arch: hello.arch ?? machine.arch,
           capabilities: hello.capabilities,
         });
-        ack?.({ proto: REALTIME_PROTO_VERSION, machineId });
+        ack?.({ proto: REALTIME_PROTO_VERSION, machineId, serverVersion: serverVersion() });
       })();
     });
 
@@ -330,10 +362,7 @@ export async function registerRealtime(
           target: row.target,
           reportedAt: row.reportedAt,
         };
-        app.io
-          .of('/app')
-          .to([`user:${machine.ownerId}`, 'admins'])
-          .emit('inventory:updated', event);
+        app.io.of('/app').to(`user:${machine.ownerId}`).emit('inventory:updated', event);
         ack?.({ stored: true });
         // Detected-instance sync is idempotent and eventually consistent —
         // never block the report path (or its ack) on it.
@@ -542,7 +571,6 @@ export async function registerRealtime(
 
   app.io.of('/app').on('connection', (socket: Socket) => {
     void socket.join(`user:${socket.data.userId as string}`);
-    if (socket.data.role === 'admin') void socket.join('admins');
     // 9 W11 B — fresh /app sockets get the live-channel snapshot immediately
     // (the tab bar's initial paint; later changes arrive as pushes).
     realtime.chat.sendSnapshot(socket.data.userId as string);

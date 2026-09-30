@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { resolve as resolvePath } from 'node:path';
+import { normalizeWorkspacePath, isWithinWorkspace } from '../paths.js';
 import type { FastifyInstance } from 'fastify';
 import {
   AppError,
@@ -9,8 +9,8 @@ import {
 
 /**
  * Workspace directory listing (Phase 9 W6) — one level of subdirectories
- * under the machine's base workspace, for the chat session picker. Owner-or-
- * admin read with 404-hiding (same convention as the other machine routes);
+ * under the machine's base workspace, for the chat session picker. Owner-only
+ * read with 404-hiding (#36 — same convention as the other machine routes);
  * listing rides the daemon (`workspace:list` over /ctl), so the machine must
  * be online and advertise the `workspace` capability. Containment (the
  * requested path must BE the root or sit under it) is enforced HERE, before
@@ -24,7 +24,7 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
     guard,
     async (req) => {
       const machine = await app.uow.machines.findById(req.params.id);
-      if (!machine || (machine.ownerId !== req.user!.id && req.user!.role !== 'admin')) {
+      if (!machine || machine.ownerId !== req.user!.id) {
         throw new AppError('Machine not found', 404, 'MACHINE_NOT_FOUND');
       }
       if (machine.baseWorkspace === null) {
@@ -35,11 +35,14 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
-      const root = resolvePath(machine.baseWorkspace);
-      const requested = resolvePath(
+      // #33: normalize WITHOUT the server's own filesystem semantics — the
+      // path belongs to the (possibly Windows) machine, and a Linux server's
+      // resolve() would garble `D:\code` into `/app/D:\code`.
+      const root = normalizeWorkspacePath(machine.baseWorkspace);
+      const requested = normalizeWorkspacePath(
         req.query.path && req.query.path !== '' ? req.query.path : root,
       );
-      if (requested !== root && !requested.startsWith(root + '/')) {
+      if (!isWithinWorkspace(requested, root)) {
         throw new AppError(
           'Path is outside the machine base workspace',
           400,

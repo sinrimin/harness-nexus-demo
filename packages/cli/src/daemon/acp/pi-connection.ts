@@ -1,7 +1,9 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
+import { spawn } from '../../proc.js';
 import { readdirSync, readFileSync } from 'node:fs';
-import { groupIsAlive } from '../adapter-ledger.js';
+import { groupIsAlive, groupSignalTarget } from '../adapter-ledger.js';
 import { piFindSessionFile, piSessionReplay, type PiReplayUpdate } from '../pi-sessions.js';
+import { hasTokenCounts, normalizeUsage } from '../usage.js';
 import type {
   AgentConnection,
   AcpSessionCaps,
@@ -202,30 +204,14 @@ export function piEventToAcpUpdate(event: unknown): UnknownRecord | null {
     }
     case 'message_end': {
       // Deltas already streamed the content; message_end is authoritative
-      // CONTENT (ignored here) + USAGE (kept — feeds the turn tail).
+      // CONTENT (ignored here) + USAGE (kept — feeds the turn tail). The
+      // dialect pick (inputTokens/input, cache spellings) lives in one place.
       const message = (e['message'] ?? {}) as UnknownRecord;
       const usage = (message['usage'] ?? e['usage']) as UnknownRecord | undefined;
       if (usage === undefined || typeof usage !== 'object' || usage === null) return null;
-      const input =
-        typeof usage['inputTokens'] === 'number'
-          ? usage['inputTokens']
-          : typeof usage['input'] === 'number'
-            ? usage['input']
-            : undefined;
-      const output =
-        typeof usage['outputTokens'] === 'number'
-          ? usage['outputTokens']
-          : typeof usage['output'] === 'number'
-            ? usage['output']
-            : undefined;
-      if (input === undefined && output === undefined) return null;
-      return {
-        sessionUpdate: 'usage_update',
-        usage: {
-          ...(input !== undefined ? { inputTokens: input } : {}),
-          ...(output !== undefined ? { outputTokens: output } : {}),
-        },
-      };
+      const fields = normalizeUsage(usage);
+      if (!hasTokenCounts(fields)) return null;
+      return { sessionUpdate: 'usage_update', usage: fields };
     }
     default:
       return null; // agent_start/end/settled, turn_*, queue_*, compaction_*, extension_error…
@@ -319,7 +305,10 @@ export class PiRpcConnection implements AgentConnection {
         cwd: opts.cwd,
         env: { ...process.env, ...(opts.env ?? {}) },
         stdio: ['pipe', 'pipe', 'pipe'],
-        detached: true, // own process group — kill() takes the whole tree
+        windowsHide: true, // #33 — no console window per child on Windows
+        // #35 — process groups are POSIX-only (see agent-connection.ts);
+        // attached on win32 so the tree inherits the daemon's console.
+        detached: process.platform !== 'win32',
       });
     } catch (e) {
       throw new Error(`failed to spawn pi '${command}': ${errText(e)}`);
@@ -450,7 +439,9 @@ export class PiRpcConnection implements AgentConnection {
     const sigGroup = (sig: NodeJS.Signals): void => {
       if (pid === undefined) return;
       try {
-        process.kill(-pid, sig);
+        // Negative pid = the process group on POSIX; the bare leader on
+        // win32 (#42 — no process groups there, -pid just throws).
+        process.kill(groupSignalTarget(pid), sig);
       } catch {
         // group already gone
       }

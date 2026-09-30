@@ -6,7 +6,6 @@ const en = {
   signOut: 'Sign out',
   themeToLight: 'Switch to light theme',
   themeToDark: 'Switch to dark theme',
-  themeLockedBySkin: 'Light/dark is fixed by this skin',
   githubStar: 'Star on GitHub',
   skinPicker: 'Switch skin',
   skinSignal: 'Signal',
@@ -41,17 +40,15 @@ const en = {
   navGroupAsset: 'Assets',
   navGroupAccess: 'Access',
   navGroupAdmin: 'Admin',
-  // Readout strip (D2). Figures first, then the scope vocabulary: a number
-  // that spans every user must say so.
+  // Readout strip (D2). Every figure counts the caller's own rows (#36), so
+  // there is no all/own scope vocabulary anymore.
   readoutMachines: 'machines',
   readoutMcp: 'mcp',
   readoutQueued: 'queued',
   readoutChannels: 'chan',
-  readoutAll: 'all',
-  readoutAllHint: 'Includes every user on this instance',
-  readoutOwn: 'own',
-  readoutOwnHint: 'Counts your rows only — chat is private to its owner',
   readoutAria: 'Instance posture',
+  // #37 — the version line above the account block.
+  versionHint: 'Harness Nexus server build',
   // 403 view (guards.tsx).
   adminsOnlyTitle: 'Admins only',
   adminsOnlyBody:
@@ -66,7 +63,6 @@ const zh: typeof en = {
   signOut: '退出登录',
   themeToLight: '切换到浅色主题',
   themeToDark: '切换到深色主题',
-  themeLockedBySkin: '当前皮肤的明暗模式固定，不可切换',
   githubStar: '去 GitHub 加星',
   skinPicker: '切换皮肤',
   skinSignal: 'Signal',
@@ -102,11 +98,8 @@ const zh: typeof en = {
   readoutMcp: 'mcp',
   readoutQueued: '排队',
   readoutChannels: '渠道',
-  readoutAll: '全部',
-  readoutAllHint: '包含本实例上的所有用户',
-  readoutOwn: '本人',
-  readoutOwnHint: '只统计你自己的数据 —— 聊天对所有者之外不可见',
   readoutAria: '实例姿态',
+  versionHint: 'Harness Nexus 服务端构建版本',
   adminsOnlyTitle: '仅限管理员',
   adminsOnlyBody: '你没有权限查看此页面。如需访问，请联系管理员。',
   backToOverview: '返回总览',

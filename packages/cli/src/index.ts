@@ -36,6 +36,10 @@ import {
 } from './config.js';
 import { runDaemon } from './daemon/client.js';
 import { runMcpServe } from './mcp/serve.js';
+import { runTuiCommand } from './tui/command.js';
+import { cliVersion } from './version.js';
+import { runLogsCommand, type LogsArgs } from './logs.js';
+import { logOp } from './daemon/logbook.js';
 import { HarnessNexusClient } from '@harness-nexus/sdk';
 import type { InstallPlan } from './install/types.js';
 import type { AgentTarget } from '@harness-nexus/core';
@@ -47,7 +51,10 @@ Usage:
   hnx uninstall --target <t> [--out <dir>] [--apply]
   hnx enroll --server <url> --token <pat> [--name <name>]
   hnx daemon [--server <url>] [--token <machine-pat>] [--machine-id <id>]
+  hnx tui [--dump]
   hnx mcp serve --profile <id> [--server <url>] [--token <pat>]
+  hnx logs [--tail <n>] [--bundle <file|->]
+  hnx --version
 
 Install options:
   --profile <id>     Profile to install (required)
@@ -75,11 +82,30 @@ Daemon options (Phase 8 — bring the machine online):
   --server <url>     Override the server base URL
   --token <pat>      Override the machine token
   --machine-id <id>  Override the machine id
+  The daemon keeps a local logbook under ~/.hnx/logs/ (#38):
+  ops.log = operations it performed, comm.log = server traffic metadata
+  (chat stream bursts collapse to one line per burst). Env:
+  HNX_LOG_COMM=payload  also log full payloads (DEBUG ONLY — includes chat
+                        content; never share the file unreviewed)
+  HNX_LOG_DIR=<dir>     override the logbook directory
+
+Logs options (#38 — inspect the daemon's local logbook):
+  --tail <n>         Lines to print per file (default 20)
+  --bundle <file>    Write a shareable single-file support bundle
+                     (build header + last 200 lines of each log);
+                     '-' writes it to stdout
 
 MCP serve options (Phase 8 C2 — the stdio shim; spawned by Agent tools):
   --profile <id>     Profile to serve (required)
   --server <url>     Server base URL (default: ~/.hnx/config.json)
   --token <pat>      Machine PAT or user PAT (default: ~/.hnx/config.json)
+
+TUI options (#39 — the daemon's live console; replaces 'hnx daemon' for
+an interactive session, same identity/lock rules):
+  --dump             Print a one-shot text snapshot and exit (also the
+                     automatic fallback when stdout is not a terminal)
+  Keys: 1 agents · 2 ops · 3 comm · t tokens · m metrics bar · a all ·
+        space refresh · q quit (nmon-style pane toggles)
 
 To upgrade an install, run the same 'hnx install --apply' again — the plan
 rewrites its own entries (idempotent) and the ledger is refreshed.
@@ -482,6 +508,50 @@ function parseMcpServeArgs(argv: string[]): McpServeArgs {
   return args;
 }
 
+function parseLogsArgs(argv: string[]): LogsArgs {
+  const args: LogsArgs = { tail: 20 };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const next = (): string => {
+      const v = argv[++i];
+      if (v === undefined) throw new InstallError(`Missing value for ${a}`, 'VALIDATION_FAILED');
+      return v;
+    };
+    switch (a) {
+      case '--tail': {
+        const n = Number(next());
+        if (!Number.isInteger(n) || n < 1) {
+          throw new InstallError('--tail expects a positive integer', 'VALIDATION_FAILED');
+        }
+        args.tail = n;
+        break;
+      }
+      case '--bundle':
+        args.bundle = next();
+        break;
+      default:
+        throw new InstallError(`Unknown argument: ${a}`, 'VALIDATION_FAILED');
+    }
+  }
+  return args;
+}
+
+interface TuiArgs {
+  dump: boolean;
+}
+
+function parseTuiArgs(argv: string[]): TuiArgs {
+  const args: TuiArgs = { dump: false };
+  for (const a of argv) {
+    if (a === '--dump') {
+      args.dump = true;
+      continue;
+    }
+    throw new InstallError(`Unknown argument: ${a}`, 'VALIDATION_FAILED');
+  }
+  return args;
+}
+
 async function runMcpServeCommand(args: McpServeArgs): Promise<void> {
   const config = loadDaemonConfig();
   const server = args.server ?? config?.server;
@@ -498,6 +568,12 @@ async function runMcpServeCommand(args: McpServeArgs): Promise<void> {
 async function main(argv: string[]): Promise<number> {
   const [, , subcommand, ...rest] = argv;
 
+  if (subcommand === '--version' || subcommand === '-v') {
+    // eslint-disable-next-line no-console
+    console.log(cliVersion());
+    return 0;
+  }
+
   if (!subcommand || subcommand === '-h' || subcommand === '--help') {
     // eslint-disable-next-line no-console
     console.log(HELP);
@@ -513,10 +589,43 @@ async function main(argv: string[]): Promise<number> {
     try {
       if (subcommand === 'install') {
         const args = parseArgs(rest);
-        await runInstall(args);
+        const startedAt = Date.now();
+        try {
+          await runInstall(args);
+        } catch (e) {
+          // #38 — manual installs share the daemon's operation trail.
+          if (args.apply) {
+            logOp({
+              op: 'install',
+              target: args.target ?? 'profile',
+              outcome: 'error',
+              ms: Date.now() - startedAt,
+              detail: `profile ${args.profile} — ${e instanceof Error ? e.message : String(e)}`,
+            });
+          }
+          throw e;
+        }
+        if (args.apply) {
+          logOp({
+            op: 'install',
+            target: args.target ?? 'profile',
+            outcome: 'ok',
+            ms: Date.now() - startedAt,
+            detail: `profile ${args.profile}`,
+          });
+        }
         return 0;
       }
-      return runUninstall(parseArgs(rest, /* loose */ true));
+      const args = parseArgs(rest, /* loose */ true);
+      const code = runUninstall(args);
+      if (args.apply) {
+        logOp({
+          op: 'uninstall',
+          target: args.target ?? 'profile',
+          outcome: code === 0 ? 'ok' : 'error',
+        });
+      }
+      return code;
     } catch (e) {
       if (e instanceof InstallError) {
         // eslint-disable-next-line no-console
@@ -529,7 +638,16 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
-  if (subcommand === 'enroll' || subcommand === 'daemon' || subcommand === 'mcp') {
+  if (subcommand === 'logs') {
+    return runLogsCommand(parseLogsArgs(rest));
+  }
+
+  if (
+    subcommand === 'enroll' ||
+    subcommand === 'daemon' ||
+    subcommand === 'tui' ||
+    subcommand === 'mcp'
+  ) {
     if (rest.includes('-h') || rest.includes('--help')) {
       // eslint-disable-next-line no-console
       console.log(HELP);
@@ -543,6 +661,17 @@ async function main(argv: string[]): Promise<number> {
       if (subcommand === 'daemon') {
         await runDaemonCommand(parseDaemonArgs(rest));
         return 0;
+      }
+      if (subcommand === 'tui') {
+        const tuiArgs = parseTuiArgs(rest);
+        const merged = mergeDaemonConfig({}, loadDaemonConfig());
+        saveDaemonConfig(merged);
+        return await runTuiCommand({
+          server: merged.server,
+          token: merged.token,
+          machineId: merged.machineId,
+          dump: tuiArgs.dump,
+        });
       }
       const [serve, ...serveRest] = rest;
       if (serve !== 'serve') {

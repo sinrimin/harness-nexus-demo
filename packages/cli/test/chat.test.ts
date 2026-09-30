@@ -165,6 +165,24 @@ describe('mapAcpUpdate', () => {
       map({ sessionUpdate: 'usage_update', usage: { inputTokens: 3, outputTokens: 4 } }),
     ).toEqual({ kind: 'usage', inputTokens: 3, outputTokens: 4 });
     expect(map({ sessionUpdate: 'usage_update' })).toEqual({ kind: 'usage' });
+    // #39 — cache fields ride the dialect pick (usage.ts owns the spellings).
+    expect(
+      map({
+        sessionUpdate: 'usage_update',
+        usage: {
+          inputTokens: 3,
+          outputTokens: 4,
+          cacheCreationInputTokens: 50,
+          cacheReadInputTokens: 600,
+        },
+      }),
+    ).toEqual({
+      kind: 'usage',
+      inputTokens: 3,
+      outputTokens: 4,
+      cacheWriteTokens: 50,
+      cacheReadTokens: 600,
+    });
   });
 
   it('takeElicitationView reduces the claude AskUserQuestion shape (9 W14.1)', async () => {
@@ -725,6 +743,144 @@ describe('session round-trip vs the fixture agent', () => {
     socket.receive('disconnect', 'io client disconnect');
     await waitFor(() => (handle.prewarmReady('codex') ? undefined : true));
   }, 20000);
+
+  it('claude dialect: response usage + cumulative cost feed the ledger (#44)', async () => {
+    const socket = new FakeSocket();
+    const handle = attachChatHandlers(socket as never, {
+      env: {
+        HN_ACP_COMMAND_CLAUDE_CODE: `node ${FIXTURE}`,
+        PATH: process.env.PATH ?? '',
+      },
+      spawnEnv: { FIXTURE_RESPONSE_USAGE: '1' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-cc',
+      agentInstanceId: 'ag-1',
+      target: 'claude-code',
+      cwd: '/tmp',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find(
+          (e) =>
+            e.event === 'chat:session.ready' &&
+            (e.payload as { sessionId?: string }).sessionId === 'sess-cc',
+        )?.payload,
+    );
+    expect((ready as { error?: string }).error).toBeUndefined();
+
+    // Two turns of the claude dialect: usage_update carries occupancy+cost
+    // only; tokens ride the session/prompt RESPONSE as cumulative totals.
+    for (const n of [1, 2]) {
+      socket.receive('chat:message.send', {
+        sessionId: 'sess-cc',
+        prompt: [{ type: 'text', text: `turn ${String(n)}` }],
+      });
+      await waitFor(() => {
+        const results = socket.chatEvents().filter((e) => e.kind === 'turn_result');
+        return results.length >= n ? true : undefined;
+      });
+    }
+    const turns = socket.chatEvents().filter((e) => e.kind === 'turn_result');
+    // The response usage rides each turn_result (cumulative per the wrapper).
+    expect(turns[0]).toMatchObject({
+      kind: 'turn_result',
+      stopReason: 'end_turn',
+      usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 500, cacheWriteTokens: 50 },
+    });
+    expect(turns[1]).toMatchObject({
+      kind: 'turn_result',
+      usage: { inputTokens: 200, cacheReadTokens: 1000 },
+    });
+    // usage_update carried cost (cumulative), no tokens.
+    const usages = socket.chatEvents().filter((e) => e.kind === 'usage');
+    expect(
+      usages.some((e) => 'costUsd' in (e as object) && !('inputTokens' in (e as object))),
+    ).toBe(true);
+
+    // Ledger: delta-accounted — 2 turns credit each per-turn amount once.
+    const [row] = handle.usage.rows();
+    expect(row).toMatchObject({
+      target: 'claude-code',
+      turns: 2,
+      inputTokens: 200,
+      outputTokens: 40,
+      cacheReadTokens: 1000,
+      cacheWriteTokens: 100,
+    });
+    expect(row.costUsd).toBeCloseTo(0.024, 9);
+  }, 15000);
+
+  it('sessionsSnapshot + usage ledger track the live channel and its tokens (#39)', async () => {
+    const socket = new FakeSocket();
+    const handle = attachChatHandlers(socket as never, {
+      env: {
+        HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`,
+        PATH: process.env.PATH ?? '',
+      },
+      spawnEnv: { FIXTURE_SESSION_CONFIG: '1' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-tui',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find(
+          (e) =>
+            e.event === 'chat:session.ready' &&
+            (e.payload as { sessionId?: string }).sessionId === 'sess-tui',
+        )?.payload,
+    );
+    expect((ready as { error?: string }).error).toBeUndefined();
+
+    // Before any turn: the channel is there, model keyed off the config
+    // snapshot's model-category select, no tokens yet.
+    const idle = handle.sessionsSnapshot();
+    expect(idle).toHaveLength(1);
+    expect(idle[0]).toMatchObject({
+      sessionId: 'sess-tui',
+      target: 'hermes',
+      model: 'fx-opus',
+      busy: false,
+      turns: 0,
+      inputTokens: 0,
+    });
+    expect(handle.usage.rows()).toHaveLength(0);
+
+    // One turn: the fixture's usage_update (11 in / 7 out, per-turn dialect)
+    // lands in BOTH the session view and the per-model ledger.
+    socket.receive('chat:message.send', {
+      sessionId: 'sess-tui',
+      prompt: [{ type: 'text', text: 'hello tui' }],
+    });
+    await waitFor(() =>
+      socket.chatEvents().some((e) => e.kind === 'turn_result') ? true : undefined,
+    );
+    const busy = handle.sessionsSnapshot()[0]!;
+    expect(busy.busy).toBe(false); // settled after turn_result
+    expect(busy.turns).toBe(1);
+    expect(busy.inputTokens).toBe(11);
+    expect(busy.outputTokens).toBe(7);
+    const [row] = handle.usage.rows();
+    expect(row).toMatchObject({
+      target: 'hermes',
+      model: 'fx-opus',
+      turns: 1,
+      inputTokens: 11,
+      outputTokens: 7,
+      sessions: 1,
+    });
+
+    socket.receive('chat:session.close', { sessionId: 'sess-tui', reason: 'user' });
+    await waitFor(() => (handle.sessionsSnapshot().length === 0 ? true : undefined));
+    // The ledger survives the channel close — it is daemon-lifetime.
+    expect(handle.usage.rows()).toHaveLength(1);
+  }, 15000);
 
   it('a plan turn surfaces full-replace snapshots and the history ring replays them (9 W14)', async () => {
     const socket = new FakeSocket();
