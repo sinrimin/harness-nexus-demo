@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 // Throwaway smoke test for the Phase 1 auth flow. Run against a freshly booted
 // memory-mode server. Not part of the automated test suite (yet).
 const B = process.env.BASE_URL ?? 'http://127.0.0.1:7780';
@@ -1165,6 +1169,7 @@ const {
   accessSync,
   readFileSync,
   statSync,
+  existsSync,
   chmodSync,
   readdirSync,
 } = await import('node:fs');
@@ -1785,6 +1790,12 @@ process.exit(1);
 );
 chmodSync(pathMod.join(ccShimDir, 'claude'), 0o755);
 
+// #45 — one daemon per HOME (the ~/.hnx/daemon.lock is per-home, atomic): the
+// [8 C4] daemon is STILL ALIVE at this point, so the #6 daemon needs its own
+// home or it refuses with DAEMON_LOCKED (which is exactly the correct
+// behavior this section used to trip over).
+const c4CcHome = mkdtempSync(pathMod.join(tmpdir(), 'hnx-smoke-c4cc-'));
+
 const c4CcDaemon = spawn(
   process.execPath,
   [
@@ -1798,7 +1809,7 @@ const c4CcDaemon = spawn(
     c4CcMachineId,
   ],
   {
-    env: { ...process.env, HOME: c4Home, PATH: `${ccShimDir}:${process.env.PATH}` },
+    env: { ...process.env, HOME: c4CcHome, PATH: `${ccShimDir}:${process.env.PATH}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   },
 );
@@ -1806,10 +1817,35 @@ let c4CcErr = '';
 c4CcDaemon.stderr.on('data', (d) => {
   c4CcErr += d.toString();
 });
+// Consume stdout too: a full unconsumed pipe would block the child.
+let c4CcOut = '';
+c4CcDaemon.stdout.on('data', (d) => {
+  c4CcOut += d.toString();
+});
+let c4CcExited = null;
+c4CcDaemon.on('exit', (code, signal) => {
+  c4CcExited = `code=${code} signal=${signal}`;
+});
+let c4CcOnline = false;
 for (let i = 0; i < 50; i++) {
   r = await req('GET', `/api/machines/${c4CcMachineId}`, { token: userToken });
-  if (r.json.machine?.online) break;
+  if (r.json.machine?.online) {
+    c4CcOnline = true;
+    break;
+  }
   await new Promise((s2) => setTimeout(s2, 200));
+}
+expect('c4-cc daemon online', c4CcOnline, true);
+expect(
+  'c4-cc daemon advertises marketplace-deploy',
+  (r.json.machine?.capabilities ?? []).includes('marketplace-deploy'),
+  true,
+);
+if (!c4CcOnline) {
+  log(
+    `(c4-cc daemon diagnose): pid=${c4CcDaemon.pid} exited=${c4CcExited ?? 'no'}\n` +
+      `(stdout): ${c4CcOut.slice(-1000)}\n(stderr): ${c4CcErr.slice(-1000)}`,
+  );
 }
 
 r = await req('POST', `/api/machines/${c4CcMachineId}/jobs`, {
@@ -1834,8 +1870,17 @@ for (let i = 0; i < 100; i++) {
 expect('marketplace deploy succeeded', ccJob?.status, 'succeeded');
 expect('result method', ccJob?.result?.method, 'marketplace');
 expect('result installedVersion', ccJob?.result?.installedVersion, '1.0.0');
+if (ccJob?.status !== 'succeeded' && c4CcErr !== '') {
+  log(`(c4-cc daemon stderr): ${c4CcErr.slice(-2000)}`);
+}
 
-const ccArgv = readFileSync(pathMod.join(c4Home, '.claude', 'plugins', 'argv.log'), 'utf8');
+const ccArgv = (() => {
+  try {
+    return readFileSync(pathMod.join(c4CcHome, '.claude', 'plugins', 'argv.log'), 'utf8');
+  } catch {
+    return ''; // the deploy never ran — the FAILs above carry the verdict
+  }
+})();
 expect(
   'marketplace add URL carries the machine PAT',
   ccArgv.includes(`plugin marketplace add ${ccBase}/api/marketplace/${c4CcToken}/marketplace.json`),
@@ -1900,7 +1945,7 @@ for (let i = 0; i < 100; i++) {
 }
 expect('marketplace update job succeeded', ccJob?.status, 'succeeded');
 expect('update reports the new version', ccJob?.result?.installedVersion, '2.0.0');
-const ccArgv2 = readFileSync(pathMod.join(c4Home, '.claude', 'plugins', 'argv.log'), 'utf8');
+const ccArgv2 = readFileSync(pathMod.join(c4CcHome, '.claude', 'plugins', 'argv.log'), 'utf8');
 expect('second run used plugin update', ccArgv2.includes(`plugin update c4-cc@${ccMp} -y`), true);
 
 // claude-code deploys never register an AgentInstance (chat keys off the
@@ -1919,7 +1964,8 @@ await new Promise((resolve) => {
 });
 await req('DELETE', `/api/machines/${c4CcMachineId}`, { token: userToken });
 rmSync(ccShimDir, { recursive: true, force: true });
-rmSync(pathMod.join(c4Home, '.claude'), { recursive: true, force: true });
+rmSync(pathMod.join(c4CcHome, '.claude'), { recursive: true, force: true });
+rmSync(c4CcHome, { recursive: true, force: true });
 if (c4CcErr.includes('Error:')) {
   log(
     `(c4-cc daemon stderr note): ${c4CcErr
@@ -2191,7 +2237,7 @@ const w1BinScript = (name, out) => {
   chmodSync(file, 0o755);
 };
 w1BinScript('claude', '9.9.7-fake (Claude Code)');
-w1BinScript('dsh', '0.1.2-fake');
+w1BinScript('dsh', '0.2.0');
 // claude + codex artifacts: items nest under the Agent card
 mkdirSync(pathMod.join(w1Home, '.claude/skills/cc-w1'), { recursive: true });
 writeFileSync(
@@ -2464,7 +2510,7 @@ r = await req('POST', `/api/machines/${w2MachineId}/jobs`, {
   token: adminToken,
   body: { type: 'harness', action: 'install', target: 'deepseek' },
 });
-expect('admin harness mutation refused (owner-only)', r.status, 403);
+expect('admin harness mutation hidden as 404 (owner-only, #36)', r.status, 404);
 
 w2Daemon.kill('SIGTERM');
 await req('DELETE', `/api/machines/${w2MachineId}`, { token: userToken });
@@ -2627,16 +2673,16 @@ const w3Env = readFileSync(pathMod.join(w3Home, '.dsh', '.env'), 'utf8');
 expect('dsh: user env var survives', w3Env.includes('DEEPSEEK_API_KEY=user-key'), true);
 expect('dsh: managed key written', w3Env.includes('HARNESS_NEXUS_API_KEY=sk-w3-secret'), true);
 
-log('\n--- [9 W3] gates: GET echo, machine-PAT bundle, admin 403, flavor 409 ---');
+log('\n--- [9 W3] gates: GET echo, machine-PAT bundle, admin 404, flavor 409 ---');
 r = await req('GET', `/api/machines/${w3MachineId}/runtime-config/codex`, { token: userToken });
 expect('GET echoes the stored spec', r.json.config.model, 'w3-model');
 r = await req('GET', `/api/machines/${w3MachineId}/runtime-config/codex`, { token: adminToken });
-expect('admin may view the spec', r.status, 200);
+expect('admin GET hidden as 404 (owner-only, #36)', r.status, 404);
 r = await req('PUT', `/api/machines/${w3MachineId}/runtime-config/codex`, {
   token: adminToken,
   body: w3CodexSpec,
 });
-expect('admin mutation refused (owner-only)', r.status, 403);
+expect('admin mutation hidden as 404 (owner-only, #36)', r.status, 404);
 r = await req('PUT', `/api/machines/${w3MachineId}/runtime-config/claude-code`, {
   token: userToken,
   body: { ...w3CodexSpec, api: 'openai' },
@@ -2705,9 +2751,9 @@ expect(
   true,
 );
 
-log('\n--- [9 W4] gates: admin view ok, bad target 400 ---');
+log('\n--- [9 W4] gates: admin view 404 (owner-only), bad target 400 ---');
 r = await req('GET', `/api/machines/${w3MachineId}/runtimes/codex/config`, { token: adminToken });
-expect('admin may view the redacted config', r.status, 200);
+expect('admin redacted-config view hidden as 404 (owner-only, #36)', r.status, 404);
 r = await req('GET', `/api/machines/${w3MachineId}/runtimes/hermes/config`, { token: userToken });
 expect('non-runtime target rejected (400)', r.status, 400);
 
@@ -2794,6 +2840,75 @@ r = await req('POST', '/api/llm-providers/query-models', {
 expect('dead endpoint maps to 502 PROVIDER_MODELS_FAILED', r.status, 502);
 expect('error code', r.json.error, 'PROVIDER_MODELS_FAILED');
 
+// ===========================================================================
+// [#51] provider model registry — models live ON the provider row; consumer
+// forms pick from the registry; PUTs snapshot metadata as modelEntries.
+// ===========================================================================
+log('\n--- [#51] provider model registry ---');
+r = await req('PATCH', `/api/llm-providers/${w10ProviderId}`, {
+  token: userToken,
+  body: {
+    models: [
+      { id: 'gpt-5', displayName: 'GPT-5', contextWindow: 400_000, maxOutputTokens: 128_000 },
+      { id: 'gpt-5-mini' },
+      { id: 'text-embed', type: 'embedding' },
+    ],
+  },
+});
+expect('registry PATCH round-trips (type defaults to chat)', r.status, 200);
+expect('model count', r.json.provider.models.length, 3);
+expect(
+  'chat model carries its metadata',
+  r.json.provider.models[0].contextWindow,
+  400_000,
+);
+
+r = await req('PATCH', `/api/llm-providers/${w10ProviderId}`, {
+  token: userToken,
+  body: { models: [{ id: 'dup' }, { id: 'dup' }] },
+});
+expect('duplicate model ids rejected', r.status, 400);
+// Restore the registry for the modelEntries check.
+r = await req('PATCH', `/api/llm-providers/${w10ProviderId}`, {
+  token: userToken,
+  body: {
+    models: [
+      { id: 'gpt-5', displayName: 'GPT-5', contextWindow: 400_000, maxOutputTokens: 128_000 },
+      { id: 'gpt-5-mini' },
+    ],
+  },
+});
+expect('registry restored', r.status, 200);
+
+const w51Machine = await req('POST', '/api/machines', {
+  token: userToken,
+  body: { name: 'w51-box' },
+});
+expect('w51 enroll status', w51Machine.status, 201);
+r = await req('PUT', `/api/machines/${w51Machine.json.machine.id}/runtime-config/codex`, {
+  token: userToken,
+  body: {
+    providerLabel: 'w10-gw',
+    baseUrl: 'https://gw.example.com/v1',
+    api: 'openai',
+    model: 'gpt-5',
+    credentialName: 'w3-gw-key',
+    providerId: w10ProviderId,
+    models: ['gpt-5-mini', 'not-in-registry'],
+  },
+});
+expect('registry-backed spec accepted', r.status, 201);
+expect(
+  'modelEntries snapshot: known ids carry metadata, unknown stay absent',
+  JSON.stringify(r.json.config.modelEntries),
+  JSON.stringify([
+    { id: 'gpt-5', displayName: 'GPT-5', contextWindow: 400_000, maxOutputTokens: 128_000 },
+    { id: 'gpt-5-mini' },
+  ]),
+);
+r = await req('DELETE', `/api/machines/${w51Machine.json.machine.id}`, { token: userToken });
+expect('w51 machine cleanup', r.status, 200);
+
 r = await req('DELETE', `/api/machines/${w10Machine.json.machine.id}`, { token: userToken });
 expect('w10 machine cleanup', r.status, 200);
 r = await req('DELETE', `/api/llm-providers/${w10ProviderId}`, { token: userToken });
@@ -2878,7 +2993,7 @@ expect('subdirectory listing is empty', JSON.stringify(r.json.directories), '[]'
 
 log('\n--- [9 W6] workspace gates: ownership + offline ---');
 r = await req('GET', `/api/machines/${w6MachineId}/workspace`, { token: adminToken });
-expect('admin may also browse (owner-or-admin read)', r.status, 200);
+expect('admin workspace browse hidden as 404 (owner-only, #36)', r.status, 404);
 await req('POST', '/api/users', {
   token: adminToken,
   body: { username: 'w6stranger', password: 'stranger-pass-123', role: 'user' },
@@ -2930,7 +3045,9 @@ const w7BinScript = (name, out) => {
   chmodSync(file, 0o755);
 };
 w7BinScript('claude', '9.9.7-fake (Claude Code)');
-w7BinScript('dsh', '0.1.2-rc.1');
+// #46 — the ground-truth line: at/above the daemon's dsh floor (0.2.0-rc.2),
+// so the ACP version gate would admit this fake client if a chat opened here.
+w7BinScript('dsh', '0.2.0-rc.2');
 
 // A dsh-shaped transcript: header + title + one full turn, multi-frame zstd.
 const w7Proj = pathMod.join(w7Home, 'proj');
@@ -2945,7 +3062,7 @@ if (w7HasZstd) {
   const dshEntries = [
     {
       type: 'session',
-      version: 0,
+      version: 4,
       id: w7DshId,
       createdAt: Date.now(),
       cwd: w7Proj,
@@ -2975,7 +3092,8 @@ if (w7HasZstd) {
     { type: 'turn/end', data: { reason: { kind: 'completed' } } },
   ];
   writeFileSync(
-    pathMod.join(dshDir, 'session.jsonl.zstd'),
+    // #46 — the CURRENT generation-versioned artifact (pre-v4 reads as absent).
+    pathMod.join(dshDir, 'session.v4.jsonl.zstd'),
     Buffer.concat(
       dshEntries.map((e) => w7Zstd.zstdCompressSync(Buffer.from(`${JSON.stringify(e)}\n`))),
     ),
@@ -3140,6 +3258,38 @@ expect(
   JSON.stringify(['fx-native-1']),
 );
 
+// [9 W7 / #55] Native session deletion — the REST route rides sessions:delete
+// over /ctl: the ACP arm (fixture adapter handles session/delete) and the
+// dsh file arm (the crafted store's directory), plus idempotency.
+log('\n--- [#55] native session delete: ACP arm + dsh file arm + idempotency ---');
+r = await req('DELETE', `/api/agent-instances/${w7CcAgent.id}/sessions/fx-native-1`, {
+  token: userToken,
+});
+expect('ACP-arm delete status', r.status, 200);
+expect('ACP-arm delete ok', r.json.ok, true);
+// The fixture adapter's session/list is a CANNED row — it cannot reflect the
+// delete (the real adapter's semantics are covered by the cli unit tests over
+// the fixture's session/delete handler and the agent-browser pass). What the
+// smoke CAN hold here: the round-trip + idempotency.
+r = await req('DELETE', `/api/agent-instances/${w7CcAgent.id}/sessions/fx-native-1`, {
+  token: userToken,
+});
+expect('repeat delete stays ok (idempotent)', r.json.ok, true);
+
+if (w7HasZstd) {
+  r = await req('DELETE', `/api/agent-instances/${w7DshAgent.id}/sessions/${w7DshId}`, {
+    token: userToken,
+  });
+  expect('dsh-arm delete ok', r.json.ok, true);
+  expect(
+    'dsh session directory removed from disk',
+    existsSync(pathMod.join(w7Home, '.dsh', 'sessions', '--w7-proj--', w7DshId)),
+    false,
+  );
+  r = await req('GET', `/api/agent-instances/${w7DshAgent.id}/sessions`, { token: userToken });
+  expect('dsh listing empty after the delete', JSON.stringify(r.json.sessions), '[]');
+}
+
 w7App.close();
 w7Daemon.kill('SIGTERM');
 await new Promise((resolve) => {
@@ -3147,7 +3297,14 @@ await new Promise((resolve) => {
   setTimeout(resolve, 3000);
 });
 await req('DELETE', `/api/machines/${w7MachineId}`, { token: userToken });
-rmSync(w7Home, { recursive: true, force: true });
+// Best-effort: the dsh daemon can still be writing its session store when we
+// tear down here (ENOTEMPTY race) — a stale dir is swept by the hygiene pass
+// at the top of the next run.
+try {
+  rmSync(w7Home, { recursive: true, force: true });
+} catch {
+  /* best-effort */
+}
 if (w7Err.includes('Error:')) {
   log(
     `(w7 daemon stderr note): ${w7Err
@@ -3208,6 +3365,181 @@ expect(
   JSON.stringify({ 'claude-code': false, codex: true, deepseek: true, opencode: false }),
 );
 await req('DELETE', `/api/machines/${pwMachineId}`, { token: userToken });
+
+
+// ===========================================================================
+// [#52] Platform assistant — config CRUD (owner-only, model coherence),
+// sessions, and the soft-delete lifecycle. The pi turn itself is covered by
+// the faux-driven server tests; the smoke pins the REST door.
+// ===========================================================================
+log('\n--- [#52] assistant config CRUD + owner-only + soft delete ---');
+r = await req('POST', '/api/llm-providers', {
+  token: userToken,
+  body: {
+    name: 'asst-gw',
+    api: 'openai-chat',
+    baseUrl: 'https://gw.example.com/v1',
+    credentialName: 'w3-gw-key',
+    models: [{ id: 'smoke-model', type: 'chat' }],
+  },
+});
+expect('assistant smoke provider created', r.status, 201);
+const asstProviderId = r.json.provider.id;
+
+r = await req('POST', '/api/assistants', {
+  token: userToken,
+  body: { name: 'smoke-ops', providerId: asstProviderId, defaultModel: 'smoke-model' },
+});
+expect('assistant created', r.status, 201);
+const asstId = r.json.assistant.id;
+expect('assistant defaults all tool groups', Array.isArray(r.json.assistant.enabledToolGroups), true);
+
+r = await req('POST', '/api/assistants', {
+  token: userToken,
+  body: { name: 'smoke-ops', providerId: asstProviderId, defaultModel: 'smoke-model' },
+});
+expect('duplicate name 409', r.status, 409);
+r = await req('POST', '/api/assistants', {
+  token: userToken,
+  body: { name: 'bad-model', providerId: asstProviderId, defaultModel: 'not-configured' },
+});
+expect('model not on provider 409', r.status, 409);
+
+r = await req('GET', '/api/assistants', { token: adminToken });
+expect('foreign list empty (owner-only)', r.json.assistants.length, 0);
+r = await req('GET', `/api/assistants/${asstId}`, { token: adminToken });
+expect('foreign get 404 (admin gets the same 404)', r.status, 404);
+
+r = await req('POST', `/api/assistants/${asstId}/sessions`, { token: userToken });
+expect('session created', r.status, 201);
+const asstSessionId = r.json.session.id;
+r = await req('GET', '/api/assistant-sessions', { token: userToken });
+expect('session listed', r.json.sessions.length, 1);
+r = await req('GET', `/api/assistant-sessions/${asstSessionId}/messages`, { token: userToken });
+expect('transcript readable (empty)', r.json.messages.length, 0);
+
+r = await req('PATCH', `/api/assistants/${asstId}`, {
+  token: userToken,
+  body: { name: 'smoke-ops-2', enabledToolGroups: ['system'] },
+});
+expect('assistant renamed', r.json.assistant.name, 'smoke-ops-2');
+
+r = await req('DELETE', `/api/assistants/${asstId}`, { token: userToken });
+expect('assistant soft-deleted', r.status, 200);
+r = await req('GET', '/api/assistants', { token: userToken });
+expect('deleted config gone from pickers', r.json.assistants.length, 0);
+r = await req('GET', `/api/assistant-sessions/${asstSessionId}`, { token: userToken });
+expect('session of deleted config still resolves', r.status, 200);
+r = await req('DELETE', `/api/assistant-sessions/${asstSessionId}`, { token: userToken });
+expect('session deleted', r.status, 200);
+await req('DELETE', `/api/llm-providers/${asstProviderId}`, { token: userToken });
+
+
+// ===========================================================================
+// [#52 M2] — MCP/skill references on the assistant config: visibility gate,
+// skill kind/source rules, and the view echo.
+// ===========================================================================
+log('\n--- [#52 M2] assistant MCP/skill references ---');
+r = await req('POST', '/api/llm-providers', {
+  token: userToken,
+  body: {
+    name: 'asst-gw-2',
+    api: 'openai-chat',
+    baseUrl: 'https://gw.example.com/v1',
+    credentialName: 'w3-gw-key',
+    models: [{ id: 'smoke-model', type: 'chat' }],
+  },
+});
+expect('m2 provider created', r.status, 201);
+const asstProviderId2 = r.json.provider.id;
+
+r = await req('POST', '/api/mcp-servers', {
+  token: userToken,
+  body: {
+    name: 'asst-mcp',
+    transport: { type: 'streamable-http', url: 'https://mcp.example.com/mcp' },
+    dialSite: 'server',
+    scope: 'personal',
+  },
+});
+expect('mcp row created', r.status, 201);
+const asstMcpId = r.json.mcpServer.id;
+
+r = await req('POST', '/api/resources', {
+  token: userToken,
+  body: {
+    key: 'skill:asst-smoke',
+    kind: 'skill',
+    name: 'asst-smoke-skill',
+    source: { type: 'inline', content: '# smoke\nBe terse.' },
+    scope: 'personal',
+    targets: [],
+  },
+});
+expect('skill resource created', r.status, 201);
+const asstSkillId = r.json.resource.id;
+
+r = await req('POST', '/api/assistants', {
+  token: userToken,
+  body: {
+    name: 'asst-m2',
+    providerId: asstProviderId2,
+    defaultModel: 'smoke-model',
+    mcpServerIds: [asstMcpId],
+    skillResourceIds: [asstSkillId],
+  },
+});
+expect('assistant with references created', r.status, 201);
+const asstM2Id = r.json.assistant.id;
+expect('view echoes mcpServerIds', JSON.stringify(r.json.assistant.mcpServerIds), JSON.stringify([asstMcpId]));
+expect('view echoes skillResourceIds', JSON.stringify(r.json.assistant.skillResourceIds), JSON.stringify([asstSkillId]));
+
+// [#52 M3] — the daily token budget: set, echo, clear back to null.
+r = await req('PATCH', `/api/assistants/${asstM2Id}`, {
+  token: userToken,
+  body: { dailyTokenBudget: 12345 },
+});
+expect('budget set', r.json.assistant.dailyTokenBudget, 12345);
+r = await req('PATCH', `/api/assistants/${asstM2Id}`, {
+  token: userToken,
+  body: { dailyTokenBudget: null },
+});
+expect('budget cleared', r.json.assistant.dailyTokenBudget, null);
+r = await req('PATCH', `/api/assistants/${asstM2Id}`, {
+  token: userToken,
+  body: { dailyTokenBudget: 0 },
+});
+expect('non-positive budget rejected', r.status, 400);
+
+// A non-skill resource is refused.
+r = await req('POST', '/api/resources', {
+  token: userToken,
+  body: {
+    key: 'rule:asst-smoke',
+    kind: 'rule',
+    name: 'asst-smoke-rule',
+    source: { type: 'inline', content: 'x' },
+    scope: 'personal',
+    targets: [],
+  },
+});
+expect('rule resource created', r.status, 201);
+const asstRuleId = r.json.resource.id;
+r = await req('PATCH', `/api/assistants/${asstM2Id}`, {
+  token: userToken,
+  body: { skillResourceIds: [asstRuleId] },
+});
+expect('non-skill resource 409', r.status, 409);
+await req('DELETE', `/api/resources/${asstRuleId}`, { token: userToken });
+await req('DELETE', `/api/resources/${asstSkillId}`, { token: userToken });
+await req('DELETE', `/api/assistants/${asstM2Id}`, { token: userToken });
+await req('DELETE', `/api/llm-providers/${asstProviderId2}`, { token: userToken });
+
+r = await req('PATCH', `/api/assistants/${asstM2Id}`, {
+  token: userToken,
+  body: { mcpServerIds: ['nope'] },
+});
+expect('foreign mcp id 404', r.status, 404);
 
 log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

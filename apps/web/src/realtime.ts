@@ -1,4 +1,9 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { io, type Socket } from 'socket.io-client';
+import { createResubscribeGate } from '@/lib/resubscribe';
 import { TOKEN_KEY } from './api.js';
 
 /**
@@ -26,11 +31,23 @@ export interface MachineStatusEvent {
 
 let socket: Socket | null = null;
 
+const resubscribeGate = createResubscribeGate();
+
+/**
+ * Register a recovery action for /app RE-connects (the #66 silent-blip case:
+ * weak network, lock screen). The callback runs on connect-after-disconnect;
+ * unregister on unmount.
+ */
+export function onAppResubscribe(fn: () => void): () => void {
+  return resubscribeGate.subscribe(fn);
+}
+
 export function appSocket(): Socket {
   if (socket === null) {
     socket = io('/app', {
       auth: (cb) => cb({ token: localStorage.getItem(TOKEN_KEY) ?? '' }),
     });
+    socket.on('connect', () => resubscribeGate.onConnect());
   }
   return socket;
 }
@@ -96,6 +113,21 @@ export type ChatStreamEvent =
   | ({ kind: 'session_config' } & SessionConfigPatch)
   | ({ kind: 'plan' } & PlanPatch)
   | ({ kind: 'commands' } & CommandsPatch)
+  | { kind: 'raw'; method: string; params: unknown }
+  /** #71 — native sub-agent sessions (wrapped daemon-side by frame sessionId). */
+  | { kind: 'subagent_spawned'; subagentId: string; name: string; task: string }
+  | { kind: 'subagent_update'; subagentId: string; event: SubagentChildEvent }
+  | {
+      kind: 'subagent_done';
+      subagentId: string;
+      state: 'completed' | 'failed' | 'cancelled' | 'disconnected';
+    };
+
+/** #71 — the child-side event set a `subagent_update` may carry. */
+export type SubagentChildEvent =
+  | { kind: 'message_delta'; delta: string }
+  | { kind: 'thought_delta'; delta: string }
+  | { kind: 'tool_call'; call: ChatToolCallView }
   | { kind: 'raw'; method: string; params: unknown };
 
 // ---- 9 W14 — ACP plan (todo) snapshots (mirrors shared/realtime.ts) ----
@@ -261,6 +293,22 @@ export interface ChatChannelsPush {
   channels: ChatChannelView[];
 }
 
+// ---- #68 — assistant dispatch backflow (mirrors server assistant-dispatch.ts) ----
+
+/** One dispatch record of an assistant session, as pushed to the owner. */
+export interface AssistantDispatchView {
+  channelId: string;
+  agentInstanceId: string;
+  status: 'starting' | 'running' | 'done' | 'failed' | 'closed';
+  busy: boolean;
+}
+
+/** The per-session dispatch snapshot (on open/sync and every lifecycle change). */
+export interface AssistantDispatchesPush {
+  sessionId: string;
+  dispatches: AssistantDispatchView[];
+}
+
 // ---- 9 W7 — native session history (mirrors shared/realtime.ts) ----
 
 /** One prompt block the browser may send / one history user item carries. */
@@ -291,4 +339,43 @@ export function emitWithAck<T>(event: string, payload: unknown, timeoutMs = 1000
       resolve(res);
     });
   });
+}
+
+// ---- #52 — the platform assistant's /app family (mirrors shared schemas) ----
+
+export interface AssistantSessionView {
+  id: string;
+  ownerId: string;
+  assistantId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  lastMessageAt: string | null;
+}
+
+export type AssistantLiveSessionView = AssistantSessionView & { busy: boolean };
+
+export interface AssistantSessionsPush {
+  sessions: AssistantLiveSessionView[];
+}
+
+export interface AssistantReadyPush {
+  sessionId: string;
+  assistantId: string;
+  assistantName: string;
+}
+
+export interface AssistantEventEnvelope {
+  sessionId: string;
+  event: ChatStreamEvent;
+}
+
+export interface AssistantHistoryEvent {
+  sessionId: string;
+  items: HistoryItem[];
+}
+
+export interface AssistantClosedPush {
+  sessionId: string;
+  reason: string;
 }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import {
   chmodSync,
   mkdirSync,
@@ -82,6 +86,15 @@ describe('mergeTomlRootKeys', () => {
     expect(out).toContain('command = "keep"');
     // root keys must precede the first section header
     expect(out.indexOf('model_provider =')).toBeLessThan(out.indexOf('[profiles.work]'));
+  });
+
+  it('renders numbers/booleans bare and null REMOVES the key line (#63)', () => {
+    const doc = 'a = "x"\nb = 2\nc = true\n[s]\nk = 1\n';
+    expect(mergeTomlRootKeys(doc, { a: null, b: 7, c: false, d: 'e' })).toBe(
+      'b = 7\nc = false\nd = "e"\n[s]\nk = 1\n',
+    );
+    // removing a key that is not there is a no-op, not an append
+    expect(mergeTomlRootKeys('x = 1\n', { y: null })).toBe('x = 1\n');
   });
 
   it('inserts missing keys before the first section header when only sections exist', () => {
@@ -185,6 +198,165 @@ describe('applyRuntimeConfig — claude-code', () => {
     expect(() => applyRuntimeConfig('claude-code', spec(), 'k', bad)).toThrow(/not valid JSON/);
     rmSync(bad, { recursive: true, force: true });
   });
+
+  it('#60 — panel knobs: tier pins, subagent, token caps, extra body, auth slot', () => {
+    // User state to preserve + a legacy pre-tier env we retire on sight.
+    writeRel(
+      '.claude/settings.json',
+      JSON.stringify({
+        env: {
+          CUSTOM: 'keep',
+          ANTHROPIC_SMALL_FAST_MODEL: 'legacy-haiku',
+          ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'stale-name',
+        },
+      }),
+    );
+    applyRuntimeConfig(
+      'claude-code',
+      spec({
+        api: 'anthropic-messages',
+        model: 'gw-large[1m]',
+        models: ['gw-mini'],
+        claudeCode: {
+          authField: 'ANTHROPIC_API_KEY',
+          tiers: [
+            {
+              tier: 'sonnet',
+              model: 'gw-large[1m]',
+              displayName: 'Gateway Large',
+              capabilities: ['effort', 'thinking'],
+            },
+            { tier: 'haiku', model: 'gw-mini' },
+          ],
+          subagentModel: 'gw-mini[1m]',
+          maxOutputTokens: 64000,
+          maxContextTokens: 983616,
+          extraBody: { enable_thinking: true },
+          switches: {
+            attributionHidden: true,
+            teammates: true,
+            toolSearch: true,
+            maxEffort: true,
+            autoUpgradeDisabled: true,
+            artifactsDisabled: true,
+          },
+        },
+      }),
+      'sk-gw',
+      home,
+    );
+    const settings = JSON.parse(readFileSync(path.join(home, '.claude/settings.json'), 'utf8')) as {
+      env: Record<string, string>;
+      model: string;
+      availableModels: string[];
+      attribution: { commit: string; pr: string; sessionUrl: boolean };
+    };
+    // auth slot swap: the key rides API_KEY, the other var is ours to remove
+    expect(settings.env.ANTHROPIC_API_KEY).toBe('sk-gw');
+    expect(settings.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    // the [1m] marker rides the model slot itself (settings `model` + tier env)
+    expect(settings.model).toBe('gw-large[1m]');
+    expect(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('gw-large[1m]');
+    expect(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME).toBe('Gateway Large');
+    expect(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe(
+      'effort,thinking',
+    );
+    expect(settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('gw-mini');
+    // unpinned tiers + legacy + user env
+    expect(settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined();
+    expect(settings.env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBeUndefined();
+    expect(settings.env.ANTHROPIC_SMALL_FAST_MODEL).toBeUndefined();
+    expect(settings.env.CUSTOM).toBe('keep');
+    // knobs
+    expect(settings.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('gw-mini[1m]');
+    expect(settings.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('64000');
+    expect(settings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('983616');
+    expect(settings.env.CLAUDE_CODE_EXTRA_BODY).toBe('{"enable_thinking":true}');
+    // behavior switches (#60) — two are deliberately UNPREFIXED env names
+    expect(settings.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
+    expect(settings.env.ENABLE_TOOL_SEARCH).toBe('true');
+    expect(settings.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('max');
+    expect(settings.env.DISABLE_AUTOUPDATER).toBe('1');
+    expect(settings.env.CLAUDE_CODE_DISABLE_ARTIFACT).toBe('1');
+    expect(settings.attribution).toEqual({ commit: '', pr: '', sessionUrl: false });
+    // allowlist: plain ids only (markers stripped), pins + subagent unioned in
+    expect(settings.availableModels).toEqual(['gw-large', 'gw-mini']);
+
+    // idempotent re-apply
+    const first = readFileSync(path.join(home, '.claude/settings.json'), 'utf8');
+    applyRuntimeConfig(
+      'claude-code',
+      spec({
+        api: 'anthropic-messages',
+        model: 'gw-large[1m]',
+        models: ['gw-mini'],
+        claudeCode: {
+          authField: 'ANTHROPIC_API_KEY',
+          tiers: [
+            {
+              tier: 'sonnet',
+              model: 'gw-large[1m]',
+              displayName: 'Gateway Large',
+              capabilities: ['effort', 'thinking'],
+            },
+            { tier: 'haiku', model: 'gw-mini' },
+          ],
+          subagentModel: 'gw-mini[1m]',
+          maxOutputTokens: 64000,
+          maxContextTokens: 983616,
+          extraBody: { enable_thinking: true },
+          switches: {
+            attributionHidden: true,
+            teammates: true,
+            toolSearch: true,
+            maxEffort: true,
+            autoUpgradeDisabled: true,
+            artifactsDisabled: true,
+          },
+        },
+      }),
+      'sk-gw',
+      home,
+    );
+    expect(readFileSync(path.join(home, '.claude/settings.json'), 'utf8')).toBe(first);
+  });
+
+  it('#60 — a knob-less re-apply REMOVES every panel env key (revert semantics)', () => {
+    applyRuntimeConfig(
+      'claude-code',
+      spec({ api: 'anthropic-messages', model: 'gw-large', models: undefined }),
+      'sk-gw',
+      home,
+    );
+    const settings = JSON.parse(readFileSync(path.join(home, '.claude/settings.json'), 'utf8')) as {
+      env: Record<string, string>;
+      availableModels: string[];
+      attribution?: unknown;
+    };
+    for (const key of [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+      'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+      'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+      'CLAUDE_CODE_EXTRA_BODY',
+      'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS',
+      'ENABLE_TOOL_SEARCH',
+      'CLAUDE_CODE_EFFORT_LEVEL',
+      'DISABLE_AUTOUPDATER',
+      'CLAUDE_CODE_DISABLE_ARTIFACT',
+    ]) {
+      expect(settings.env[key], key).toBeUndefined();
+    }
+    expect(settings.attribution).toBeUndefined();
+    // back on the default auth slot, plain allowlist, user env intact
+    expect(settings.env.ANTHROPIC_AUTH_TOKEN).toBe('sk-gw');
+    expect(settings.availableModels).toEqual(['gw-large']);
+    expect(settings.env.CUSTOM).toBe('keep');
+  });
 });
 
 describe('applyRuntimeConfig — codex', () => {
@@ -225,6 +397,75 @@ describe('applyRuntimeConfig — codex', () => {
     const toml = readFileSync(path.join(home, '.codex/config.toml'), 'utf8');
     expect(toml).not.toContain('base_url');
     expect(toml).toContain('requires_openai_auth = true');
+  });
+
+  it('#63 — panel dials: effort/summary/verbosity, ints bare, seed fallback', () => {
+    const cfg = writeRel('.codex/config.toml', '');
+    applyRuntimeConfig(
+      'codex',
+      spec({
+        modelEntries: [{ id: 'gw-large', contextWindow: 272000 }],
+        codex: {
+          reasoningEffort: 'high',
+          reasoningSummary: 'detailed',
+          verbosity: 'low',
+          autoCompactTokenLimit: 900000,
+          switches: { updateCheckDisabled: true },
+        },
+      }),
+      'k',
+      home,
+    );
+    const toml = readFileSync(cfg, 'utf8');
+    expect(toml).toContain('model_reasoning_effort = "high"');
+    expect(toml).toContain('model_reasoning_summary = "detailed"');
+    expect(toml).toContain('model_verbosity = "low"');
+    // panel-unset contextWindow falls back to the DEFAULT model's seed entry…
+    expect(toml).toContain('model_context_window = 272000');
+    // …and integers render BARE — a quoted value is a TOML string, not i64
+    expect(toml).not.toContain('model_context_window = "');
+    expect(toml).toContain('model_auto_compact_token_limit = 900000');
+    expect(toml).toContain('check_for_update_on_startup = false');
+  });
+
+  it('#63 — contextWindow: panel beats seed; no panel + no seed = key removed', () => {
+    const cfg = writeRel('.codex/config.toml', 'model_context_window = 400000\n');
+    applyRuntimeConfig(
+      'codex',
+      spec({
+        modelEntries: [{ id: 'gw-large', contextWindow: 272000 }],
+        codex: { contextWindow: 1000000 },
+      }),
+      'k',
+      home,
+    );
+    expect(readFileSync(cfg, 'utf8')).toContain('model_context_window = 1000000');
+
+    applyRuntimeConfig(
+      'codex',
+      spec({ modelEntries: [{ id: 'gw-large', contextWindow: 272000 }] }),
+      'k',
+      home,
+    );
+    expect(readFileSync(cfg, 'utf8')).toContain('model_context_window = 272000');
+
+    applyRuntimeConfig('codex', spec(), 'k', home);
+    expect(readFileSync(cfg, 'utf8')).not.toContain('model_context_window');
+  });
+
+  it('#63 — a knob-less re-apply REMOVES every managed dial (revert semantics)', () => {
+    const cfg = writeRel(
+      '.codex/config.toml',
+      'model_reasoning_effort = "low"\nmodel_verbosity = "high"\ncheck_for_update_on_startup = false\n# keep\n[profiles.p]\nmodel = "p"\n',
+    );
+    applyRuntimeConfig('codex', spec(), 'k', home);
+    const toml = readFileSync(cfg, 'utf8');
+    expect(toml).not.toContain('model_reasoning_effort');
+    expect(toml).not.toContain('model_verbosity');
+    expect(toml).not.toContain('check_for_update_on_startup');
+    expect(toml).toContain('# keep');
+    expect(toml).toContain('[profiles.p]');
+    expect(toml).toContain('model = "p"'); // section key, not ours
   });
 });
 
@@ -309,6 +550,52 @@ describe('applyRuntimeConfig — deepseek', () => {
     expect(patch).not.toContain('gw-mini');
   });
 
+  it('#64 — per-model detail: panel wins per-field over the seed; vision claims images', () => {
+    applyRuntimeConfig(
+      'deepseek',
+      spec({
+        models: ['gw-mini'],
+        modelEntries: [
+          {
+            id: 'gw-large',
+            displayName: 'Seed Large',
+            contextWindow: 200000,
+            maxOutputTokens: 16000,
+            vision: true,
+          },
+          { id: 'gw-mini', contextWindow: 64000 },
+        ],
+        deepseek: { models: [{ id: 'gw-large', name: 'Panel Large', maxOutputTokens: 8000 }] },
+      }),
+      'sk-dsh',
+      home,
+    );
+    const settings = readFileSync(path.join(home, '.dsh/settings.yaml'), 'utf8');
+    // Panel name + maxTokens beat the seed; contextWindow falls to the seed
+    // (unquoted — a YAML number, not a string); vision rides the seed.
+    expect(settings).toContain('- id: "gw-large"');
+    expect(settings).toContain('name: "Panel Large"');
+    expect(settings).toContain('contextWindow: 200000');
+    expect(settings).toContain('maxTokens: 8000');
+    expect(settings).toContain('input: ["text", "image"]');
+    expect(settings).not.toContain('Seed Large');
+    // Seed-only entry: its contextWindow, no name, no vision claim.
+    expect(settings).toContain('- id: "gw-mini"');
+    expect(settings).toMatch(
+      /- id: "gw-mini"\s*\n\s*contextWindow: 64000\s*\n\s*agent-default-model:/,
+    );
+  });
+
+  it('#64 — bare ids stay byte-identical with no detail and no seed (compat)', () => {
+    applyRuntimeConfig('deepseek', spec(), 'sk-dsh', home);
+    const doc = readFileSync(path.join(home, '.dsh/settings.yaml'), 'utf8');
+    expect(doc).toContain('models:\n        - id: "gw-large"\nagent-default-model:');
+    // no detail keys leaked for a bare id
+    expect(doc).not.toContain('contextWindow:');
+    expect(doc).not.toContain('maxTokens:');
+    expect(doc).not.toContain('input:');
+  });
+
   it('a []-placeholder base is absorbed, not appended after (two docs = boot error)', () => {
     const only = mkdtempSync(path.join(tmpdir(), 'hnx-rc-empty-'));
     mkdirSync(path.join(only, '.dsh'), { recursive: true });
@@ -379,6 +666,11 @@ describe('applyRuntimeConfig — opencode (9 W12)', () => {
     expect(block.options.baseURL).toBe('https://gw.example.com/v1');
     expect(block.options.apiKey).toBe('{file:~/.config/opencode/harness-nexus.key}');
     expect(Object.keys(block.models)).toEqual(['gw-large', 'gw-mini']); // default leads the switchable set
+    // opencode ≥1.18 rejects bare `{}` model entries — every entry carries
+    // BOTH limit keys (fallbacks when the registry has no curated value:
+    // 1.18.31 rejects output-only entries with "Missing key …limit.context").
+    expect(block.models['gw-large']).toEqual({ limit: { output: 8192, context: 128_000 } });
+    expect(block.models['gw-mini']).toEqual({ limit: { output: 8192, context: 128_000 } });
     // RAW secret, no trailing newline — opencode reads the {file:} target
     // verbatim; a `\n` would ride the key and the gateway rejects it.
     expect(readFileSync(key(), 'utf8')).toBe('sk-test-1');
@@ -393,6 +685,153 @@ describe('applyRuntimeConfig — opencode (9 W12)', () => {
     );
     expect(readFileSync(key(), 'utf8')).toBe('sk-test-2');
     expect(JSON.parse(readFileSync(cfg(), 'utf8'))).toEqual(parsed); // byte-stable re-apply
+  });
+
+  it('fills model name/limit from #51 registry entries; bare ids keep the fallback', () => {
+    applyRuntimeConfig(
+      'opencode',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        models: ['gw-mini'],
+        modelEntries: [
+          {
+            id: 'gw-large',
+            displayName: 'Gateway Large',
+            contextWindow: 200_000,
+            maxOutputTokens: 16_384,
+          },
+        ],
+      }),
+      'sk-entry',
+      home,
+    );
+    const parsed = JSON.parse(readFileSync(cfg(), 'utf8')) as {
+      provider: Record<string, { models: Record<string, unknown> }>;
+    };
+    const models = parsed.provider['harness-nexus']!.models;
+    expect(models['gw-large']).toEqual({
+      name: 'Gateway Large',
+      limit: { output: 16_384, context: 200_000 },
+    });
+    expect(models['gw-mini']).toEqual({ limit: { output: 8192, context: 128_000 } });
+  });
+
+  it('#62 — panel detail wins per-field over the seed; capabilities, options, small_model, autoupdate', () => {
+    applyRuntimeConfig(
+      'opencode',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        models: ['gw-mini'],
+        modelEntries: [
+          {
+            id: 'gw-large',
+            displayName: 'Seeded Name',
+            contextWindow: 200_000,
+            maxOutputTokens: 16_384,
+          },
+        ],
+        opencode: {
+          models: [
+            {
+              id: 'gw-large',
+              name: 'Panel Name', // panel name wins over the seed
+              maxOutputTokens: 32_000, // panel output wins; context still seeds
+              reasoning: true,
+              temperatureEnabled: true,
+              vision: true,
+              options: { enable_thinking: true },
+            },
+            { id: 'gw-mini', contextWindow: 65_536 }, // bare id gets panel-only context
+          ],
+          smallModel: 'gw-mini',
+          autoupdateDisabled: true,
+        },
+      }),
+      'sk-panel',
+      home,
+    );
+    const parsed = JSON.parse(readFileSync(cfg(), 'utf8')) as {
+      small_model: string;
+      autoupdate: boolean;
+      provider: { 'harness-nexus'?: { models: Record<string, unknown> } };
+    };
+    const models = parsed.provider['harness-nexus']!.models;
+    expect(models['gw-large']).toEqual({
+      name: 'Panel Name',
+      reasoning: true,
+      temperature: true,
+      attachment: true,
+      options: { enable_thinking: true },
+      limit: { output: 32_000, context: 200_000 },
+    });
+    expect(models['gw-mini']).toEqual({ limit: { output: 8192, context: 65_536 } });
+    expect(parsed.small_model).toBe('harness-nexus/gw-mini');
+    expect(parsed.autoupdate).toBe(false);
+
+    // idempotent re-apply
+    const first = readFileSync(cfg(), 'utf8');
+    applyRuntimeConfig(
+      'opencode',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        models: ['gw-mini'],
+        modelEntries: [
+          {
+            id: 'gw-large',
+            displayName: 'Seeded Name',
+            contextWindow: 200_000,
+            maxOutputTokens: 16_384,
+          },
+        ],
+        opencode: {
+          models: [
+            {
+              id: 'gw-large',
+              name: 'Panel Name',
+              maxOutputTokens: 32_000,
+              reasoning: true,
+              temperatureEnabled: true,
+              vision: true,
+              options: { enable_thinking: true },
+            },
+            { id: 'gw-mini', contextWindow: 65_536 },
+          ],
+          smallModel: 'gw-mini',
+          autoupdateDisabled: true,
+        },
+      }),
+      'sk-panel',
+      home,
+    );
+    expect(readFileSync(cfg(), 'utf8')).toBe(first);
+  });
+
+  it('#62 — a knob-less re-apply REMOVES small_model/autoupdate; limits fall back', () => {
+    applyRuntimeConfig(
+      'opencode',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        models: undefined,
+        modelEntries: [{ id: 'gw-large', contextWindow: 131_072 }],
+      }),
+      'sk-panel',
+      home,
+    );
+    const parsed = JSON.parse(readFileSync(cfg(), 'utf8')) as {
+      small_model?: string;
+      autoupdate?: boolean;
+      provider: { 'harness-nexus'?: { models: Record<string, unknown> } };
+    };
+    expect(parsed.small_model).toBeUndefined();
+    expect(parsed.autoupdate).toBeUndefined();
+    // capabilities gone, limits back to seed → fallback chain
+    expect(parsed.provider['harness-nexus']!.models['gw-large']).toEqual({
+      limit: { output: 8192, context: 131_072 },
+    });
   });
 
   it('preserves user config keys and other providers', () => {
@@ -571,5 +1010,119 @@ describe('runApplyConfigJob', () => {
     const result = sock.last<{ ok: boolean; error?: string }>('job:result')!.payload;
     expect(result.ok).toBe(false);
     expect(result.error).toBe('harness payload invalid');
+  });
+});
+
+describe('applyRuntimeConfig — pi modelEntries (#51)', () => {
+  const models = (): string => path.join(home, '.pi/agent/models.json');
+
+  beforeAll(() => {
+    // The malformed-JSON refusal test above leaves a poisoned models.json
+    // behind (it must not touch it); start this describe from a clean .pi.
+    rmSync(path.join(home, '.pi'), { recursive: true, force: true });
+  });
+
+  it('enriches registry ids with name/contextWindow/maxTokens/input; bare ids stay bare', () => {
+    applyRuntimeConfig(
+      'pi',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        models: ['gw-mini', 'gw-unknown'],
+        modelEntries: [
+          {
+            id: 'gw-large',
+            displayName: 'Gateway Large',
+            contextWindow: 256_000,
+            maxOutputTokens: 32_000,
+          },
+          { id: 'gw-mini', displayName: 'Mini', contextWindow: 128_000, vision: true },
+        ],
+      }),
+      'sk-pi-9',
+      home,
+    );
+    const modelsDoc = JSON.parse(readFileSync(models(), 'utf8')) as {
+      providers: Record<string, { models: Array<Record<string, unknown>> }>;
+    };
+    const entries = modelsDoc.providers['harness-nexus']!.models;
+    expect(entries).toEqual([
+      {
+        id: 'gw-large',
+        name: 'Gateway Large',
+        contextWindow: 256_000,
+        maxTokens: 32_000,
+      },
+      { id: 'gw-mini', name: 'Mini', contextWindow: 128_000, input: ['text', 'image'] },
+      { id: 'gw-unknown' }, // absent from the registry → honest bare id
+    ]);
+  });
+
+  it('#65 — panel overlay wins per-field; reasoning + samplingParams are panel-only', () => {
+    rmSync(path.join(home, '.pi'), { recursive: true, force: true });
+    applyRuntimeConfig(
+      'pi',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        modelEntries: [
+          {
+            id: 'gw-large',
+            displayName: 'Seed Large',
+            contextWindow: 256_000,
+            maxOutputTokens: 32_000,
+            vision: true,
+          },
+        ],
+        pi: {
+          models: [
+            {
+              id: 'gw-large',
+              name: 'Panel Large',
+              contextWindow: 128_000,
+              reasoning: true,
+              samplingParams: { enable_thinking: true, top_p: 0.9 },
+            },
+          ],
+        },
+      }),
+      'sk-pi-10',
+      home,
+    );
+    const modelsDoc = JSON.parse(readFileSync(models(), 'utf8')) as {
+      providers: Record<string, { models: Array<Record<string, unknown>> }>;
+    };
+    const entry = modelsDoc.providers['harness-nexus']!.models[0]!;
+    // panel name + contextWindow beat the seed; maxTokens falls to the seed;
+    // vision rides the seed (panel left it unset); the two panel-only knobs ride along
+    expect(entry).toEqual({
+      id: 'gw-large',
+      name: 'Panel Large',
+      contextWindow: 128_000,
+      maxTokens: 32_000,
+      input: ['text', 'image'],
+      reasoning: true,
+      samplingParams: { enable_thinking: true, top_p: 0.9 },
+    });
+
+    // a knob-less re-apply drops the panel overlay and returns to the seed shape
+    applyRuntimeConfig(
+      'pi',
+      spec({
+        api: 'openai',
+        model: 'gw-large',
+        modelEntries: [{ id: 'gw-large', displayName: 'Seed Large', contextWindow: 256_000 }],
+      }),
+      'sk-pi-10',
+      home,
+    );
+    const resealed = JSON.parse(readFileSync(models(), 'utf8')) as {
+      providers: Record<string, { models: Array<Record<string, unknown>> }>;
+    };
+    expect(resealed.providers['harness-nexus']!.models[0]).toEqual({
+      id: 'gw-large',
+      name: 'Seed Large',
+      contextWindow: 256_000,
+    });
   });
 });

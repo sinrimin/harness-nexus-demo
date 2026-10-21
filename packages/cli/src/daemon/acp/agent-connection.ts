@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { type ChildProcess } from 'node:child_process';
 import { spawn } from '../../proc.js';
 import { createInterface } from 'node:readline';
@@ -43,6 +47,13 @@ export interface AcpSessionCaps {
   resume: boolean;
   /** `session/list` exists (the claude/codex listing path). */
   list: boolean;
+  /**
+   * #55 — `session/delete` exists (ACP-stabilized 2026-06). Adapter-dependent:
+   * claude-agent-acp ≥0.79 yes, opencode only from V2 (1.x has none), codex-acp
+   * not yet. Absent means the daemon reports the delete unsupported instead of
+   * firing a method the adapter would reject.
+   */
+  delete: boolean;
 }
 
 /**
@@ -69,6 +80,7 @@ export function deriveSessionCaps(result: unknown): AcpSessionCaps {
       r.agentCapabilities?.loadSession === true,
     resume: caps['resume'] !== undefined,
     list: caps['list'] !== undefined,
+    delete: caps['delete'] !== undefined,
   };
 }
 
@@ -227,7 +239,18 @@ export class AcpAgentConnection implements AgentConnection {
         // render elicitations, and only forwards MCP-server elicitations for
         // advertised modes. Other adapters ignore the capability. url mode is
         // deliberately NOT advertised (no OAuth-jump UI in the portal).
-        { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } },
+        //
+        // #71 — advertise native sub-agent sessions: claude-agent-acp then
+        // suppresses the Task tool call from the parent transcript, announces
+        // each child (`subagent_spawned`), streams the child's updates on the
+        // CHILD's own sessionId, and replays child transcripts on session/load.
+        // Without it the child's tool activity pours into the root session and
+        // interleaves with the main agent's transcript. Other adapters ignore
+        // the capability.
+        {
+          protocolVersion: 1,
+          clientCapabilities: { elicitation: { form: {} }, subagents: {} },
+        },
         initializeTimeoutMs,
       )) as typeof result;
     } catch (e) {

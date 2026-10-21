@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import type { Database } from 'better-sqlite3';
 import type {
   User,
@@ -12,6 +16,10 @@ import type {
   Resource,
   ResourceSource,
   AgentTarget,
+  AssistantConfig,
+  AssistantMessageRow,
+  AssistantRepository,
+  AssistantSession,
   Machine,
   MachineInventorySnapshot,
   InventoryAgentData,
@@ -60,6 +68,7 @@ interface PatRow {
 interface SettingsRow {
   id: number;
   allow_registration: number;
+  image_retention_days: number;
   updated_at: string;
 }
 interface CredentialRow {
@@ -324,8 +333,9 @@ export function sqliteSettingsRepository(db: Database): SystemSettingsRepository
     if (existing) return existing;
     const now = new Date().toISOString();
     db.prepare(
-      `INSERT INTO system_settings (id, allow_registration, updated_at) VALUES (1, ?, ?)`,
-    ).run(DEFAULTS.allowRegistration ? 1 : 0, now);
+      `INSERT INTO system_settings (id, allow_registration, image_retention_days, updated_at)
+       VALUES (1, ?, ?, ?)`,
+    ).run(DEFAULTS.allowRegistration ? 1 : 0, DEFAULTS.imageRetentionDays, now);
     return db.prepare('SELECT * FROM system_settings WHERE id = 1').get() as SettingsRow;
   };
 
@@ -334,15 +344,23 @@ export function sqliteSettingsRepository(db: Database): SystemSettingsRepository
       const row = ensureRow();
       return {
         allowRegistration: row.allow_registration === 1,
+        imageRetentionDays: row.image_retention_days,
         updatedAt: row.updated_at,
       };
     },
     async save(settings) {
+      ensureRow();
       const now = settings.updatedAt;
       db.prepare(
-        `UPDATE system_settings SET allow_registration = ?, updated_at = ? WHERE id = 1`,
-      ).run(settings.allowRegistration ? 1 : 0, now);
-      return { allowRegistration: settings.allowRegistration, updatedAt: now };
+        `UPDATE system_settings
+         SET allow_registration = ?, image_retention_days = ?, updated_at = ?
+         WHERE id = 1`,
+      ).run(settings.allowRegistration ? 1 : 0, settings.imageRetentionDays, now);
+      return {
+        allowRegistration: settings.allowRegistration,
+        imageRetentionDays: settings.imageRetentionDays,
+        updatedAt: now,
+      };
     },
   };
 }
@@ -650,6 +668,8 @@ interface MachineRow {
   base_workspace: string | null;
   /** Issue #3 — JSON per-target pre-warm map, NULL on pre-feature rows. */
   chat_prewarm: string | null;
+  /** Issue #49 — JSON per-target default-mode map, NULL on pre-feature rows. */
+  chat_default_mode: string | null;
   enrollment_pat_id: string;
   enrolled_at: string;
   last_seen_at: string | null;
@@ -673,8 +693,27 @@ function parseMachinePrewarm(raw: string | null): Machine['chatPrewarm'] | undef
   return undefined;
 }
 
+/** JSON column ↔ domain; invalid/legacy JSON null-normalizes (no default mode). */
+function parseMachineDefaultMode(raw: string | null): Machine['chatDefaultMode'] | undefined {
+  if (raw === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      typeof (parsed as Record<string, unknown>)['claude-code'] === 'string'
+    ) {
+      return parsed as Machine['chatDefaultMode'];
+    }
+  } catch {
+    // fall through
+  }
+  return undefined;
+}
+
 function mapMachine(row: MachineRow): Machine {
   const chatPrewarm = parseMachinePrewarm(row.chat_prewarm);
+  const chatDefaultMode = parseMachineDefaultMode(row.chat_default_mode);
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -687,6 +726,7 @@ function mapMachine(row: MachineRow): Machine {
     remoteChatEnabled: row.remote_chat_enabled === 1,
     baseWorkspace: row.base_workspace,
     ...(chatPrewarm !== undefined ? { chatPrewarm } : {}),
+    ...(chatDefaultMode !== undefined ? { chatDefaultMode } : {}),
     enrollmentPatId: row.enrollment_pat_id,
     enrolledAt: row.enrolled_at,
     lastSeenAt: row.last_seen_at,
@@ -722,10 +762,10 @@ export function sqliteMachineRepository(db: Database): MachineRepository {
       db.prepare(
         `INSERT INTO machines
            (id, owner_id, name, hostname, os, arch, daemon_version, capabilities,
-            remote_chat_enabled, base_workspace, chat_prewarm,
+            remote_chat_enabled, base_workspace, chat_prewarm, chat_default_mode,
             enrollment_pat_id, enrolled_at, last_seen_at)
          VALUES (@id, @owner_id, @name, @hostname, @os, @arch, @daemon_version, @capabilities,
-                 @remote_chat_enabled, @base_workspace, @chat_prewarm,
+                 @remote_chat_enabled, @base_workspace, @chat_prewarm, @chat_default_mode,
                  @enrollment_pat_id, @enrolled_at, @last_seen_at)
          ON CONFLICT(id) DO UPDATE SET
            name                = excluded.name,
@@ -737,6 +777,7 @@ export function sqliteMachineRepository(db: Database): MachineRepository {
            remote_chat_enabled = excluded.remote_chat_enabled,
            base_workspace      = excluded.base_workspace,
            chat_prewarm        = excluded.chat_prewarm,
+           chat_default_mode   = excluded.chat_default_mode,
            last_seen_at        = excluded.last_seen_at`,
       ).run({
         id: machine.id,
@@ -751,6 +792,8 @@ export function sqliteMachineRepository(db: Database): MachineRepository {
         base_workspace: machine.baseWorkspace,
         chat_prewarm:
           machine.chatPrewarm === undefined ? null : JSON.stringify(machine.chatPrewarm),
+        chat_default_mode:
+          machine.chatDefaultMode === undefined ? null : JSON.stringify(machine.chatDefaultMode),
         enrollment_pat_id: machine.enrollmentPatId,
         enrolled_at: machine.enrolledAt,
         last_seen_at: machine.lastSeenAt,
@@ -1095,6 +1138,8 @@ interface LlmProviderRow {
   credential_name: string;
   scope: string;
   owner_id: string | null;
+  /** #51 — JSON of ProviderModelConfig[]; NULL on pre-feature rows → []. */
+  models: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1107,6 +1152,7 @@ const mapLlmProvider = (r: LlmProviderRow): LlmProvider => ({
   credentialName: r.credential_name,
   scope: r.scope as LlmProvider['scope'],
   ownerId: r.owner_id,
+  models: r.models === null ? [] : (JSON.parse(r.models) as LlmProvider['models']),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -1146,13 +1192,14 @@ export function sqliteLlmProviderRepository(db: Database): LlmProviderRepository
     async save(provider) {
       db.prepare(
         `INSERT INTO llm_providers
-           (id, name, api, base_url, credential_name, scope, owner_id, created_at, updated_at)
-         VALUES (@id, @name, @api, @base_url, @credential_name, @scope, @owner_id, @created_at, @updated_at)
+           (id, name, api, base_url, credential_name, scope, owner_id, models, created_at, updated_at)
+         VALUES (@id, @name, @api, @base_url, @credential_name, @scope, @owner_id, @models, @created_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            name            = excluded.name,
            api             = excluded.api,
            base_url        = excluded.base_url,
            credential_name = excluded.credential_name,
+           models          = excluded.models,
            updated_at      = excluded.updated_at`,
       ).run({
         id: provider.id,
@@ -1162,6 +1209,7 @@ export function sqliteLlmProviderRepository(db: Database): LlmProviderRepository
         credential_name: provider.credentialName,
         scope: provider.scope,
         owner_id: provider.ownerId,
+        models: JSON.stringify(provider.models ?? []),
         created_at: provider.createdAt,
         updated_at: provider.updatedAt,
       });
@@ -1169,6 +1217,254 @@ export function sqliteLlmProviderRepository(db: Database): LlmProviderRepository
     },
     async delete(id) {
       db.prepare('DELETE FROM llm_providers WHERE id = ?').run(id);
+    },
+  };
+}
+
+// ---- assistant repository (#52) ----
+
+interface AssistantConfigRow {
+  id: string;
+  owner_id: string;
+  name: string;
+  description: string | null;
+  provider_id: string;
+  default_model: string;
+  system_prompt_override: string | null;
+  enabled_tool_groups: string;
+  mcp_server_ids: string | null;
+  skill_resource_ids: string | null;
+  daily_token_budget: number | null;
+  deleted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface AssistantSessionRow {
+  id: string;
+  owner_id: string;
+  assistant_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  last_message_at: string | null;
+}
+
+interface AssistantMessageRow_ {
+  session_id: string;
+  seq: number;
+  item: string;
+}
+
+interface AssistantToolCallRow {
+  id: string;
+  session_id: string;
+  user_id: string;
+  tool: string;
+  args: string;
+  status: string;
+  duration_ms: number;
+  created_at: string;
+}
+
+function mapAssistantConfig(r: AssistantConfigRow): AssistantConfig {
+  return {
+    id: r.id,
+    ownerId: r.owner_id,
+    name: r.name,
+    ...(r.description !== null ? { description: r.description } : {}),
+    providerId: r.provider_id,
+    defaultModel: r.default_model,
+    ...(r.system_prompt_override !== null
+      ? { systemPromptOverride: r.system_prompt_override }
+      : {}),
+    enabledToolGroups: JSON.parse(r.enabled_tool_groups) as AssistantConfig['enabledToolGroups'],
+    mcpServerIds: r.mcp_server_ids === null ? [] : (JSON.parse(r.mcp_server_ids) as string[]),
+    skillResourceIds:
+      r.skill_resource_ids === null ? [] : (JSON.parse(r.skill_resource_ids) as string[]),
+    ...(r.daily_token_budget !== null ? { dailyTokenBudget: r.daily_token_budget } : {}),
+    ...(r.deleted_at !== null ? { deletedAt: r.deleted_at } : {}),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function mapAssistantSession(r: AssistantSessionRow): AssistantSession {
+  return {
+    id: r.id,
+    ownerId: r.owner_id,
+    assistantId: r.assistant_id,
+    title: r.title,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    lastMessageAt: r.last_message_at,
+  };
+}
+
+export function sqliteAssistantRepository(db: Database): AssistantRepository {
+  return {
+    async findById(id) {
+      const row = db.prepare('SELECT * FROM assistant_configs WHERE id = ?').get(id) as
+        AssistantConfigRow | undefined;
+      return row ? mapAssistantConfig(row) : null;
+    },
+    async listByOwner(ownerId) {
+      const rows = db
+        .prepare(
+          'SELECT * FROM assistant_configs WHERE owner_id = ? AND deleted_at IS NULL ORDER BY created_at',
+        )
+        .all(ownerId) as AssistantConfigRow[];
+      return rows.map(mapAssistantConfig);
+    },
+    async findByName(ownerId, name) {
+      const row = db
+        .prepare(
+          'SELECT * FROM assistant_configs WHERE owner_id = ? AND name = ? AND deleted_at IS NULL',
+        )
+        .get(ownerId, name) as AssistantConfigRow | undefined;
+      return row ? mapAssistantConfig(row) : null;
+    },
+    async save(config) {
+      db.prepare(
+        `INSERT INTO assistant_configs
+           (id, owner_id, name, description, provider_id, default_model,
+            system_prompt_override, enabled_tool_groups, mcp_server_ids, skill_resource_ids,
+            daily_token_budget, deleted_at, created_at, updated_at)
+         VALUES (@id, @owner_id, @name, @description, @provider_id, @default_model,
+                 @system_prompt_override, @enabled_tool_groups, @mcp_server_ids, @skill_resource_ids,
+                 @daily_token_budget, @deleted_at, @created_at, @updated_at)
+         ON CONFLICT(id) DO UPDATE SET
+           name                   = excluded.name,
+           description            = excluded.description,
+           provider_id            = excluded.provider_id,
+           default_model          = excluded.default_model,
+           system_prompt_override = excluded.system_prompt_override,
+           enabled_tool_groups    = excluded.enabled_tool_groups,
+           mcp_server_ids         = excluded.mcp_server_ids,
+           skill_resource_ids     = excluded.skill_resource_ids,
+           daily_token_budget     = excluded.daily_token_budget,
+           deleted_at             = excluded.deleted_at,
+           updated_at             = excluded.updated_at`,
+      ).run({
+        id: config.id,
+        owner_id: config.ownerId,
+        name: config.name,
+        description: config.description ?? null,
+        provider_id: config.providerId,
+        default_model: config.defaultModel,
+        system_prompt_override: config.systemPromptOverride ?? null,
+        enabled_tool_groups: JSON.stringify(config.enabledToolGroups),
+        mcp_server_ids: JSON.stringify(config.mcpServerIds ?? []),
+        skill_resource_ids: JSON.stringify(config.skillResourceIds ?? []),
+        daily_token_budget: config.dailyTokenBudget ?? null,
+        deleted_at: config.deletedAt ?? null,
+        created_at: config.createdAt,
+        updated_at: config.updatedAt,
+      });
+      return config;
+    },
+    async delete(id) {
+      db.prepare('DELETE FROM assistant_configs WHERE id = ?').run(id);
+    },
+
+    async findSessionById(id) {
+      const row = db.prepare('SELECT * FROM assistant_sessions WHERE id = ?').get(id) as
+        AssistantSessionRow | undefined;
+      return row ? mapAssistantSession(row) : null;
+    },
+    async listSessions(ownerId, assistantId) {
+      const rows = (
+        assistantId === undefined
+          ? db
+              .prepare(
+                `SELECT * FROM assistant_sessions WHERE owner_id = ?
+                 ORDER BY COALESCE(last_message_at, created_at) DESC, created_at DESC`,
+              )
+              .all(ownerId)
+          : db
+              .prepare(
+                `SELECT * FROM assistant_sessions WHERE owner_id = ? AND assistant_id = ?
+                 ORDER BY COALESCE(last_message_at, created_at) DESC, created_at DESC`,
+              )
+              .all(ownerId, assistantId)
+      ) as AssistantSessionRow[];
+      return rows.map(mapAssistantSession);
+    },
+    async saveSession(session) {
+      db.prepare(
+        `INSERT INTO assistant_sessions
+           (id, owner_id, assistant_id, title, created_at, updated_at, last_message_at)
+         VALUES (@id, @owner_id, @assistant_id, @title, @created_at, @updated_at, @last_message_at)
+         ON CONFLICT(id) DO UPDATE SET
+           title           = excluded.title,
+           updated_at      = excluded.updated_at,
+           last_message_at = excluded.last_message_at`,
+      ).run({
+        id: session.id,
+        owner_id: session.ownerId,
+        assistant_id: session.assistantId,
+        title: session.title,
+        created_at: session.createdAt,
+        updated_at: session.updatedAt,
+        last_message_at: session.lastMessageAt,
+      });
+      return session;
+    },
+    async deleteSession(id) {
+      db.prepare('DELETE FROM assistant_sessions WHERE id = ?').run(id);
+    },
+
+    async appendMessage(sessionId, row) {
+      const { seq, ...item } = row;
+      db.prepare('INSERT INTO assistant_messages (session_id, seq, item) VALUES (?, ?, ?)').run(
+        sessionId,
+        seq,
+        JSON.stringify(item),
+      );
+    },
+    async listMessages(sessionId) {
+      const rows = db
+        .prepare('SELECT * FROM assistant_messages WHERE session_id = ? ORDER BY seq')
+        .all(sessionId) as AssistantMessageRow_[];
+      return rows.map((r) => ({
+        seq: r.seq,
+        ...(JSON.parse(r.item) as object),
+      })) as AssistantMessageRow[];
+    },
+    async clearMessages(sessionId) {
+      db.prepare('DELETE FROM assistant_messages WHERE session_id = ?').run(sessionId);
+    },
+
+    async appendToolCallAudit(audit) {
+      db.prepare(
+        `INSERT INTO assistant_tool_calls
+           (id, session_id, user_id, tool, args, status, duration_ms, created_at)
+         VALUES (@id, @session_id, @user_id, @tool, @args, @status, @duration_ms, @created_at)`,
+      ).run({
+        id: audit.id,
+        session_id: audit.sessionId,
+        user_id: audit.userId,
+        tool: audit.tool,
+        args: audit.args,
+        status: audit.status,
+        duration_ms: audit.durationMs,
+        created_at: audit.createdAt,
+      });
+    },
+    async listToolCallAudits(sessionId) {
+      const rows = db
+        .prepare('SELECT * FROM assistant_tool_calls WHERE session_id = ? ORDER BY created_at')
+        .all(sessionId) as AssistantToolCallRow[];
+      return rows.map((r) => ({
+        id: r.id,
+        sessionId: r.session_id,
+        userId: r.user_id,
+        tool: r.tool,
+        args: r.args,
+        status: r.status as 'ok' | 'error' | 'blocked',
+        durationMs: r.duration_ms,
+        createdAt: r.created_at,
+      }));
     },
   };
 }

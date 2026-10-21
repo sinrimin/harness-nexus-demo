@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * kit — the product's own devices (04-contract.md §2).
  *
@@ -25,4 +29,5 @@ export { CommandLine } from './command-line';
 export { ConfirmDialog } from './confirm-dialog';
 export { PageIntro } from './page-intro';
 export { Chip } from './chip';
+export { TagCombobox } from './tag-combobox';
 export { Region } from './region';

@@ -1,13 +1,10 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { useEffect, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
-import {
-  ChevronDownIcon,
-  FileCogIcon,
-  LaptopIcon,
-  PlusIcon,
-  RefreshCwIcon,
-  XIcon,
-} from 'lucide-react';
+import { FileCogIcon, LaptopIcon, PlusIcon, XIcon } from 'lucide-react';
 import { api } from '@/api';
 import { useAuth, withAuthGuard } from '@/auth';
 import { useI18n, dateLocale, type TranslationKey } from '@/i18n';
@@ -19,9 +16,10 @@ import {
   RUNTIME_API_SUPPORT,
   DEFAULT_CHAT_PREWARM_SETTINGS,
   providerApiToSpecApi,
+  setClaudeOneMarker,
+  stripClaudeOneMarker,
   type ChatPrewarmSettings,
   type CredentialView,
-  type LlmModelInfo,
   type LlmProviderView,
   type MachineView,
   type RuntimeConfigSpec,
@@ -32,12 +30,6 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
 import {
   Select,
   SelectContent,
@@ -55,6 +47,46 @@ import {
   DrawerTitle,
 } from '@/components/ui/drawer';
 import { ConfirmDialog, EmptyState, Panel, PanelBody, PanelHeader, Well } from '@/components/kit';
+import {
+  ClaudeCodePanel,
+  ccDraftFromSpec,
+  ccIssue,
+  emptyCcDraft,
+  serializeCcDraft,
+  type CcDraft,
+} from './claude-code-panel.js';
+import {
+  OpencodePanel,
+  ocDraftFromSpec,
+  ocIssue,
+  emptyOcDraft,
+  serializeOcDraft,
+  type OcDraft,
+} from './opencode-panel.js';
+import {
+  CodexPanel,
+  cxDraftFromSpec,
+  cxIssue,
+  emptyCxDraft,
+  serializeCxDraft,
+  type CxDraft,
+} from './codex-panel.js';
+import {
+  DeepseekPanel,
+  dsDraftFromSpec,
+  dsIssue,
+  emptyDsDraft,
+  serializeDsDraft,
+  type DsDraft,
+} from './deepseek-panel.js';
+import {
+  PiPanel,
+  piDraftFromSpec,
+  piIssue,
+  emptyPiDraft,
+  serializePiDraft,
+  type PiDraft,
+} from './pi-panel.js';
 import type { InventoryEntry, RuntimeInfoView } from './types.js';
 
 /**
@@ -169,7 +201,19 @@ function AgentRuntimeCard({
             machine={machine}
             onChanged={onChanged}
           />
-          <ProviderConfigForm machineId={machineId} target={entry.target} runtime={entry.runtime} />
+          <ProviderConfigForm
+            machineId={machineId}
+            target={entry.target}
+            runtime={entry.runtime}
+            // #60 — the claude-code panel owns every model-shaped and
+            // behavior-shaped control for that target; the #49 default
+            // permission mode rides along as its behavior section's slot.
+            defaultModeSlot={
+              entry.target === 'claude-code' ? (
+                <DefaultModeSelect machineId={machineId} machine={machine} onChanged={onChanged} />
+              ) : undefined
+            }
+          />
         </PanelBody>
       </Panel>
     </>
@@ -241,6 +285,77 @@ function PrewarmToggle({
         disabled={busy || machine === null}
         onCheckedChange={(v) => void toggle(v)}
       />
+    </div>
+  );
+}
+
+/**
+ * Issue #49 — this Agent's DEFAULT chat permission mode (machine-scoped;
+ * claude-code only — the only adapter whose ACP wrapper advertises permission
+ * modes, and it always resolves an explicit one itself, so the platform
+ * supplies the initial mode). Applied once at session establishment; the W9
+ * mode dropdown remains the mid-session switch. Option names stay English —
+ * they are the adapter's own wire names (same as the W9 dropdown).
+ */
+function DefaultModeSelect({
+  machineId,
+  machine,
+  onChanged,
+}: {
+  machineId: string;
+  machine: MachineView | null;
+  onChanged: () => void;
+}) {
+  const { logout } = useAuth();
+  const { t } = useI18n();
+  const [busy, setBusy] = useState(false);
+  const current = machine?.chatDefaultMode?.['claude-code'] ?? null;
+
+  async function apply(next: string): Promise<void> {
+    if (machine === null || busy) return;
+    setBusy(true);
+    try {
+      await withAuthGuard(
+        () =>
+          api.updateMachine(machineId, {
+            chatDefaultMode: { 'claude-code': next === 'none' ? null : next },
+          }),
+        logout,
+      );
+      onChanged();
+    } catch (e) {
+      toast.error(e instanceof HarnessNexusError ? e.message : t('common.updateFailed'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    // Rendered INSIDE the claude-code panel's behavior section (#60) — the
+    // same three-line field idiom as 默认模型 above: label / select / hint.
+    <div className="grid gap-2 pt-1">
+      <Label htmlFor="default-mode">{t('machineDetail.defaultMode')}</Label>
+      <Select
+        value={current ?? 'none'}
+        onValueChange={(v) => void apply(v)}
+        disabled={busy || machine === null}
+      >
+        <SelectTrigger
+          id="default-mode"
+          aria-label={t('machineDetail.defaultMode')}
+          className="w-full"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="none">{t('machineDetail.defaultModeNone')}</SelectItem>
+          <SelectItem value="default">Manual</SelectItem>
+          <SelectItem value="acceptEdits">Accept edits</SelectItem>
+          <SelectItem value="plan">Plan</SelectItem>
+          <SelectItem value="auto">Auto</SelectItem>
+        </SelectContent>
+      </Select>
+      <p className="text-muted-foreground text-xs">{t('machineDetail.defaultModeDesc')}</p>
     </div>
   );
 }
@@ -506,9 +621,11 @@ function ViewConfigButton({
  * Agent's LLM route, applied into the harness's NATIVE config by an
  * `apply-config` job (confirm-first: the write ships the credential's
  * plaintext to the machine). W10: pick a stored LlmProvider (filtered to the
- * APIs this Agent speaks) and only choose the model — 获取模型 discovers the
- * endpoint's list server-side. Manual entry remains as the fallback arm.
- * Renders nothing for targets the daemon doesn't runtime-manage.
+ * APIs this Agent speaks) and choose the model FROM the provider's curated
+ * registry (#51) — no live discovery here anymore. A provider without chat
+ * models and the manual arm keep free-text model inputs, so the form is
+ * never a dead end. Renders nothing for targets the daemon doesn't
+ * runtime-manage.
  */
 const MANUAL_PROVIDER = '__manual__';
 
@@ -520,7 +637,7 @@ const MANUAL_PROVIDER = '__manual__';
  *
  * The body is the kit's `Well`, not a hand-rolled box: these are protocol
  * values (a base URL, an api flavour, a credential NAME), i.e. exactly what the
- * well material exists for, and a hand-rolled `bg-muted/50 h-9 rounded-md` box
+ * well material exists for, and a hand-rolled `bg-muted/50` fixed-height box
  * was unreachable for skins — BAY painted its LCD inputs dark and left these
  * three light, with a 36px body next to 30px controls (reported from a phone,
  * P8). Height comes from the density token now.
@@ -556,10 +673,12 @@ function ProviderConfigForm({
   machineId,
   target,
   runtime,
+  defaultModeSlot,
 }: {
   machineId: string;
   target: string;
   runtime: RuntimeInfoView | null;
+  defaultModeSlot?: ReactNode;
 }) {
   const { logout } = useAuth();
   const { t } = useI18n();
@@ -573,8 +692,16 @@ function ProviderConfigForm({
   const [apiFlavor, setApiFlavor] = useState<string>('');
   const [credentialName, setCredentialName] = useState('');
   const [extraModels, setExtraModels] = useState<string[]>([]);
-  const [fetched, setFetched] = useState<LlmModelInfo[] | null>(null);
-  const [fetching, setFetching] = useState(false);
+  // #60 — claude-code's dedicated panel knobs (draft shape; serialized at apply).
+  const [cc, setCc] = useState<CcDraft>(emptyCcDraft);
+  // #62 — opencode's dedicated panel knobs.
+  const [oc, setOc] = useState<OcDraft>(emptyOcDraft);
+  // #63 — codex's dedicated panel knobs.
+  const [cx, setCx] = useState<CxDraft>(emptyCxDraft);
+  // #64 — dsh's dedicated panel knobs.
+  const [ds, setDs] = useState<DsDraft>(emptyDsDraft);
+  // #65 — pi's dedicated panel knobs.
+  const [pi, setPi] = useState<PiDraft>(emptyPiDraft);
   const [busy, setBusy] = useState(false);
   // P6 — Apply config confirms first (the credential goes to the machine).
   const [asking, setAsking] = useState(false);
@@ -585,6 +712,12 @@ function ProviderConfigForm({
   const usableProviders = (providers ?? []).filter((p) => supportedKinds.includes(p.api));
   const selectedProvider = usableProviders.find((p) => p.id === providerId) ?? null;
   const manual = selectedProvider === null;
+  // #51 — the registry is the picker's world: only chat rows are selectable.
+  // A provider with no chat models (and the manual arm) falls back to
+  // free-text model inputs below.
+  const chatModels =
+    selectedProvider !== null ? selectedProvider.models.filter((m) => m.type === 'chat') : [];
+  const useModelSelect = selectedProvider !== null && chatModels.length > 0;
 
   // Prefill: a stored providerId that still resolves selects that provider;
   // otherwise (no provider, or it was deleted) the manual arm carries the
@@ -628,10 +761,22 @@ function ProviderConfigForm({
       setProviderId(match?.id ?? MANUAL_PROVIDER);
       setProviderLabel(existing?.providerLabel ?? '');
       setBaseUrl(existing?.baseUrl ?? '');
-      setModel(existing?.model ?? '');
+      // #60 — the `[1m]` marker never rides the model STATE: prefill strips it
+      // into the panel's oneM checkbox, apply re-appends it (ccDraftFromSpec
+      // read the same spec, so the two agree).
+      setModel(existing?.model !== undefined ? stripClaudeOneMarker(existing.model) : '');
       setApiFlavor(existing?.api ?? apiOptions[0] ?? '');
       setCredentialName(existing?.credentialName ?? '');
-      setExtraModels((existing?.models ?? []).filter((m) => m !== existing?.model));
+      setExtraModels(
+        (existing?.models ?? []).filter(
+          (m) => m !== existing?.model && m !== stripClaudeOneMarker(existing?.model ?? ''),
+        ),
+      );
+      setCc(ccDraftFromSpec(existing));
+      setOc(ocDraftFromSpec(existing));
+      setCx(cxDraftFromSpec(existing));
+      setDs(dsDraftFromSpec(existing));
+      setPi(piDraftFromSpec(existing));
     })();
     return () => {
       cancelled = true;
@@ -647,50 +792,50 @@ function ProviderConfigForm({
   /** The credential that will be written — worth naming in the confirm dialog. */
   const effectiveCredential = selectedProvider?.credentialName ?? credentialName;
 
-  async function fetchModels(): Promise<void> {
-    setFetching(true);
-    try {
-      const list = await withAuthGuard(() => {
-        if (selectedProvider !== null) {
-          return api.queryProviderModels({ providerId: selectedProvider.id });
-        }
-        // Manual arm — the explicit query shape. Spec flavors map onto the
-        // fetch kinds (the models endpoint is shared by both openai kinds).
-        return api.queryProviderModels({
-          api: apiFlavor === 'anthropic-messages' ? 'anthropic' : 'openai-chat',
-          ...(baseUrl.trim() !== '' ? { baseUrl: baseUrl.trim() } : {}),
-          credentialName,
-        });
-      }, logout);
-      setFetched(list);
-      toast.success(t('machineDetail.fetchedCount', { count: list.length }));
-    } catch (e) {
-      toast.error(
-        e instanceof HarnessNexusError ? e.message : t('machineDetail.fetchModelsFailed'),
-      );
-    } finally {
-      setFetching(false);
-    }
-  }
-
   async function apply(): Promise<void> {
     setBusy(true);
     try {
       // Row inputs are free-typed: normalize before sending (trim, drop
-      // empties and the default, dedupe — the PUT would reject them).
+      // empties and the default, dedupe — the PUT would reject them). The
+      // claude-code 1M checkbox may have put a `[1m]` marker on the default
+      // model — rows dedupe against BOTH spellings (#60).
+      const wireModel = setClaudeOneMarker(model.trim(), cc.oneM);
+      const baseModel = stripClaudeOneMarker(model.trim());
       const normalizedExtras = [
-        ...new Set(extraModels.map((m) => m.trim()).filter((m) => m !== '' && m !== model.trim())),
+        ...new Set(
+          extraModels
+            .map((m) => m.trim())
+            .filter((m) => m !== '' && m !== baseModel && m !== wireModel),
+        ),
       ];
+      // #60/#62/#63/#64 — each panel serializes to undefined when everything
+      // is default, keeping untouched specs byte-identical to their old shape.
+      const claudeCode = serializeCcDraft(cc);
+      const opencode = serializeOcDraft(oc, [
+        ...new Set([model, ...extraModels].map((x) => x.trim()).filter((x) => x !== '')),
+      ]);
+      const codex = serializeCxDraft(cx);
+      const deepseek = serializeDsDraft(ds, [
+        ...new Set([model, ...extraModels].map((x) => x.trim()).filter((x) => x !== '')),
+      ]);
+      const piCfg = serializePiDraft(pi, [
+        ...new Set([model, ...extraModels].map((x) => x.trim()).filter((x) => x !== '')),
+      ]);
       const spec: RuntimeConfigSpec = {
         providerLabel: (selectedProvider?.name ?? providerLabel).trim(),
         api: (selectedProvider !== null
           ? providerApiToSpecApi(selectedProvider.api)
           : apiFlavor || apiOptions[0]) as RuntimeConfigSpec['api'],
-        model: model.trim(),
+        model: wireModel,
         credentialName: selectedProvider?.credentialName ?? credentialName,
         ...(selectedProvider !== null ? { providerId: selectedProvider.id } : {}),
         ...(normalizedExtras.length > 0 ? { models: normalizedExtras } : {}),
         ...(effectiveBaseUrl !== '' ? { baseUrl: effectiveBaseUrl } : {}),
+        ...(claudeCode !== undefined ? { claudeCode } : {}),
+        ...(opencode !== undefined ? { opencode } : {}),
+        ...(codex !== undefined ? { codex } : {}),
+        ...(deepseek !== undefined ? { deepseek } : {}),
+        ...(piCfg !== undefined ? { pi: piCfg } : {}),
       };
       await withAuthGuard(() => api.putRuntimeConfig(machineId, managedTarget!, spec), logout);
       toast.success(t('machineDetail.applyToast'));
@@ -704,29 +849,50 @@ function ProviderConfigForm({
   const ready =
     model.trim() !== '' &&
     !busy &&
+    ccIssue(cc) === null &&
+    ocIssue(oc, [
+      ...new Set([model, ...extraModels].map((x) => x.trim()).filter((x) => x !== '')),
+    ]) === null &&
+    cxIssue(cx) === null &&
+    dsIssue(ds, [
+      ...new Set([model, ...extraModels].map((x) => x.trim()).filter((x) => x !== '')),
+    ]) === null &&
+    piIssue(pi, [
+      ...new Set([model, ...extraModels].map((x) => x.trim()).filter((x) => x !== '')),
+    ]) === null &&
     (selectedProvider !== null || (providerLabel.trim() !== '' && credentialName !== ''));
 
   const needBaseUrlNote = selectedProvider !== null && selectedProvider.baseUrl === null;
 
   return (
     <>
-      <div className="flex flex-col gap-3 border-t px-6 pt-4">
+      <div className="flex flex-col gap-3 border-t px-6 pt-4 pb-4">
         <div>
           <p className="text-sm font-medium">{t('machineDetail.providerTitle')}</p>
           <p className="text-muted-foreground text-xs">{t('machineDetail.providerDesc')}</p>
         </div>
-        <div className="flex flex-wrap items-end gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:flex sm:flex-wrap sm:items-end">
           <div className="grid min-w-52 gap-2">
             <Label htmlFor={`pc-provider-${target}`}>{t('machineDetail.providerPickLabel')}</Label>
             <Select
               value={providerId}
               onValueChange={(v) => {
                 setProviderId(v);
-                setFetched(null);
-                setExtraModels([]);
+                // Registry cutover (#51): model/extras survive the switch only
+                // when the new provider's registry still lists them; the
+                // manual arm and a registry-less provider keep free-text values.
+                const next = usableProviders.find((p) => p.id === v) ?? null;
+                const ids = new Set(
+                  next !== null
+                    ? next.models.filter((m) => m.type === 'chat').map((m) => m.id)
+                    : [],
+                );
+                if (ids.size === 0) return;
+                setModel((prev) => (ids.has(prev.trim()) ? prev : ''));
+                setExtraModels((prev) => prev.filter((x) => ids.has(x.trim())));
               }}
             >
-              <SelectTrigger id={`pc-provider-${target}`}>
+              <SelectTrigger id={`pc-provider-${target}`} className="w-full">
                 <SelectValue placeholder={t('machineDetail.pickProvider')} />
               </SelectTrigger>
               <SelectContent>
@@ -823,8 +989,8 @@ function ProviderConfigForm({
                   </Select>
                 </div>
               ) : (
-                // Single-flavor target — same read-only h-9 cell as the preset
-                // arm, so the row heights match (was a tiny standalone badge).
+                // Single-flavor target — same read-only control-height cell as
+                // the preset arm, so the row heights match (was a badge).
                 <ReadonlyField label={t('machineDetail.apiLabel')} className="min-w-36">
                   {apiOptions[0]}
                 </ReadonlyField>
@@ -847,41 +1013,64 @@ function ProviderConfigForm({
             </>
           ) : null}
 
-          <div className="grid min-w-44 gap-2">
-            <Label htmlFor={`pc-model-${target}`}>{t('machineDetail.modelDefaultLabel')}</Label>
-            <div className="flex gap-2">
-              <Input
-                id={`pc-model-${target}`}
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                className="font-mono text-xs"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              {fetched !== null && fetched.length > 0 ? (
-                <FetchedModelMenu fetched={fetched} onPick={setModel} />
-              ) : null}
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className="shrink-0"
-                disabled={fetching || (manual && credentialName === '')}
-                onClick={() => void fetchModels()}
-                title={t('machineDetail.fetchModels')}
-                aria-label={t('machineDetail.fetchModels')}
-              >
-                <RefreshCwIcon className={fetching ? 'animate-spin' : ''} />
-              </Button>
+          {/* #60/#62/#63/#64/#65 — for claude-code, opencode, codex, deepseek
+            and pi the default-model picker lives inside the dedicated panel
+            (one surface per knob); other targets keep the generic grid. */}
+          {managedTarget !== 'claude-code' &&
+          managedTarget !== 'opencode' &&
+          managedTarget !== 'codex' &&
+          managedTarget !== 'deepseek' &&
+          managedTarget !== 'pi' ? (
+            <div className="grid min-w-44 gap-2">
+              <Label htmlFor={`pc-model-${target}`}>{t('machineDetail.modelDefaultLabel')}</Label>
+              {useModelSelect ? (
+                <Select value={model} onValueChange={setModel}>
+                  <SelectTrigger id={`pc-model-${target}`} className="font-mono text-xs">
+                    <SelectValue placeholder={t('machineDetail.pickModel')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {/* A stored id that predates the registry stays visible and
+                      submittable — the cutover never silently drops a working
+                      route (registry-less rows are reset on provider CHANGE,
+                      not on open). */}
+                    {model.trim() !== '' && !chatModels.some((m) => m.id === model.trim()) ? (
+                      <SelectItem value={model.trim()} className="font-mono text-xs">
+                        {model.trim()}
+                      </SelectItem>
+                    ) : null}
+                    {chatModels.map((m) => (
+                      <SelectItem key={m.id} value={m.id} className="font-mono text-xs">
+                        {m.displayName ?? m.id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  id={`pc-model-${target}`}
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  className="font-mono text-xs"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              )}
             </div>
-          </div>
-          <Button onClick={() => setAsking(true)} disabled={!ready}>
+          ) : null}
+          <Button
+            onClick={() => setAsking(true)}
+            disabled={!ready}
+            className="w-full sm:w-auto [@media(pointer:coarse)]:h-11"
+          >
             {busy ? t('machineDetail.applying') : t('machineDetail.applyButton')}
           </Button>
         </div>
 
         {needBaseUrlNote && managedTarget === 'deepseek' ? (
           <p className="text-warn text-xs">{t('machineDetail.baseUrlNeeded')}</p>
+        ) : null}
+        {selectedProvider !== null && chatModels.length === 0 ? (
+          <p className="text-muted-foreground text-xs">{t('machineDetail.noModelsOnProvider')}</p>
         ) : null}
         {providers !== null && usableProviders.length === 0 && manual ? (
           <p className="text-muted-foreground text-xs">{t('machineDetail.noProviders')}</p>
@@ -893,79 +1082,184 @@ function ProviderConfigForm({
           <p className="text-muted-foreground text-xs">{t('machineDetail.noCredentials')}</p>
         ) : null}
 
-        {/* 9 W13 — cc-switch-style extra models: rows are freely editable
-          inputs (fetching is optional; some gateways expose no /models), a
-          fetched list turns into per-row pick dropdowns, and any row can be
-          promoted to the default (the old default swaps into the rows). */}
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-2">
-            <span className="text-sm leading-none font-medium">
-              {t('machineDetail.extraModelsTitle')}
-            </span>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-xs"
-              onClick={() => setExtraModels((prev) => [...prev, ''])}
-            >
-              <PlusIcon className="size-3.5" />
-              {t('machineDetail.extraModelsAdd')}
-            </Button>
-          </div>
-          {extraModels.map((m, i) => (
-            <div key={i} className="flex max-w-2xl items-center gap-2">
-              <Input
-                value={m}
-                onChange={(e) =>
-                  setExtraModels((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))
-                }
-                placeholder={t('machineDetail.extraModelsPlaceholder')}
-                className="h-9 font-mono text-xs"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              {fetched !== null && fetched.length > 0 ? (
-                <FetchedModelMenu
-                  fetched={fetched}
-                  onPick={(id) => setExtraModels((prev) => prev.map((x, j) => (j === i ? id : x)))}
-                />
-              ) : null}
+        {/* 9 W13 — cc-switch-style extra models. With a provider picked the
+          rows pick from its registry, minus ids already used elsewhere (the
+          row's own id stays selectable); a registry-less provider and the
+          manual arm keep free-text rows. Any row can still be promoted to
+          the default (the old default swaps into the rows). #60/#62/#63/#64/#65:
+          for claude-code, opencode, codex, deepseek and pi these rows moved
+          into the dedicated panel. */}
+        {managedTarget !== 'claude-code' &&
+        managedTarget !== 'opencode' &&
+        managedTarget !== 'codex' &&
+        managedTarget !== 'deepseek' &&
+        managedTarget !== 'pi' ? (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-sm leading-none font-medium">
+                {t('machineDetail.extraModelsTitle')}
+              </span>
               <Button
                 type="button"
-                variant="ghost"
+                variant="outline"
                 size="sm"
-                className="text-muted-foreground h-9 shrink-0 px-2 text-xs hover:text-foreground"
-                disabled={m.trim() === '' || m.trim() === model.trim()}
-                onClick={() => {
-                  const id = m.trim();
-                  const old = model.trim();
-                  setModel(id);
-                  setExtraModels((prev) => {
-                    const kept = prev.filter((_, j) => j !== i);
-                    if (old !== '' && old !== id && !kept.some((x) => x.trim() === old)) {
-                      kept.push(old);
-                    }
-                    return kept;
-                  });
-                }}
+                className="h-7 px-2 text-xs [@media(pointer:coarse)]:h-9"
+                onClick={() => setExtraModels((prev) => [...prev, ''])}
               >
-                {t('machineDetail.extraModelsMakeDefault')}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="text-muted-foreground size-8 shrink-0 hover:text-danger"
-                onClick={() => setExtraModels((prev) => prev.filter((_, j) => j !== i))}
-                aria-label={t('machineDetail.extraModelsRemove', { model: m === '' ? '…' : m })}
-              >
-                <XIcon className="size-3.5" />
+                <PlusIcon className="size-3.5" />
+                {t('machineDetail.extraModelsAdd')}
               </Button>
             </div>
-          ))}
-          <p className="text-muted-foreground text-xs">{t('machineDetail.extraModelsHint')}</p>
-        </div>
+            {extraModels.map((m, i) => {
+              const used = new Set(
+                [model, ...extraModels.filter((_, j) => j !== i)]
+                  .map((x) => x.trim())
+                  .filter((x) => x !== ''),
+              );
+              const rowOptions = chatModels.filter((mm) => mm.id === m.trim() || !used.has(mm.id));
+              return (
+                <div key={i} className="flex max-w-2xl flex-wrap items-center gap-2">
+                  {useModelSelect ? (
+                    <Select
+                      value={m}
+                      onValueChange={(v) =>
+                        setExtraModels((prev) => prev.map((x, j) => (j === i ? v : x)))
+                      }
+                    >
+                      <SelectTrigger
+                        aria-label={t('machineDetail.pickModel')}
+                        className="min-w-0 flex-1 font-mono text-xs"
+                      >
+                        <SelectValue placeholder={t('machineDetail.pickModel')} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {m.trim() !== '' && !chatModels.some((mm) => mm.id === m.trim()) ? (
+                          <SelectItem value={m.trim()} className="font-mono text-xs">
+                            {m.trim()}
+                          </SelectItem>
+                        ) : null}
+                        {rowOptions.map((mm) => (
+                          <SelectItem key={mm.id} value={mm.id} className="font-mono text-xs">
+                            {mm.displayName ?? mm.id}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input
+                      value={m}
+                      onChange={(e) =>
+                        setExtraModels((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))
+                      }
+                      placeholder={t('machineDetail.extraModelsPlaceholder')}
+                      className="font-mono text-xs"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  )}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="text-muted-foreground h-(--control-h) shrink-0 px-2 text-xs hover:text-foreground"
+                    disabled={m.trim() === '' || m.trim() === model.trim()}
+                    onClick={() => {
+                      const id = m.trim();
+                      const old = model.trim();
+                      setModel(id);
+                      setExtraModels((prev) => {
+                        const kept = prev.filter((_, j) => j !== i);
+                        if (old !== '' && old !== id && !kept.some((x) => x.trim() === old)) {
+                          kept.push(old);
+                        }
+                        return kept;
+                      });
+                    }}
+                  >
+                    {t('machineDetail.extraModelsMakeDefault')}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="text-muted-foreground size-8 shrink-0 hover:text-danger"
+                    onClick={() => setExtraModels((prev) => prev.filter((_, j) => j !== i))}
+                    aria-label={t('machineDetail.extraModelsRemove', { model: m === '' ? '…' : m })}
+                  >
+                    <XIcon className="size-3.5" />
+                  </Button>
+                </div>
+              );
+            })}
+            <p className="text-muted-foreground text-xs">{t('machineDetail.extraModelsHint')}</p>
+          </div>
+        ) : null}
+
+        {/* #60 — claude-code's own knob panel: the agent's whole model +
+          behavior surface (the provider row above keeps only the connection).
+          The `[1m]` marker checkbox rides the draft, not the model string. */}
+        {managedTarget === 'claude-code' ? (
+          <ClaudeCodePanel
+            draft={cc}
+            onChange={setCc}
+            defaultModel={model}
+            onDefaultModelChange={setModel}
+            extraModels={extraModels}
+            onExtraModelsChange={setExtraModels}
+            chatModels={chatModels}
+            behaviorSlot={defaultModeSlot}
+          />
+        ) : null}
+        {managedTarget === 'opencode' ? (
+          <OpencodePanel
+            draft={oc}
+            onChange={setOc}
+            defaultModel={model}
+            onDefaultModelChange={setModel}
+            extraModels={extraModels}
+            onExtraModelsChange={setExtraModels}
+            chatModels={chatModels}
+          />
+        ) : null}
+        {/* #63 — codex's own knob panel (the provider row keeps the
+          connection). */}
+        {managedTarget === 'codex' ? (
+          <CodexPanel
+            draft={cx}
+            onChange={setCx}
+            defaultModel={model}
+            onDefaultModelChange={setModel}
+            extraModels={extraModels}
+            onExtraModelsChange={setExtraModels}
+            chatModels={chatModels}
+          />
+        ) : null}
+        {/* #64 — dsh's own knob panel (the provider row keeps the
+          connection). */}
+        {managedTarget === 'deepseek' ? (
+          <DeepseekPanel
+            draft={ds}
+            onChange={setDs}
+            defaultModel={model}
+            onDefaultModelChange={setModel}
+            extraModels={extraModels}
+            onExtraModelsChange={setExtraModels}
+            chatModels={chatModels}
+          />
+        ) : null}
+        {/* #65 — pi's own knob panel (the provider row keeps the
+          connection). */}
+        {managedTarget === 'pi' ? (
+          <PiPanel
+            draft={pi}
+            onChange={setPi}
+            defaultModel={model}
+            onDefaultModelChange={setModel}
+            extraModels={extraModels}
+            onExtraModelsChange={setExtraModels}
+            chatModels={chatModels}
+          />
+        ) : null}
       </div>
 
       {asking ? (
@@ -994,47 +1288,6 @@ function ProviderConfigForm({
           }}
         />
       ) : null}
-    </>
-  );
-}
-
-/**
- * A compact "pick from the fetched list" dropdown (cc-switch style) — sits
- * after a model input; picking fills THAT input. Rendered only while a fetch
- * succeeded; manual typing always stays available.
- */
-function FetchedModelMenu({
-  fetched,
-  onPick,
-}: {
-  fetched: LlmModelInfo[];
-  onPick: (id: string) => void;
-}) {
-  const { t } = useI18n();
-  if (fetched.length === 0) return null;
-  return (
-    <>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            className="shrink-0"
-            title={t('machineDetail.extraModelsPick')}
-            aria-label={t('machineDetail.extraModelsPick')}
-          >
-            <ChevronDownIcon className="size-4" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="max-h-72 overflow-y-auto">
-          {fetched.map((m) => (
-            <DropdownMenuItem key={m.id} onClick={() => onPick(m.id)} className="font-mono text-xs">
-              {m.name !== undefined && m.name !== m.id ? `${m.id} — ${m.name}` : m.id}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
     </>
   );
 }

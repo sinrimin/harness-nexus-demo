@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /** Chat pages (Phase 9 W6: agent cards + portal-style session page). */
 const en = {
   title: 'Chat',
@@ -20,12 +24,20 @@ const en = {
   // ---- session page ----
   backToAgents: 'All agents',
   newSession: 'New session',
+  welcomeGreeting: 'Where shall we start?',
+  welcomeSub: 'Start a new conversation, or pick one back up below.',
   noSessions: 'No sessions yet — create one to start.',
   sessionsUnsupported: 'This agent keeps no resumable session list.',
   sessionsUnsupportedPartial: 'This agent keeps no resumable session list — open channels only.',
   sessionsOffline: 'Machine offline — the session list needs the daemon.',
   sessionsDaemonOld: 'Upgrade hnx on the machine to list its native sessions.',
   newSessionHere: 'New session in {dir}',
+  // #55 — session deletion (both rails: platform rows and native rows).
+  deleteSessionTitle: 'Delete session',
+  deleteSessionAction: 'Delete session',
+  deleteSessionConsequence:
+    'The conversation and all its messages are permanently removed from its store.',
+  deleteFailed: 'Delete failed: {error}',
   // The rail's group header: the comp's `.sgroup-h` label over the directory.
   workingDirectory: 'Working directory',
   staleModel: 'pinned {model} no longer configured — not resumable',
@@ -39,6 +51,10 @@ const en = {
     'Pick the project directory for this session — a subdirectory of the machine base workspace. The agent works inside it.',
   useDirectory: 'Use directory',
   selectedDirectory: 'Selected directory (absolute path)',
+  // #70 — may type a not-yet-existing path; the daemon creates it at open.
+  autoCreateDir: 'Auto-create directory',
+  autoCreateDirHint:
+    'Typed paths that do not exist yet are created on the machine at open (must stay under the base workspace). Editing the path arms this automatically; tree picks leave it off.',
   needsBaseWorkspace:
     'This machine has no base workspace yet. Set one — an absolute path on the machine; chat sessions pick their project directory under it.',
   baseWorkspaceLabel: 'Base workspace',
@@ -75,6 +91,8 @@ const en = {
   // ---- composer / lifecycle ----
   connecting: 'connecting…',
   working: 'working',
+  // #68 — the dispatch tools' live-session link (exists while the channel does).
+  dispatchLiveLink: 'Live session',
   closed: 'closed',
   closedWithError: 'closed — {error}',
   placeholderReady: 'Send a message… (Enter to send, Shift+Enter for a new line)',
@@ -107,6 +125,7 @@ const en = {
   evicted: 'This channel was closed to make room for a newer one — reopen the session to continue.',
   // ---- 9 W11 B: live-channel tabs ----
   tabCloseAria: 'Close channel {id}',
+  tabStopAssistant: 'Stop this assistant turn ({id})',
   tabDeferred: 'finishing',
   tabIdleTitle: 'Idle since the last turn ended',
   tabsCleanupAll: 'Close all (busy ones finish first)',
@@ -157,6 +176,8 @@ const en = {
     'This channel is no longer live (the server or agent restarted) — open a new one.',
   errWorkspaceNotSet: 'This machine has no base workspace — set one in the picker first.',
   errWorkspaceInvalid: 'That directory is outside the machine base workspace.',
+  subagentTaskLabel: 'Task',
+  subagentTranscript: 'Sub-agent transcript',
 };
 
 const zh: typeof en = {
@@ -174,12 +195,18 @@ const zh: typeof en = {
   machineGroupLabel: '对话',
   backToAgents: '全部代理',
   newSession: '新建会话',
+  welcomeGreeting: '今天从哪里开始？',
+  welcomeSub: '开一个新会话，或从下面继续一段。',
   noSessions: '暂无会话——新建一个开始。',
   sessionsUnsupported: '该代理没有可恢复的会话列表。',
   sessionsUnsupportedPartial: '该代理不支持原生会话列表——仅显示打开的通道。',
   sessionsOffline: '机器离线——会话列表需要守护进程在线。',
   sessionsDaemonOld: '请升级机器上的 hnx 以列出原生会话。',
   newSessionHere: '在此目录新建会话（{dir}）',
+  deleteSessionTitle: '删除会话',
+  deleteSessionAction: '删除会话',
+  deleteSessionConsequence: '会话及其全部消息将从所属存储中永久删除。',
+  deleteFailed: '删除失败：{error}',
   workingDirectory: '工作目录',
   staleModel: '固定模型 {model} 已不在当前配置——无法恢复',
   untitled: '未命名会话',
@@ -190,6 +217,9 @@ const zh: typeof en = {
   pickDirectoryDesc: '为会话选择项目目录——机器基础工作区的子目录，代理将在其中工作。',
   useDirectory: '使用该目录',
   selectedDirectory: '选中目录（绝对路径）',
+  autoCreateDir: '自动创建目录',
+  autoCreateDirHint:
+    '手入的新路径若尚不存在，开聊时会在机器上创建（须位于基础工作区内）。手动编辑路径会自动勾选；从目录树选择则不影响。',
   needsBaseWorkspace:
     '此机器尚未设置基础工作区。请设置一个机器上的绝对路径；聊天会话将在其子目录中选择项目目录。',
   baseWorkspaceLabel: '基础工作区',
@@ -224,6 +254,7 @@ const zh: typeof en = {
   permissionsSettled: '已处理 {count} 个权限请求',
   connecting: '连接中…',
   working: '处理中',
+  dispatchLiveLink: '实时会话',
   closed: '已关闭',
   closedWithError: '已关闭 — {error}',
   placeholderReady: '发送消息…（Enter 发送，Shift+Enter 换行）',
@@ -255,6 +286,7 @@ const zh: typeof en = {
   evicted: '此通道已为更新的会话让位而被关闭——重新打开该会话即可继续。',
   // ---- 9 W11 B: live-channel tabs ----
   tabCloseAria: '关闭通道 {id}',
+  tabStopAssistant: '停止该助理回合（{id}）',
   tabDeferred: '收尾中',
   tabIdleTitle: '自上回合结束起闲置',
   tabsCleanupAll: '关闭全部（忙的收尾后关闭）',
@@ -297,6 +329,8 @@ const zh: typeof en = {
   errSessionGone: '该通道已不再在线（服务器或 Agent 重启过）—— 请重新打开一个。',
   errWorkspaceNotSet: '此机器未设置基础工作区——请先在选择器中设置。',
   errWorkspaceInvalid: '该目录不在机器基础工作区内。',
+  subagentTaskLabel: '任务',
+  subagentTranscript: '子代理记录',
 };
 
 export const chatStrings = { en, zh };

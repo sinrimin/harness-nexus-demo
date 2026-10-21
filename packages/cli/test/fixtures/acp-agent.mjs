@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * Fixture ACP agent (Phase 8 C5 tests + smoke; 9 W7 adds sessions). Speaks
  * ACP v1 — JSON-RPC 2.0, newline-delimited — over stdio:
@@ -20,16 +24,23 @@
  *     prompt containing 'ask-user' (9 W14.1):
  *        elicitation/create (a REQUEST, form mode) → the client's response is
  *        echoed as "elicitation answered: <json>" → end_turn
+ *     prompt containing 'run-subagent' (#71, RFD form as spoken by
+ *        claude-agent-acp ≥0.93): Agent tool_call (parent, ordinary) →
+ *        subagent_update running (parent announce) → session_message + text +
+ *        a Write tool_call + a usage frame on the CHILD's sessionId (usage
+ *        must be dropped child-side) → subagent_update idle/end_turn →
+ *        Agent tool_call_update completed → parent text → end_turn
  *     any other prompt: one thought chunk + one text chunk (echo) + usage → end_turn
  *   session/cancel → the pending prompt resolves {stopReason: 'cancelled'}
  *   session/close → {}
  *
- * FIXTURE_TAP_SPEAKER=1 (9 W7.1): emulate the hnx dsh tap PLUGIN — dial the
- *   daemon's HNX_TAP_PORT/HNX_TAP_TOKEN listener, say hello, and replay
- *   canned session-event-BUS rows during a plain echo turn (deltas during
- *   generation, a streamed-step commit, then turn/end AFTER the wire
- *   settles). Tests must pin FIXTURE_SESSION_ID — the daemon filters tap
- *   events by the acp session id.
+ * FIXTURE_TAP_SPEAKER=1 (9 W7.1; #46 frame protocol): emulate the hnx dsh
+ *   tap PLUGIN — dial the daemon's HNX_TAP_PORT/HNX_TAP_TOKEN listener, say
+ *   hello, replay canned `agent/assistant-stream` FRAMES (the per-token
+ *   deltas, dsh ≥0.1.3) and session-event-BUS rows during a plain echo turn
+ *   (frames during generation, a streamed-step commit, then turn/end AFTER
+ *   the wire settles). Tests must pin FIXTURE_SESSION_ID — the daemon filters
+ *   tap lines by the acp session id.
  *
  * FIXTURE_CONTEXT=1 (#26): usage_update also carries the context OCCUPANCY
  *   (`used`/`size`, the way the claude wrapper reports it), which is what the
@@ -75,14 +86,35 @@ if (process.env.FIXTURE_TAP_SPEAKER === '1') {
   const port = Number(process.env.HNX_TAP_PORT);
   const token = process.env.HNX_TAP_TOKEN;
   if (Number.isInteger(port) && port > 0 && token) {
-    const s = netConnect(port, '127.0.0.1');
-    tapSock = s;
-    s.on('connect', () => {
-      tapReady = true;
-      s.write(`${JSON.stringify({ type: 'hello', token, pid: process.pid })}\n`);
-    });
-    s.on('error', () => {});
+    // #47 — FIXTURE_TAP_DELAY_MS delays the plugin's dial (a slow cold boot:
+    // the daemon's hello grace must still catch it).
+    const delay = Number(process.env.FIXTURE_TAP_DELAY_MS ?? '0');
+    const dial = () => {
+      const s = netConnect(port, '127.0.0.1');
+      tapSock = s;
+      s.on('connect', () => {
+        tapReady = true;
+        s.write(`${JSON.stringify({ type: 'hello', token, pid: process.pid })}\n`);
+      });
+      s.on('error', () => {});
+    };
+    if (delay > 0) setTimeout(dial, delay);
+    else dial();
   }
+}
+
+// #47 — append a line on exit so tests can observe deliberate kills. Node's
+// default SIGTERM disposition skips 'exit' handlers, so exit cleanly instead.
+if (process.env.FIXTURE_EXIT_FILE) {
+  const exitFile = process.env.FIXTURE_EXIT_FILE;
+  process.on('exit', () => {
+    try {
+      appendFileSync(exitFile, `exit ${process.pid}\n`);
+    } catch {
+      /* best effort */
+    }
+  });
+  process.on('SIGTERM', () => process.exit(0));
 }
 
 /** One bus event for `sessionId` — verbatim SessionEvent envelope. */
@@ -95,37 +127,56 @@ function tapEvent(sessionId, event) {
   }
 }
 
+/** One assistant-stream frame for `sessionId` — the tap v2 delta arm (#46). */
+function tapFrame(sessionId, frame) {
+  if (!tapReady || tapSock === null) return;
+  try {
+    tapSock.write(`${JSON.stringify({ type: 'frame', sessionId, frame })}\n`);
+  } catch {
+    /* best effort */
+  }
+}
+
 /**
- * The tap-speaker echo turn: bus deltas stream DURING generation (incl. one
- * SUBAGENT session's event the daemon must filter out), the commit for the
+ * The tap-speaker echo turn: frame deltas stream DURING generation (incl. one
+ * SUBAGENT session's frame the daemon must filter out), the commit for the
  * already-streamed step carries only usage, the wire settles, and the bus
  * `turn/end` lands ~150ms AFTER the wire — the daemon must wait for it
  * before turn_result (the settle-from-tap contract).
  */
 function runTapSpeakerTurn(id, text, finish) {
   const sid = process.env.FIXTURE_SESSION_ID || 'fx-session';
-  tapEvent(sid, {
-    type: 'assistant/chunk',
-    seq: 1,
+  const attempt = `${sid}:1`;
+  tapFrame(sid, { type: 'start', attemptId: attempt, revision: 1, turn: 1, step: 0 });
+  tapFrame(sid, {
+    type: 'chunk',
+    attemptId: attempt,
+    revision: 2,
+    index: 0,
     time: 1,
-    data: { turn: 1, step: 0, chunk: { type: 'text-delta', text: 'tap-流式-1 ' } },
+    chunk: { type: 'text-delta', index: 0, text: 'tap-流式-1 ' },
   });
-  tapEvent('fx-subagent-session', {
-    type: 'assistant/chunk',
-    seq: 1,
+  tapFrame('fx-subagent-session', {
+    type: 'chunk',
+    attemptId: 'fx-subagent-session:1',
+    revision: 1,
+    index: 0,
     time: 1,
-    data: { turn: 1, step: 0, chunk: { type: 'text-delta', text: 'SUBAGENT-NOISE' } },
+    chunk: { type: 'text-delta', index: 0, text: 'SUBAGENT-NOISE' },
   });
   setTimeout(() => {
-    tapEvent(sid, {
-      type: 'assistant/chunk',
-      seq: 2,
+    tapFrame(sid, {
+      type: 'chunk',
+      attemptId: attempt,
+      revision: 3,
+      index: 1,
       time: 2,
-      data: { turn: 1, step: 0, chunk: { type: 'text-delta', text: 'tap-流式-2' } },
+      chunk: { type: 'text-delta', index: 0, text: 'tap-流式-2' },
     });
   }, 150);
   setTimeout(() => {
-    // Commit of the streamed step: the mapper must NOT re-render its blocks.
+    // Commit of the frame-streamed step: the mapper must NOT re-render its
+    // blocks (the frame arm already marked the step) — usage rides through.
     tapEvent(sid, {
       type: 'assistant/message',
       seq: 3,
@@ -433,6 +484,114 @@ function runPlanShowcase(id, sessionId) {
   finish();
 }
 
+// #71 — native sub-agent sessions: the adapter-side sequence the daemon must
+// route BY FRAME SESSION ID — the child is announced on the parent (the RFD
+// form claude-agent-acp ≥0.93 speaks for a plain `subagents` client), streams
+// its updates on the CHILD's own id (including a usage frame that must be
+// dropped child-side), and closes with a terminal state on the parent.
+// Nothing the child emits may leak into the root stream.
+function emitSubagentSequence(parentId) {
+  const childId = 'fx-sub-1';
+  // The RFD protocol keeps the launch as an ordinary parent tool call.
+  updateMeta(
+    parentId,
+    {
+      sessionUpdate: 'tool_call',
+      toolCallUpdate: {
+        toolCallId: 'fx-agent-1',
+        title: 'Create the fixture greeting',
+        kind: 'think',
+        status: 'in_progress',
+      },
+    },
+    { claudeCode: { toolName: 'Agent' } },
+  );
+  notify('session/update', {
+    sessionId: parentId,
+    update: {
+      sessionUpdate: 'subagent_update',
+      sessionId: childId,
+      title: 'fixture-worker',
+      description: 'Write the fixture greeting',
+      state: { state: 'running' },
+    },
+  });
+  notify('session/update', {
+    sessionId: childId,
+    update: {
+      sessionUpdate: 'session_message',
+      recipientSessionId: childId,
+      senderSessionId: parentId,
+      messageId: 'fx-agent-1',
+      content: [{ type: 'text', text: 'please write the greeting file' }],
+    },
+  });
+  notify('session/update', {
+    sessionId: childId,
+    update: {
+      sessionUpdate: 'agent_message_chunk',
+      contentBlock: { type: 'text', text: 'child step one\n' },
+    },
+  });
+  updateMeta(
+    childId,
+    {
+      sessionUpdate: 'tool_call',
+      toolCallUpdate: {
+        toolCallId: 'fx-sub-write-1',
+        title: 'greeting.txt',
+        kind: 'edit',
+        status: 'completed',
+        rawInput: { file_path: 'greeting.txt', content: 'hi from the child' },
+      },
+    },
+    { claudeCode: { toolName: 'Write' } },
+  );
+  // Child usage is a root-session concern — dropped, never wrapped.
+  notify('session/update', {
+    sessionId: childId,
+    update: {
+      sessionUpdate: 'usage_update',
+      usage: { input_tokens: 10, output_tokens: 5 },
+    },
+  });
+  notify('session/update', {
+    sessionId: parentId,
+    update: {
+      sessionUpdate: 'subagent_update',
+      sessionId: childId,
+      state: { state: 'idle', stopReason: 'end_turn' },
+    },
+  });
+  updateMeta(
+    parentId,
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallUpdate: {
+        toolCallId: 'fx-agent-1',
+        title: 'Create the fixture greeting',
+        kind: 'think',
+        status: 'completed',
+      },
+    },
+    { claudeCode: { toolName: 'Agent' } },
+  );
+  return childId;
+}
+
+function runSubagentShowcase(id, parentId) {
+  emitSubagentSequence(parentId);
+  notify('session/update', {
+    sessionId: parentId,
+    update: {
+      sessionUpdate: 'agent_message_chunk',
+      contentBlock: { type: 'text', text: 'echo: subagent finished\n' },
+    },
+  });
+  update(parentId, 'usage_update');
+  respond(id, { stopReason: 'end_turn' });
+}
+
 function runPrompt(id, text, deferred = false) {
   const sessionId = 'fx-session'; // single-session fixture; content is what matters
   const finish = (stopReason) => {
@@ -494,6 +653,11 @@ function runPrompt(id, text, deferred = false) {
 
   if (text.includes('show-plan')) {
     runPlanShowcase(id, sessionId);
+    return;
+  }
+
+  if (text.includes('run-subagent')) {
+    runSubagentShowcase(id, sessionId);
     return;
   }
 
@@ -648,6 +812,7 @@ function fixtureSessionConfig() {
         { id: 'default', name: 'Manual', description: 'Always ask before making changes' },
         { id: 'acceptEdits', name: 'Accept edits' },
         { id: 'plan', name: 'Plan' },
+        { id: 'auto', name: 'Auto' },
       ],
     },
     configOptions: [
@@ -700,6 +865,15 @@ function handleRequest(msg) {
   const { id, method, params } = msg;
   switch (method) {
     case 'initialize':
+      // #71 — tests point FIXTURE_INIT_FILE here to assert the initialize
+      // params (e.g. that clientCapabilities.subagents is advertised).
+      if (process.env.FIXTURE_INIT_FILE) {
+        try {
+          appendFileSync(process.env.FIXTURE_INIT_FILE, `${JSON.stringify(params)}\n`);
+        } catch {
+          /* best effort */
+        }
+      }
       // FIXTURE_NO_INIT=1 — emulate a wrapper that never completes the
       // handshake (e.g. npx dying on a corrupted cache): one stderr line as
       // the diagnostic breadcrumb, and NO response. Tests drive start()
@@ -710,7 +884,9 @@ function handleRequest(msg) {
       }
       respond(id, {
         protocolVersion: 1,
-        agentInfo: { name: 'fixture-agent', version: '0.1.0' },
+        // #70 — FIXTURE_AGENT_NAME reflects an env var the DAEMON's own
+        // environment carried into the spawn (proves the process.env base).
+        agentInfo: { name: process.env.FIXTURE_AGENT_NAME ?? 'fixture-agent', version: '0.1.0' },
         authMethods: [],
         agentCapabilities: {
           // 9 W9 B — FIXTURE_IMAGE_CAPS=1 flips the image capability (dsh
@@ -723,7 +899,11 @@ function handleRequest(msg) {
           sessionCapabilities:
             process.env.FIXTURE_ACP_NO_LOAD === '1'
               ? { list: {}, resume: {}, close: {} } // the dsh shape — no replay
-              : { list: {}, load: {}, resume: {}, close: {} },
+              : // #55 — FIXTURE_ACP_NO_DELETE=1 emulates the codex-acp /
+                // opencode-1.x shape: no session/delete capability.
+                process.env.FIXTURE_ACP_NO_DELETE === '1'
+                ? { list: {}, load: {}, resume: {}, close: {} }
+                : { list: {}, load: {}, resume: {}, close: {}, delete: {} },
         },
       });
       return;
@@ -781,9 +961,32 @@ function handleRequest(msg) {
         ],
       });
       return;
+    case 'session/delete':
+      // #55 — append the id to FIXTURE_DELETE_LOG so tests can assert the
+      // request reached the agent, then answer the spec's empty result.
+      if (process.env.FIXTURE_DELETE_LOG) {
+        appendFileSync(process.env.FIXTURE_DELETE_LOG, `${params?.sessionId ?? ''}\n`);
+      }
+      respond(id, {});
+      return;
     case 'session/load': {
       // The claude/codex shape: replay the prior turn BEFORE responding.
       const sid = params?.sessionId ?? 'fx-native-1';
+      // #71 — a resumed session that used a sub-agent replays the child the
+      // same way the live path saw it (announce → child-id frames → state),
+      // so the capture path routes identically.
+      if (sid === 'fx-native-sub') {
+        notify('session/update', {
+          sessionId: sid,
+          update: {
+            sessionUpdate: 'user_message_chunk',
+            contentBlock: { type: 'text', text: 'please run-subagent now' },
+          },
+        });
+        emitSubagentSequence(sid);
+        respond(id, { sessionId: sid });
+        return;
+      }
       if (sid === 'fx-native-fail') {
         // Establishment failure (the dsh pinned-model class) — the daemon
         // must surface the error AND kill this adapter process.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * SQLite schema migrations — append-only and idempotent.
  *
@@ -355,6 +359,124 @@ ALTER TABLE machines ADD COLUMN chat_prewarm TEXT;
 -- the row once no profile references it.
 ALTER TABLE mcp_servers ADD COLUMN deleted_at TEXT;
 ALTER TABLE resources ADD COLUMN deleted_at TEXT;
+    `,
+  },
+  {
+    version: 18,
+    description: 'issue #49 — per-target default chat permission modes (machine-scoped)',
+    sql: `
+-- JSON of { 'claude-code': string | null } per MACHINE; NULL on rows written
+-- before the feature → no platform default (adapter-resolved mode).
+ALTER TABLE machines ADD COLUMN chat_default_mode TEXT;
+    `,
+  },
+  {
+    version: 19,
+    description: 'issue #51 — provider model registry (configured models on the provider row)',
+    sql: `
+-- JSON of ProviderModelConfig[] (whole-row read/write — the chat_prewarm
+-- precedent, no cross-row queries worth a table). NULL on rows written before
+-- the feature → readers map it to [].
+ALTER TABLE llm_providers ADD COLUMN models TEXT;
+    `,
+  },
+  {
+    version: 20,
+    description: 'issue #52 — platform assistant (configs, sessions, transcript, tool-call audit)',
+    sql: `
+-- All owner-only rows (no scope column: personal by construction, the #36
+-- owner rule with no admin arm). Configs are soft-deleted (deleted_at set =
+-- gone from pickers, sessions stay readable). The transcript is append-only
+-- JSON items in seq order; the seq is caller-allocated and monotonic per
+-- session, so (session_id, seq) is the natural identity.
+CREATE TABLE IF NOT EXISTS assistant_configs (
+  id                    TEXT PRIMARY KEY,
+  owner_id              TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name                  TEXT NOT NULL,
+  description           TEXT,
+  provider_id           TEXT NOT NULL,
+  default_model         TEXT NOT NULL,
+  system_prompt_override TEXT,
+  enabled_tool_groups   TEXT NOT NULL DEFAULT '[]',
+  deleted_at            TEXT,
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_configs_owner ON assistant_configs(owner_id);
+-- PARTIAL: a soft-deleted config frees its name for reuse; live rows stay
+-- unique per owner.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_configs_owner_name
+  ON assistant_configs(owner_id, name) WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS assistant_sessions (
+  id              TEXT PRIMARY KEY,
+  owner_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  assistant_id    TEXT NOT NULL REFERENCES assistant_configs(id) ON DELETE CASCADE,
+  title           TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  last_message_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_owner ON assistant_sessions(owner_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_assistant ON assistant_sessions(assistant_id);
+
+CREATE TABLE IF NOT EXISTS assistant_messages (
+  session_id TEXT NOT NULL REFERENCES assistant_sessions(id) ON DELETE CASCADE,
+  seq        INTEGER NOT NULL,
+  item       TEXT NOT NULL,
+  PRIMARY KEY (session_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS assistant_tool_calls (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES assistant_sessions(id) ON DELETE CASCADE,
+  user_id     TEXT NOT NULL,
+  tool        TEXT NOT NULL,
+  args        TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_tool_calls_session ON assistant_tool_calls(session_id);
+    `,
+  },
+  {
+    version: 21,
+    description: 'issue #52 M2 — assistant config MCP server + skill resource references',
+    sql: `
+-- JSON of string ids (full replace on update). NULL on rows written before
+-- M2 → readers map it to []. Visibility is enforced at save; dialability and
+-- readability resolve at turn time (the pool / resource store decide).
+ALTER TABLE assistant_configs ADD COLUMN mcp_server_ids TEXT;
+ALTER TABLE assistant_configs ADD COLUMN skill_resource_ids TEXT;
+    `,
+  },
+  {
+    version: 22,
+    description: 'issue #52 M3 — per-config daily token budget',
+    sql: `
+-- NULL = unlimited. Summed over the config's assistant turns per UTC day;
+-- a cost guard enforced at turn start.
+ALTER TABLE assistant_configs ADD COLUMN daily_token_budget INTEGER;
+    `,
+  },
+  {
+    version: 23,
+    description: 'issue #59 — assistant image blobs: registry table + retention setting',
+    sql: `
+-- Bytes live on local disk (the data dir's files/ folder); this table is the
+-- registry the transcript blocks reference by id.
+CREATE TABLE IF NOT EXISTS file_objects (
+  id         TEXT PRIMARY KEY,
+  mime_type  TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_objects_expires ON file_objects (expires_at);
+
+-- Retention stamped on each blob AT INGEST; the default covers pre-#59 rows.
+ALTER TABLE system_settings ADD COLUMN image_retention_days INTEGER NOT NULL DEFAULT 30;
     `,
   },
 ] as const;

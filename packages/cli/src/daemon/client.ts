@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { arch, homedir, hostname, platform } from 'node:os';
 import { io, type Socket } from 'socket.io-client';
 import {
@@ -45,6 +49,10 @@ export const DAEMON_CAPABILITIES = [
   'runtime-config-view',
   'workspace',
   'sessions',
+  // #55 — `sessions:delete` over /ctl (native session deletion). Separate bit
+  // so the server can 409 with an upgrade hint against pre-#55 daemons
+  // instead of timing out on a request they never answer.
+  'sessions-delete',
   'marketplace-deploy',
 ];
 
@@ -155,7 +163,10 @@ export function startDaemon(options: DaemonOptions): DaemonHandle {
   // Issue #2 — the sessions listing reuses a live channel's adapter
   // connection instead of spawning a fresh one per rail paint.
   const chat = attachChatHandlers(socket);
-  attachSessionsHandlers(socket, { liveConnectionFor: chat.liveConnectionFor });
+  attachSessionsHandlers(socket, {
+    liveConnectionFor: chat.liveConnectionFor,
+    liveNativeIdsFor: chat.liveNativeIdsFor,
+  });
 
   const reportAll = (requestId?: string): void => {
     void (async () => {

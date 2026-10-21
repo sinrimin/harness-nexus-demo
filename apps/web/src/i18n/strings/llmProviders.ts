@@ -1,4 +1,8 @@
-/** LLM providers page (Phase 9 W10). */
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
+/** LLM providers page (Phase 9 W10; #51 model registry). */
 const en = {
   title: 'LLM providers',
   subtitle1: 'Reusable LLM routes — pick one on a machine page.',
@@ -13,6 +17,7 @@ const en = {
   addTitle: 'Add provider',
   addDesc: 'The route is stored here; the key stays in the referenced credential.',
   editTitle: 'Edit provider',
+  namePlaceholder: 'e.g. team-gateway',
   apiLabel: 'API kind',
   apiHint:
     'The kind must match the Agent — Claude Code: anthropic · Codex: openai-responses · DeepSeek: anthropic / openai-chat.',
@@ -34,13 +39,38 @@ const en = {
   deleteConsequence:
     'The route stops being selectable; machines keep the configs already applied to them.',
   deletedToast: 'Provider deleted',
-  fetchModels: 'Fetch models',
-  fetchModelsTitle: 'Models — {name}',
-  fetchModelsDesc: 'Discovered live from the provider endpoint (fetched server-side).',
-  fetchingModels: 'Fetching…',
-  fetchedCount: '{count} model(s)',
-  fetchModelsEmpty: 'The endpoint returned no models.',
-  fetchModelsFailed: 'Model list fetch failed',
+  // #51 — the model registry on the provider row.
+  modelsTitle: 'Models',
+  modelsDesc: 'Curated on this row — machine pages pick from this list instead of re-discovering.',
+  modelsCountTitle: '{count} model(s)',
+  noModelsYet: 'No models yet — fetch candidates or add one.',
+  addModel: 'Add model',
+  removeModel: 'Remove {id}',
+  fetchCandidates: 'Fetch candidates',
+  fetchCandidatesFailed: 'Fetching model candidates failed',
+  candidatesLoadedToast: 'Fetched {count} model(s) — pick them from the model-id dropdown.',
+  candidatesNoneToast: 'The endpoint returned no model ids',
+  modelIdLabel: 'Model id',
+  modelIdPlaceholder: 'model id',
+  modelDisplayNameLabel: 'Display name',
+  modelTypeLabel: 'Type',
+  modelContextLabel: 'Context window',
+  modelMaxOutputLabel: 'Max output',
+  modelVisionLabel: 'Vision',
+  advancedLabel: 'Advanced',
+  modelTemperatureLabel: 'Temperature',
+  modelTopPLabel: 'Top P',
+  serverToolsLabel: 'Server tools',
+  extraBodyLabel: 'Extended parameters',
+  extraBodyValuePlaceholder: '{"strategy": "turbo"}',
+  extraBodyInvalid: 'Invalid JSON value — that key is not saved',
+  tagComboboxPlaceholder: 'Select or type…',
+  tagComboboxAdd: 'Use “{value}”',
+  tagComboboxRemove: 'Remove {value}',
+  modelsWarningsTitle: 'Warnings',
+  warnServerTools: 'Model "{id}": server tools have no tools[] surface on openai-chat providers.',
+  warnExtraBody: 'Model "{id}": extra request body only applies to OpenAI-compatible providers.',
+  duplicateModelsError: 'Duplicate model ids: {ids}',
 };
 
 const zh: typeof en = {
@@ -57,6 +87,7 @@ const zh: typeof en = {
   addTitle: '添加供应商',
   addDesc: '路由存储于此；密钥仍存放在所引用的凭据中。',
   editTitle: '编辑供应商',
+  namePlaceholder: '例如：team-gateway',
   apiLabel: 'API 类型',
   apiHint:
     '类型需与 Agent 匹配 —— Claude Code：anthropic · Codex：openai-responses · DeepSeek：anthropic / openai-chat。',
@@ -76,13 +107,38 @@ const zh: typeof en = {
   deleteAction: '删除供应商',
   deleteConsequence: '该路由不再可用；各机器已应用的配置保持不变。',
   deletedToast: '供应商已删除',
-  fetchModels: '获取模型',
-  fetchModelsTitle: '模型——{name}',
-  fetchModelsDesc: '由服务端实时从供应商端点获取。',
-  fetchingModels: '获取中…',
-  fetchedCount: '{count} 个模型',
-  fetchModelsEmpty: '端点未返回任何模型。',
-  fetchModelsFailed: '获取模型列表失败',
+  // #51 —— 供应商行上的模型注册表。
+  modelsTitle: '模型',
+  modelsDesc: '在此维护——机器页直接从这份列表选模型，不再重复发现端点。',
+  modelsCountTitle: '{count} 个模型',
+  noModelsYet: '还没有模型——可获取候选或手动添加。',
+  addModel: '添加模型',
+  removeModel: '移除 {id}',
+  fetchCandidates: '获取候选',
+  fetchCandidatesFailed: '获取候选模型失败',
+  candidatesLoadedToast: '获取到 {count} 个候选模型——在模型 id 输入框的下拉中选择。',
+  candidatesNoneToast: '端点没有返回任何模型 id',
+  modelIdLabel: '模型 id',
+  modelIdPlaceholder: '模型 id',
+  modelDisplayNameLabel: '显示名',
+  modelTypeLabel: '类型',
+  modelContextLabel: '上下文大小',
+  modelMaxOutputLabel: '最大输出',
+  modelVisionLabel: '视觉',
+  advancedLabel: '高级选项',
+  modelTemperatureLabel: 'Temperature',
+  modelTopPLabel: 'Top P',
+  serverToolsLabel: '服务端工具',
+  extraBodyLabel: '扩展参数',
+  extraBodyValuePlaceholder: '{"strategy": "turbo"}',
+  extraBodyInvalid: 'JSON 值无效——该键不会保存',
+  tagComboboxPlaceholder: '选择或输入…',
+  tagComboboxAdd: '使用“{value}”',
+  tagComboboxRemove: '移除 {value}',
+  modelsWarningsTitle: '警告',
+  warnServerTools: '模型“{id}”：服务端工具在 openai-chat 协议上没有 tools[] 形态。',
+  warnExtraBody: '模型“{id}”：额外请求体仅对 OpenAI 兼容协议生效。',
+  duplicateModelsError: '模型 id 重复：{ids}',
 };
 
 export const llmProvidersStrings = { en, zh };

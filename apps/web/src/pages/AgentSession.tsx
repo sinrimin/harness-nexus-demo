@@ -1,8 +1,11 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import {
-  ArrowLeftIcon,
   ListIcon,
   BotIcon,
   ChevronRightIcon,
@@ -16,10 +19,11 @@ import { api } from '@/api';
 import { useAuth, withAuthGuard } from '@/auth';
 import { useI18n, dateLocale } from '@/i18n';
 import { StateSignal } from '@/components/state-signal';
-import { DataText, LabelText, Well } from '@/components/kit';
+import { DataText, LabelText, Well, ConfirmDialog } from '@/components/kit';
 import {
   appSocket,
   emitWithAck,
+  onAppResubscribe,
   type ChatChannelView,
   type ChatEventEnvelope,
   type ChatHistoryEvent,
@@ -38,8 +42,12 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { Dialog as DialogPrimitive } from 'radix-ui';
 import { ChatStream } from '@/components/chat/chat-stream.js';
+import { WelcomePane, type WelcomeCard } from '@/components/chat/welcome-pane.js';
 import { ChannelTabs } from '@/components/chat/channel-tabs.js';
+import { EndSwitcher } from '@/components/chat/end-switcher.js';
+import { SessionRow } from '@/components/chat/session-row.js';
 import { useChatChannels } from '@/components/chat/use-chat-channels.js';
+import { useAssistantSessions } from '@/components/chat/use-assistant-sessions.js';
 import {
   Composer,
   queuedPreview,
@@ -217,7 +225,9 @@ function SessionRail({
   onOpenChannel,
   onNewSession,
   onRefresh,
-  showBack,
+  onDeleteSession,
+  end,
+  endInDrawer,
 }: {
   rail: RailState;
   groups: SessionGroup[];
@@ -234,20 +244,26 @@ function SessionRail({
   ) => Promise<void>;
   onNewSession: () => void;
   onRefresh: () => void;
-  /** The drawer keeps no back-to-list button: closing it IS the way back. */
-  showBack?: boolean;
+  /**
+   * #55 — ask the page to confirm + delete a native session row. Rows with a
+   * live channel do not call it (the server refuses those); undefined hides
+   * the affordance entirely.
+   */
+  onDeleteSession?: (sessionId: string, title: string) => void;
+  /** The 端 switcher (both the desktop rail AND the phone drawer — the drawer
+   *  is the only rail on mobile, hiding the switcher there dead-ended the
+   *  machine ends). */
+  end?: { agentInstanceId: string; agentName?: string } | null;
+  /** The phone-drawer copy: its picks carry the ?rail hand-off so the
+   *  destination lands with the session drawer open. */
+  endInDrawer?: boolean;
 }) {
   const { t, lang } = useI18n();
   return (
     <>
-      <div className="flex items-center gap-2 border-b px-3 py-2.5">
-        {showBack === true ? (
-          <Button asChild variant="ghost" size="sm" className="gap-1.5 px-2">
-            <Link to="/chat">
-              <ArrowLeftIcon className="size-3.5" />
-              <span className="text-xs">{t('chat.backToAgents')}</span>
-            </Link>
-          </Button>
+      <div className="flex items-center gap-1 border-b px-2 py-2.5">
+        {end !== undefined && end !== null ? (
+          <EndSwitcher current={end} fromDrawer={endInDrawer} />
         ) : null}
         <span className="min-w-0 flex-1" />
         <Button
@@ -361,80 +377,94 @@ function SessionRail({
                           // being viewed.
                           const running = attached?.busy === true;
                           return (
-                            <button
+                            <SessionRow
                               key={s.sessionId}
-                              type="button"
-                              disabled={stale && !active}
-                              onClick={() => {
-                                if (active || stale) return;
-                                // With a live channel this is a REJOIN;
-                                // without one (fresh page, or after a
-                                // server restart — channels are
-                                // server-memory only) it is a fresh RESUME
-                                // of the same native session. Both keep the
-                                // row's promise: open this conversation
-                                // (#22 — the no-channel case used to be a
-                                // silent no-op).
-                                if (attached !== undefined) {
-                                  void onOpenChannel(attached.sessionId, undefined, {
-                                    sessionId: s.sessionId,
-                                    cwd: s.cwd,
-                                  });
-                                } else {
-                                  void onOpenChannel(undefined, undefined, {
-                                    sessionId: s.sessionId,
-                                    cwd: s.cwd,
-                                  });
-                                }
-                              }}
-                              className={cn(
-                                'flex w-full items-start gap-2 border-b px-3 py-2 text-left last:border-b-0',
-                                active ? 'bg-tray' : stale ? 'cursor-default' : 'hover:bg-tray/60',
-                                stale && !active && 'opacity-50',
-                              )}
-                              title={
-                                stale
-                                  ? t('chat.staleModel', { model: s.model ?? '?' })
-                                  : attached !== undefined && !active
-                                    ? t('chat.channelOpenHint')
-                                    : (s.title ?? s.cwd)
+                              deleteLabel={t('chat.deleteSessionAction')}
+                              onDelete={
+                                attached === undefined && onDeleteSession !== undefined
+                                  ? () =>
+                                      onDeleteSession(s.sessionId, s.title ?? t('chat.untitled'))
+                                  : undefined
                               }
                             >
-                              {/* The status gutter: green running, blue
+                              <button
+                                type="button"
+                                disabled={stale && !active}
+                                onClick={() => {
+                                  if (active || stale) return;
+                                  // With a live channel this is a REJOIN;
+                                  // without one (fresh page, or after a
+                                  // server restart — channels are
+                                  // server-memory only) it is a fresh RESUME
+                                  // of the same native session. Both keep the
+                                  // row's promise: open this conversation
+                                  // (#22 — the no-channel case used to be a
+                                  // silent no-op).
+                                  if (attached !== undefined) {
+                                    void onOpenChannel(attached.sessionId, undefined, {
+                                      sessionId: s.sessionId,
+                                      cwd: s.cwd,
+                                    });
+                                  } else {
+                                    void onOpenChannel(undefined, undefined, {
+                                      sessionId: s.sessionId,
+                                      cwd: s.cwd,
+                                    });
+                                  }
+                                }}
+                                className={cn(
+                                  'flex w-full items-start gap-2 border-b px-3 py-2 text-left last:border-b-0',
+                                  active
+                                    ? 'bg-tray'
+                                    : stale
+                                      ? 'cursor-default'
+                                      : 'hover:bg-tray/60',
+                                  stale && !active && 'opacity-50',
+                                )}
+                                title={
+                                  stale
+                                    ? t('chat.staleModel', { model: s.model ?? '?' })
+                                    : attached !== undefined && !active
+                                      ? t('chat.channelOpenHint')
+                                      : (s.title ?? s.cwd)
+                                }
+                              >
+                                {/* The status gutter: green running, blue
                                       opened, empty otherwise (#12/#13). Top-
                                       aligned, the way the comp's `.sess` lamp
                                       sits beside a two-line row. */}
-                              <span className="mt-1 flex w-2 shrink-0 justify-center">
-                                <StateSignal
-                                  state={
-                                    running ? 'busy' : attached !== undefined ? 'live' : 'idle'
-                                  }
-                                  className="size-1.5"
-                                />
-                              </span>
-                              <span className="min-w-0 flex-1">
-                                <span
-                                  className={cn(
-                                    'block truncate text-xs',
-                                    active && 'text-foreground font-semibold',
-                                  )}
-                                >
-                                  {s.title ??
-                                    (s.sessionId === nativeSessionId
-                                      ? firstPromptText
-                                      : undefined) ??
-                                    t('chat.untitled')}
+                                <span className="mt-1 flex w-2 shrink-0 justify-center">
+                                  <StateSignal
+                                    state={
+                                      running ? 'busy' : attached !== undefined ? 'live' : 'idle'
+                                    }
+                                    className="size-1.5"
+                                  />
                                 </span>
-                                {/* When + WHICH: the comp prints the age and the
+                                <span className="min-w-0 flex-1">
+                                  <span
+                                    className={cn(
+                                      'block truncate text-xs',
+                                      active && 'text-foreground font-semibold',
+                                    )}
+                                  >
+                                    {s.title ??
+                                      (s.sessionId === nativeSessionId
+                                        ? firstPromptText
+                                        : undefined) ??
+                                      t('chat.untitled')}
+                                  </span>
+                                  {/* When + WHICH: the comp prints the age and the
                                     short id, and the id is what a session can
                                     be resumed by. Data role, so the column of
                                     times stays tabular. */}
-                                <DataText size="sm" tone="dim" className="mt-0.5 block truncate">
-                                  {relativeTime(s.updatedAt, dateLocale(lang))} ·{' '}
-                                  {s.sessionId.slice(0, 8)}
-                                </DataText>
-                              </span>
-                            </button>
+                                  <DataText size="sm" tone="dim" className="mt-0.5 block truncate">
+                                    {relativeTime(s.updatedAt, dateLocale(lang))} ·{' '}
+                                    {s.sessionId.slice(0, 8)}
+                                  </DataText>
+                                </span>
+                              </button>
+                            </SessionRow>
                           );
                         })
                       : null}
@@ -487,6 +517,8 @@ export function AgentSessionPage() {
   const [conversation, dispatch] = useReducer(fold, undefined, createFoldState);
   /** 9 W11 B — the tab strip's live-channel truth (snapshot pushes). */
   const channels = useChatChannels();
+  /** #52 M3 — the user's busy assistant turns, as tabs ahead of the channels. */
+  const assistantSessions = useAssistantSessions();
   /** Phase carried by an open ack (consumed by the sessionId effect). */
   const pendingPhaseRef = useRef<'ready' | null>(null);
   /**
@@ -590,6 +622,27 @@ export function AgentSessionPage() {
     void refreshSessions();
   }, [refreshSessions]);
 
+  // #55 — native session deletion: the rail asks, the page confirms.
+  const [pendingDelete, setPendingDelete] = useState<{
+    sessionId: string;
+    title: string;
+  } | null>(null);
+  const deleteNativeSession = async (): Promise<void> => {
+    if (pendingDelete === null) return;
+    const { sessionId } = pendingDelete;
+    try {
+      await withAuthGuard(() => api.deleteAgentSession(agentId, sessionId), logout);
+    } catch (e) {
+      toast.error(
+        t('chat.deleteFailed', {
+          error: e instanceof HarnessNexusError ? e.message : String(e),
+        }),
+      );
+    }
+    setPendingDelete(null);
+    void refreshSessions(true);
+  };
+
   // 9 W11 B — arriving via a CHANNEL TAB of another agent: `?ch=<wireId>`
   // rejoins that channel once the agent data loaded (the tab bar stays
   // source-of-truth: if the channel died meanwhile, the rejoin bounces and
@@ -601,6 +654,16 @@ export function AgentSessionPage() {
     void openChannel(chParam);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chParam, agentId, agent]);
+
+  // ?rail — an end-switch hand-off (a pick from the phone drawer on the
+  // OTHER page): land with the SESSION drawer open so a session can be
+  // picked or created right away, then drop the one-shot param.
+  useEffect(() => {
+    if (searchParams.get('rail') === null) return;
+    setSearchParams({}, { replace: true });
+    setRailOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Reset the pane whenever the channel changes.
   useEffect(() => {
@@ -638,6 +701,20 @@ export function AgentSessionPage() {
       liveChannelRef.current = '';
       if (buffered.closed.reason === 'evicted') setError(t('chat.evicted'));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  // #66 — silent /app reconnect (weak network, lock screen): the socket is a
+  // NEW connection with no chan-room membership while this pane stays
+  // mounted. Re-join the open channel on reconnect; the server re-pushes
+  // ready + resync and the daemon ring replays whatever the gap missed. A
+  // channel that died anyway (grace expiry) bounces SESSION_NOT_FOUND and
+  // the error path surfaces it — honest, never a frozen pane.
+  useEffect(() => {
+    if (sessionId === '') return;
+    return onAppResubscribe(() => {
+      void openChannel(sessionId);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
@@ -704,6 +781,7 @@ export function AgentSessionPage() {
     rejoinId?: string,
     directory?: string,
     resume?: { sessionId: string; cwd: string },
+    createDirectory?: boolean,
   ): Promise<void> {
     if (agentId === '') return;
     setRailOpen(false);
@@ -724,6 +802,9 @@ export function AgentSessionPage() {
       ...(rejoinId !== undefined ? { sessionId: rejoinId } : {}),
       ...(directory !== undefined ? { directory } : {}),
       ...(resume !== undefined ? { resume } : {}),
+      // #70 — the picker's 自动创建目录: a typed NEW path is created on the
+      // machine at open; unchecked + missing = the daemon's honest refusal.
+      ...(createDirectory === true ? { createDirectory: true } : {}),
     });
     if (ack.error !== undefined || ack.sessionId === undefined) {
       const code = ack.error ?? 'unknown error';
@@ -872,7 +953,9 @@ export function AgentSessionPage() {
           ? t('chat.queueFull')
           : ack.error === 'MACHINE_BUSY'
             ? t('chat.errMachineBusy')
-            : ack.error,
+            : ack.error === 'MACHINE_OFFLINE'
+              ? t('chat.errMachineOffline')
+              : ack.error,
       );
     } else if (ack.queued === true) {
       toast.info(t('chat.queuedToast'));
@@ -1008,6 +1091,25 @@ export function AgentSessionPage() {
     rail.state === 'ready'
       ? (rail.sessions.find((s) => s.sessionId === nativeSessionId)?.cwd ?? undefined)
       : undefined;
+  /** #54 — the welcome's recent cards: this agent's sessions, newest first,
+   *  workspace (cwd) shown as the card's second line. */
+  const welcomeCards = useMemo<WelcomeCard[]>(() => {
+    if (rail.state !== 'ready') return [];
+    return [...rail.sessions]
+      .sort((a, b) => (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0))
+      .slice(0, 5)
+      .map((s) => ({
+        id: s.sessionId,
+        title: s.title ?? t('chat.untitled'),
+        workspace: s.cwd,
+        timeLabel: relativeTime(s.updatedAt ?? null, dateLocale(lang)),
+        // The no-channel RESUME path (a fresh page has no attached channel);
+        // an attached one rejoins inside openChannel the same way.
+        onClick: () =>
+          void openChannel(undefined, undefined, { sessionId: s.sessionId, cwd: s.cwd }),
+      }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rail, t, lang]);
   // #14 — the ACTIVE channel's optimistic title: the fold's first user
   // prompt, the same source every target titles its sessions from. Shown
   // while the vendor title hasn't been pulled yet; CSS truncates, the row
@@ -1064,6 +1166,11 @@ export function AgentSessionPage() {
           channels={channels}
           activeSessionId={sessionId}
           onActivate={activateChannel}
+          assistantBusy={assistantSessions.filter((s) => s.busy)}
+          onActivateAssistant={(s) => navigate(`/chat/assistants?s=${s.id}`)}
+          onStopAssistant={(s) => {
+            void emitWithAck('assistant:turn.cancel', { sessionId: s.id });
+          }}
           onClose={closeChannelTab}
           onCleanup={(idleOnly) => cleanupChannels(idleOnly)}
         />
@@ -1085,7 +1192,8 @@ export function AgentSessionPage() {
               onOpenChannel={openChannel}
               onNewSession={() => setPickerOpen(true)}
               onRefresh={() => void refreshSessions(true)}
-              showBack
+              onDeleteSession={(sessionId, title) => setPendingDelete({ sessionId, title })}
+              end={{ agentInstanceId: agentId, agentName: agent?.name }}
             />
           </aside>
 
@@ -1114,6 +1222,9 @@ export function AgentSessionPage() {
                     setPickerOpen(true);
                   }}
                   onRefresh={() => void refreshSessions(true)}
+                  onDeleteSession={(sessionId, title) => setPendingDelete({ sessionId, title })}
+                  end={{ agentInstanceId: agentId, agentName: agent?.name }}
+                  endInDrawer
                 />
               </DialogPrimitive.Content>
             </DialogPrimitive.Portal>
@@ -1173,54 +1284,69 @@ export function AgentSessionPage() {
               </p>
             ) : null}
 
-            <ChatStream
-              state={conversation}
-              cwd={currentCwd}
-              onPermissionRespond={(requestId, optionId) =>
-                void respondPermission(requestId, optionId)
-              }
-              onElicitationRespond={(requestId, action, values) =>
-                void respondElicitation(requestId, action, values)
-              }
-            />
-
-            <div className="shrink-0 p-3">
-              <div className="mx-auto w-full max-w-3xl">
-                {/* 9 W14 — the agent's todo/plan snapshot (full-replace ACP
-                    state; hidden when the agent never announced one). */}
-                <TodoPanel entries={conversation.plan ?? []} />
-                {conversation.queued !== null ? (
-                  <QueuedMessage
-                    blocks={conversation.queued}
-                    onEdit={queueEdit}
-                    onCancel={() => void queueCancel()}
-                  />
-                ) : null}
-                <Composer
-                  value={draft}
-                  onChange={changeDraft}
-                  phase={phase}
-                  turnActive={conversation.turnActive}
-                  usage={conversation.usage}
-                  onSend={() => void send()}
-                  onCancel={() => void cancelTurn()}
-                  attachments={attachments}
-                  fileRefs={fileRefs}
-                  onRemoveAttachment={(id) =>
-                    setAttachments((prev) => prev.filter((a) => a.id !== id))
+            {sessionId === '' ? (
+              // #54 — the rich welcome replaces the empty stream + sender:
+              // the new-session button and the recent-session cards are the
+              // entries (the sender appears once a session is open).
+              <WelcomePane
+                greeting={t('chat.welcomeGreeting')}
+                sub={t('chat.welcomeSub')}
+                actionLabel={t('chat.newSession')}
+                onAction={() => setPickerOpen(true)}
+                cards={welcomeCards}
+              />
+            ) : (
+              <>
+                <ChatStream
+                  state={conversation}
+                  cwd={currentCwd}
+                  onPermissionRespond={(requestId, optionId) =>
+                    void respondPermission(requestId, optionId)
                   }
-                  onRemoveFileRef={(uri) =>
-                    setFileRefs((prev) => prev.filter((f) => f.uri !== uri))
+                  onElicitationRespond={(requestId, action, values) =>
+                    void respondElicitation(requestId, action, values)
                   }
-                  onPickImages={(files) => void addImages(files)}
-                  onOpenFilePicker={() => setFilePickerOpen(true)}
-                  imageSupported={imageSupported}
-                  config={conversation.config satisfies ComposerConfig}
-                  onConfigSet={(set) => void configSet(set)}
-                  commands={conversation.commands}
                 />
-              </div>
-            </div>
+
+                <div className="shrink-0 p-3">
+                  <div className="mx-auto w-full max-w-3xl">
+                    {/* 9 W14 — the agent's todo/plan snapshot (full-replace ACP
+                    state; hidden when the agent never announced one). */}
+                    <TodoPanel entries={conversation.plan ?? []} />
+                    {conversation.queued !== null ? (
+                      <QueuedMessage
+                        blocks={conversation.queued}
+                        onEdit={queueEdit}
+                        onCancel={() => void queueCancel()}
+                      />
+                    ) : null}
+                    <Composer
+                      value={draft}
+                      onChange={changeDraft}
+                      phase={phase}
+                      turnActive={conversation.turnActive}
+                      usage={conversation.usage}
+                      onSend={() => void send()}
+                      onCancel={() => void cancelTurn()}
+                      attachments={attachments}
+                      fileRefs={fileRefs}
+                      onRemoveAttachment={(id) =>
+                        setAttachments((prev) => prev.filter((a) => a.id !== id))
+                      }
+                      onRemoveFileRef={(uri) =>
+                        setFileRefs((prev) => prev.filter((f) => f.uri !== uri))
+                      }
+                      onPickImages={(files) => void addImages(files)}
+                      onOpenFilePicker={() => setFilePickerOpen(true)}
+                      imageSupported={imageSupported}
+                      config={conversation.config satisfies ComposerConfig}
+                      onConfigSet={(set) => void configSet(set)}
+                      commands={conversation.commands}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
           </section>
         </div>
       </div>
@@ -1243,7 +1369,24 @@ export function AgentSessionPage() {
           onBaseWorkspaceSaved={(base) =>
             setMachine((prev) => (prev === null ? prev : { ...prev, baseWorkspace: base }))
           }
-          onPick={(directory) => void openChannel(undefined, directory)}
+          onPick={(directory, createDirectory) =>
+            void openChannel(undefined, directory, undefined, createDirectory)
+          }
+        />
+      ) : null}
+      {pendingDelete !== null ? (
+        <ConfirmDialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setPendingDelete(null);
+          }}
+          title={t('chat.deleteSessionTitle')}
+          consequence={t('chat.deleteSessionConsequence')}
+          impact={[{ value: pendingDelete.title }]}
+          actionLabel={t('chat.deleteSessionAction')}
+          tone="danger"
+          irreversible
+          onConfirm={() => void deleteNativeSession()}
         />
       ) : null}
     </>

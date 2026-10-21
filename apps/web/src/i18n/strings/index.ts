@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * Aggregate locale dictionaries. Every leaf in `strings/` owns its English and
  * Chinese copy side by side (the leaf types `zh` as `typeof en`, so key parity
@@ -22,6 +26,7 @@ import { machinesStrings } from './machines.js';
 import { machineDetailStrings } from './machineDetail.js';
 import { skillHubStrings } from './skillHub.js';
 import { chatStrings } from './chat.js';
+import { assistantsStrings } from './assistants.js';
 import { kitStrings } from './kit.js';
 import { demoStrings } from './demo.js';
 
@@ -43,6 +48,7 @@ export const en = {
   machineDetail: machineDetailStrings.en,
   skillHub: skillHubStrings.en,
   chat: chatStrings.en,
+  assistants: assistantsStrings.en,
   kit: kitStrings.en,
   demo: demoStrings.en,
 };
@@ -65,6 +71,7 @@ export const zh: typeof en = {
   machineDetail: machineDetailStrings.zh,
   skillHub: skillHubStrings.zh,
   chat: chatStrings.zh,
+  assistants: assistantsStrings.zh,
   kit: kitStrings.zh,
   demo: demoStrings.zh,
 };

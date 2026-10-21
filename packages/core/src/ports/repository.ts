@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * Repository ports — the contracts storage drivers implement.
  *
@@ -10,6 +14,11 @@
 import type {
   Credential,
   AgentInstance,
+  AssistantConfig,
+  AssistantMessageRow,
+  AssistantSession,
+  AssistantToolCallAudit,
+  FileObject,
   Job,
   LlmProvider,
   Machine,
@@ -78,6 +87,24 @@ export interface SystemSettingsRepository {
   /** Always returns a value; drivers seed defaults on first access. */
   get(): Promise<SystemSettings>;
   save(settings: SystemSettings): Promise<SystemSettings>;
+}
+
+/**
+ * #59 — the assistant transcript's image blobs. Bytes are deliberately NOT a
+ * repository-shaped concern beyond these four operations: no dedup (every
+ * ingest is its own object), no cross-row queries — the sqlite driver keeps a
+ * small registry table and the bytes on local disk; the memory driver keeps
+ * them in a map.
+ */
+export interface FileBlobRepository {
+  /** Store one blob; the id is generated. `expiresAt` is stamped by the caller. */
+  put(input: { data: Uint8Array; mimeType: string; expiresAt: string }): Promise<FileObject>;
+  /** The registry row + bytes; null when the id is unknown OR the payload is missing. */
+  get(id: string): Promise<{ row: FileObject; data: Uint8Array } | null>;
+  /** Idempotent — a missing row or payload is not an error. */
+  delete(id: string): Promise<void>;
+  /** Reclaim everything whose (stamped) `expiresAt` has passed; returns the count. */
+  purgeExpired(now: string): Promise<number>;
 }
 
 export interface McpServerRepository {
@@ -187,6 +214,36 @@ export interface LlmProviderRepository {
   delete(id: string): Promise<void>;
 }
 
+/**
+ * Issue #52 — the platform assistant's stores. Every row is owner-only; the
+ * service layer enforces that (404 existence-hiding). Soft-deleted configs
+ * (`deletedAt` set) are excluded from `listByOwner` but still readable by id
+ * so their sessions stay openable.
+ */
+export interface AssistantRepository {
+  findById(id: string): Promise<AssistantConfig | null>;
+  /** The owner's live configs (soft-deleted excluded). */
+  listByOwner(ownerId: string): Promise<AssistantConfig[]>;
+  /** Name uniqueness is per owner — the service enforces it read-then-write. */
+  findByName(ownerId: string, name: string): Promise<AssistantConfig | null>;
+  save(config: AssistantConfig): Promise<AssistantConfig>;
+  delete(id: string): Promise<void>;
+
+  findSessionById(id: string): Promise<AssistantSession | null>;
+  /** The owner's sessions for one assistant (or every assistant when omitted), newest activity first. */
+  listSessions(ownerId: string, assistantId?: string): Promise<AssistantSession[]>;
+  saveSession(session: AssistantSession): Promise<AssistantSession>;
+  deleteSession(id: string): Promise<void>;
+
+  /** Append-only transcript in `seq` order (the caller allocates seq). */
+  appendMessage(sessionId: string, row: AssistantMessageRow): Promise<void>;
+  listMessages(sessionId: string): Promise<AssistantMessageRow[]>;
+  clearMessages(sessionId: string): Promise<void>;
+
+  appendToolCallAudit(audit: AssistantToolCallAudit): Promise<void>;
+  listToolCallAudits(sessionId: string): Promise<AssistantToolCallAudit[]>;
+}
+
 export interface UnitOfWork {
   resources: ResourceRepository;
   profiles: ProfileRepository;
@@ -201,4 +258,6 @@ export interface UnitOfWork {
   agentInstances: AgentInstanceRepository;
   runtimeConfigs: RuntimeConfigRepository;
   llmProviders: LlmProviderRepository;
+  assistants: AssistantRepository;
+  fileBlobs: FileBlobRepository;
 }

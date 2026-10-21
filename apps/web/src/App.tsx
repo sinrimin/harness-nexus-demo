@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { AuthProvider } from '@/auth';
@@ -25,6 +29,8 @@ import { MachinesPage } from '@/pages/Machines';
 import { MachineDetailPage } from '@/pages/MachineDetail';
 import { ChatPage } from '@/pages/Chat';
 import { AgentSessionPage } from '@/pages/AgentSession';
+import { AssistantSessionPage } from '@/pages/AssistantSession';
+import { AssistantsPage } from '@/pages/Assistants';
 
 /** The chrome every protected page renders inside (nav.ts holds the manifest). */
 function ShellLayout() {
@@ -44,6 +50,8 @@ const PAGES: Record<RouteId, ReactNode> = {
   home: <DashboardPage />,
   chat: <ChatPage />,
   chatSession: <AgentSessionPage />,
+  assistantSession: <AssistantSessionPage />,
+  assistants: <AssistantsPage />,
   machines: <MachinesPage />,
   machineDetail: <MachineDetailPage />,
   skills: <SkillsPage />,

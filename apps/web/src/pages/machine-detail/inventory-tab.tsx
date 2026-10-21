@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -118,7 +122,7 @@ function TargetItemsCard({ entry, machineId }: { entry: InventoryEntry; machineI
             </Badge>
           ) : null}
         </PanelHeader>
-        <PanelBody variant="flush" className="flex flex-col gap-0">
+        <PanelBody variant="flush" className="flex flex-col gap-0 pb-4">
           {/* A not-installed Agent leads with its absence; leftover items (if
             any) still render honestly below — files can outlive binaries. */}
           {notInstalled && items.length === 0 ? (

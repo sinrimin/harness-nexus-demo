@@ -1,12 +1,18 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { homedir } from 'node:os';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Socket } from 'socket.io-client';
 import {
+  CLAUDE_CODE_TIERS,
   harnessJobPayloadSchema,
   harnessResultDataSchema,
   OPENCODE_PROVIDER_ID,
   PI_PROVIDER_ID,
+  stripClaudeOneMarker,
   type JobView,
   type RuntimeConfigSpec,
 } from '@harness-nexus/shared';
@@ -27,19 +33,32 @@ import { logOp } from './logbook.js';
  * every touched file ends 0600. Ground truth per target:
  *
  *  - claude-code: `~/.claude/settings.json` — `env.ANTHROPIC_BASE_URL` (only
- *    while the spec sets one; a later unset REMOVES ours), `env.ANTHROPIC_AUTH_TOKEN`
- *    (the key), top-level `model` (base URL alone doesn't switch the model),
+ *    while the spec sets one; a later unset REMOVES ours), the key on
+ *    `env.ANTHROPIC_AUTH_TOKEN` or `env.ANTHROPIC_API_KEY` (#60 panel choice),
+ *    top-level `model` (base URL alone doesn't switch the model),
  *    and top-level `availableModels` = unique([model, ...models]) (9 W13 —
  *    the ACP wrapper restricts its model configOption to this allowlist, so
  *    the session dropdown lists only gateway-servable ids; it also narrows
  *    the machine's terminal /model picker, which is the documented Claude
- *    Code semantics for a managed route).
+ *    Code semantics for a managed route). #60 adds the dedicated claude-code
+ *    panel knobs (`spec.claudeCode`): alias-tier pins
+ *    (`ANTHROPIC_DEFAULT_{TIER}_MODEL` + `_NAME`/`_SUPPORTED_CAPABILITIES`),
+ *    `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_MAX_{OUTPUT,CONTEXT}_TOKENS`,
+ *    `CLAUDE_CODE_EXTRA_BODY` — all in the env block, all with the same
+ *    unset-REMOVES-ours revert semantics; `[1m]` markers stay on the model
+ *    slots and are stripped from the allowlist.
  *  - codex: `~/.codex/config.toml` — root keys `model` + `model_provider`, and
  *    the `[model_providers.harness_nexus]` block with `requires_openai_auth =
  *    true` (the built-in provider's own shape — auth comes from auth.json, no
  *    env var). `~/.codex/auth.json` — apikey mode with the key as
  *    `OPENAI_API_KEY`. `wire_api` is NOT set: current codex removed `chat`, so
  *    every route speaks Responses — gateways must be Responses-compatible.
+ *    #63 adds the panel dials (`spec.codex`): `model_reasoning_effort`,
+ *    `model_reasoning_summary`, `model_verbosity`,
+ *    `model_context_window` (panel value > the #51 modelEntries seed of the
+ *    default model > key removed), `model_auto_compact_token_limit`, and
+ *    `check_for_update_on_startup = false` while the switch is on — all
+ *    TOP-LEVEL keys with the claude-code unset-REMOVES-ours revert semantic.
  *  - deepseek: the SETTINGS layer (`~/.dsh/settings.yaml`, namespace
  *    `llm-pi-ai` with the provider route + `agent-default-model` selecting
  *    it). NOT loader-entry inserts in `cordis.patch.yml` — the dsh
@@ -49,6 +68,10 @@ import { logOp } from './logbook.js';
  *    `--profile acp`. A legacy W3 patch region is retired by the same apply.
  *    The key goes to `~/.dsh/.env` under `HARNESS_NEXUS_API_KEY` — dsh's own
  *    user-env credential layer, read on EVERY launch (user shells included).
+ *    #64 adds per-model detail on the `models:` entries (`name` /
+ *    `contextWindow` / `maxTokens` / `input` for vision) with the opencode
+ *    precedence — panel value (`spec.deepseek`) > #51 modelEntries seed >
+ *    key omitted (the route's own defaults apply; never a guessed value).
  */
 
 /** dsh resolves this name through process env > ~/.dsh/.credentials.yaml > ./.env > ~/.dsh/.env. */
@@ -99,34 +122,98 @@ function applyClaudeConfig(spec: RuntimeConfigSpec, secret: string, homeDir: str
   const dir = join(homeDir, '.claude');
   const file = join(dir, 'settings.json');
   const settings = readJson(file);
+  const cc = spec.claudeCode;
   const env: Record<string, string> = {
     ...((settings.env as Record<string, string> | undefined) ?? {}),
-    ANTHROPIC_AUTH_TOKEN: secret,
   };
+  // #60 — the key rides the panel's chosen auth slot; the other one is ours
+  // to remove (claude-code warns when both are set).
+  const authField = cc?.authField ?? 'ANTHROPIC_AUTH_TOKEN';
+  env[authField] = secret;
+  delete env[authField === 'ANTHROPIC_AUTH_TOKEN' ? 'ANTHROPIC_API_KEY' : 'ANTHROPIC_AUTH_TOKEN'];
   if (spec.baseUrl !== undefined) env.ANTHROPIC_BASE_URL = spec.baseUrl;
   else delete env.ANTHROPIC_BASE_URL; // the platform owns the route — unset means revert to default
+  // #60 — alias-tier pins. Every tier slot is platform-owned: an unpinned
+  // tier removes whatever we wrote there before (revert semantics), and the
+  // legacy pre-tier background-model env is retired on sight.
+  for (const tier of CLAUDE_CODE_TIERS) {
+    const row = cc?.tiers?.find((t) => t.tier === tier);
+    const prefix = `ANTHROPIC_DEFAULT_${tier.toUpperCase()}_MODEL`;
+    if (row !== undefined) {
+      env[prefix] = row.model;
+      if (row.displayName !== undefined && row.displayName !== '') {
+        env[`${prefix}_NAME`] = row.displayName;
+      } else delete env[`${prefix}_NAME`];
+      if (row.capabilities !== undefined && row.capabilities.length > 0) {
+        env[`${prefix}_SUPPORTED_CAPABILITIES`] = row.capabilities.join(',');
+      } else delete env[`${prefix}_SUPPORTED_CAPABILITIES`];
+    } else {
+      delete env[prefix];
+      delete env[`${prefix}_NAME`];
+      delete env[`${prefix}_SUPPORTED_CAPABILITIES`];
+    }
+  }
+  delete env.ANTHROPIC_SMALL_FAST_MODEL;
+  const knob = (key: string, value: string | undefined): void => {
+    if (value !== undefined) env[key] = value;
+    else delete env[key];
+  };
+  knob('CLAUDE_CODE_SUBAGENT_MODEL', cc?.subagentModel);
+  knob('CLAUDE_CODE_MAX_OUTPUT_TOKENS', cc?.maxOutputTokens?.toString());
+  knob('CLAUDE_CODE_MAX_CONTEXT_TOKENS', cc?.maxContextTokens?.toString());
+  knob(
+    'CLAUDE_CODE_EXTRA_BODY',
+    cc?.extraBody !== undefined ? JSON.stringify(cc.extraBody) : undefined,
+  );
+  // #60 behavior switches — on writes the managed key, off removes ours (the
+  // attribution object is a settings-level key with BASE_URL-style ownership:
+  // while any spec exists, an unchecked toggle reverts it to claude-code's
+  // default, same as an unset base URL).
+  const sw = cc?.switches;
+  knob('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', sw?.teammates === true ? '1' : undefined);
+  knob('ENABLE_TOOL_SEARCH', sw?.toolSearch === true ? 'true' : undefined);
+  knob('CLAUDE_CODE_EFFORT_LEVEL', sw?.maxEffort === true ? 'max' : undefined);
+  knob('DISABLE_AUTOUPDATER', sw?.autoUpgradeDisabled === true ? '1' : undefined);
+  knob('CLAUDE_CODE_DISABLE_ARTIFACT', sw?.artifactsDisabled === true ? '1' : undefined);
   // 9 W13 — the picker allowlist. Written whenever a spec exists (even a
   // single model: under a gateway the built-in catalog is dead entries, same
   // policy as dsh/opencode). Platform-owned key: re-apply overwrites whatever
-  // the user had there.
-  const availableModels = [...new Set([spec.model, ...(spec.models ?? [])])];
-  writeSecretFile(
-    file,
-    `${JSON.stringify({ ...settings, env, model: spec.model, availableModels }, null, 2)}\n`,
-  );
+  // the user had there. #60: the allowlist matches PLAIN ids — `[1m]` markers
+  // ride the model slots (settings `model` + the tier envs), not the list —
+  // and tier-pinned / subagent ids join so the locks never reject a pin.
+  const pinned = (cc?.tiers ?? []).map((t) => t.model);
+  if (cc?.subagentModel !== undefined) pinned.push(cc.subagentModel);
+  const availableModels = [
+    ...new Set([spec.model, ...(spec.models ?? []), ...pinned].map(stripClaudeOneMarker)),
+  ];
+  const managed: Record<string, unknown> = { ...settings, env, model: spec.model, availableModels };
+  if (sw?.attributionHidden === true) {
+    managed.attribution = { commit: '', pr: '', sessionUrl: false };
+  } else {
+    delete managed.attribution;
+  }
+  writeSecretFile(file, `${JSON.stringify(managed, null, 2)}\n`);
   return [display(homeDir, file)];
 }
 
 // ---- codex ----
 
 /**
- * Set TOP-LEVEL `key = "value"` pairs in a TOML document, preserving every
- * other byte. Only the region before the first `[section]` header is ours to
- * edit (a `model` inside a section belongs to that section); missing keys are
- * appended to that region. JSON string escaping is valid TOML basic-string
- * escaping.
+ * Set TOP-LEVEL key/value pairs in a TOML document, preserving every other
+ * byte. Only the region before the first `[section]` header is ours to edit
+ * (a `model` inside a section belongs to that section); missing keys are
+ * appended to that region. Values render TOML-native: strings JSON-escaped
+ * (valid TOML basic-string escaping), numbers/booleans bare. A `null` value
+ * REMOVES the key's line (0.154-era codex ignores unknown keys, but a stale
+ * managed value must not linger after the panel clears it) — the claude-code
+ * writer's unset-REMOVES-ours revert semantic, here in TOML.
  */
-export function mergeTomlRootKeys(existing: string, values: Record<string, string>): string {
+export function mergeTomlRootKeys(
+  existing: string,
+  values: Record<string, string | number | boolean | null>,
+): string {
+  const render = (v: string | number | boolean): string =>
+    typeof v === 'string' ? JSON.stringify(v) : String(v);
   const headerRe = /^\s*\[/;
   const lines = existing.split('\n');
   const firstHeader = lines.findIndex((l) => headerRe.test(l));
@@ -139,21 +226,26 @@ export function mergeTomlRootKeys(existing: string, values: Record<string, strin
   for (const line of top) {
     const key = /^(\s*[A-Za-z0-9_-]+)\s*=/.exec(line)?.[1]?.trim();
     const hit = key !== undefined ? remaining.get(key) : undefined;
-    if (key !== undefined && hit !== undefined) {
-      rewritten.push(`${key} = ${JSON.stringify(hit)}`);
+    if (key !== undefined && hit != null) {
+      rewritten.push(`${key} = ${render(hit)}`);
       remaining.delete(key);
+    } else if (key !== undefined && hit === null) {
+      remaining.delete(key); // removal — drop the managed line entirely
     } else {
       rewritten.push(line);
     }
   }
   // Append missing keys at the end of the top-level region (before trailing
-  // blank lines so a header below keeps its spacing).
+  // blank lines so a header below keeps its spacing). Null-valued keys that
+  // never matched a line are pure removals of absent keys — nothing to append.
   let insertAt = rewritten.length;
   while (insertAt > 0 && rewritten[insertAt - 1]!.trim() === '') insertAt--;
   rewritten.splice(
     insertAt,
     0,
-    ...[...remaining.entries()].map(([k, v]) => `${k} = ${JSON.stringify(v)}`),
+    ...[...remaining.entries()]
+      .filter(([, v]) => v !== null)
+      .map(([k, v]) => `${k} = ${render(v as string | number | boolean)}`),
   );
 
   const out = [...rewritten, ...rest].join('\n').replace(/\s+$/, '');
@@ -169,13 +261,30 @@ function applyCodexConfig(spec: RuntimeConfigSpec, secret: string, homeDir: stri
   } catch {
     cfg = ''; // absent file — fresh document
   }
+  const cx = spec.codex;
+  // #63 — the panel's dials are TOP-LEVEL keys, single global value per
+  // install, platform-owned while a spec exists: configured writes ours,
+  // unset REMOVES ours. `model_context_window` is the one layered exception —
+  // an untouched panel still writes the #51 seed of the default model (a real
+  // registry window beats codex's 272k assumption for unknown slugs); with no
+  // seed either, the key comes off and codex assumes 272k.
+  const seedWindow = (spec.modelEntries ?? []).find((e) => e.id === spec.model)?.contextWindow;
   const sectionBody = [
     `name = ${JSON.stringify(spec.providerLabel)}`,
     ...(spec.baseUrl !== undefined ? [`base_url = ${JSON.stringify(spec.baseUrl)}`] : []),
     'requires_openai_auth = true',
   ].join('\n');
   cfg = mergeTomlSection(
-    mergeTomlRootKeys(cfg, { model: spec.model, model_provider: CODEX_PROVIDER_ID }),
+    mergeTomlRootKeys(cfg, {
+      model: spec.model,
+      model_provider: CODEX_PROVIDER_ID,
+      model_reasoning_effort: cx?.reasoningEffort ?? null,
+      model_reasoning_summary: cx?.reasoningSummary ?? null,
+      model_verbosity: cx?.verbosity ?? null,
+      model_context_window: cx?.contextWindow ?? seedWindow ?? null,
+      model_auto_compact_token_limit: cx?.autoCompactTokenLimit ?? null,
+      check_for_update_on_startup: cx?.switches?.updateCheckDisabled === true ? false : null,
+    }),
     `model_providers.${CODEX_PROVIDER_ID}`,
     sectionBody,
   );
@@ -289,6 +398,28 @@ function applyDshConfig(spec: RuntimeConfigSpec, secret: string, homeDir: string
   // the default model leads. (The server already dedupes against `model`,
   // this is belt-and-braces for hand-queued bundles.)
   const modelIds = [...new Set([spec.model, ...(spec.models ?? [])])];
+  // #64 — per-model detail overlays the #51 seed per field; an id with
+  // neither stays a BARE entry (byte-identical to the pre-#64 emission, so
+  // an untouched spec re-applies unchanged). `vision: true` claims images
+  // (`input: ["text","image"]` — JSON flow is valid YAML); absent stays the
+  // route default (text), the pi-writer stance of never guessing.
+  const entriesById = new Map((spec.modelEntries ?? []).map((e) => [e.id, e]));
+  const detailById = new Map((spec.deepseek?.models ?? []).map((m) => [m.id, m]));
+  const modelEntryLines = modelIds.flatMap((id) => {
+    const e = entriesById.get(id);
+    const d = detailById.get(id);
+    const name = d?.name ?? e?.displayName;
+    const contextWindow = d?.contextWindow ?? e?.contextWindow;
+    const maxTokens = d?.maxOutputTokens ?? e?.maxOutputTokens;
+    const vision = d?.vision === true || e?.vision === true;
+    return [
+      `        - id: ${yq(id)}`,
+      ...(name !== undefined && name !== '' ? [`          name: ${yq(name)}`] : []),
+      ...(contextWindow !== undefined ? [`          contextWindow: ${contextWindow}`] : []),
+      ...(maxTokens !== undefined ? [`          maxTokens: ${maxTokens}`] : []),
+      ...(vision ? ['          input: ["text", "image"]'] : []),
+    ];
+  });
   const region = [
     SETTINGS_BEGIN,
     `${DSH_LLM_NS}:`,
@@ -299,7 +430,7 @@ function applyDshConfig(spec: RuntimeConfigSpec, secret: string, homeDir: string
     `      baseURL: ${yq(spec.baseUrl!)}`,
     `      apiKeyEnv: ${DSH_API_KEY_ENV}`,
     `      models:`,
-    ...modelIds.map((id) => `        - id: ${yq(id)}`),
+    ...modelEntryLines,
     `${DSH_DEFAULT_MODEL_NS}:`,
     `  provider: harness-nexus`,
     `  model: ${yq(spec.model)}`,
@@ -373,6 +504,25 @@ const OPENCODE_SDK: Record<RuntimeConfigSpec['api'], string> = {
 };
 
 /**
+ * opencode (verified 1.18.31 on the rig) REQUIRES `limit.output` on every
+ * `provider.<id>.models.<m>` entry — its config schema rejects the bare `{}`
+ * this writer used to emit ("Missing key …models.<m>.limit.output"). Registry
+ * entries without a curated maxOutputTokens get this conservative fallback
+ * (the same stance as assistant/provider.ts) — never a guessed-high value.
+ */
+const OPENCODE_FALLBACK_MAX_OUTPUT = 8192;
+
+/**
+ * opencode 1.18.31's config schema requires BOTH `limit.output` AND
+ * `limit.context` on every `provider.<id>.models.<m>` entry (rig-found
+ * 2026-10-15: a push with only `output` answered "Missing key
+ * …models.<m>.limit.context"). Registry entries without a curated
+ * contextWindow get this conservative fallback — same stance as the output
+ * fallback, never a guessed-high value.
+ */
+const OPENCODE_FALLBACK_CONTEXT = 128_000;
+
+/**
  * The AI SDK baseURL convention (rig-found 2026-09-16): `@ai-sdk/anthropic`
  * and `@ai-sdk/openai-compatible` both expect the base to END WITH `/v1`
  * (their defaults do) and append only the method path (`/messages`,
@@ -409,6 +559,10 @@ function applyOpencodeConfig(spec: RuntimeConfigSpec, secret: string, homeDir: s
   const cfgPath = join(dir, 'opencode.json');
   const keyPath = join(dir, OPENCODE_KEY_NAME);
   const cfg = readJson(cfgPath); // absent → fresh; JSONC → throws, file untouched
+  const entriesById = new Map((spec.modelEntries ?? []).map((e) => [e.id, e]));
+  // #62 — the panel's per-model detail WINS over the #51 seed, per field;
+  // `limit.*` stay REQUIRED (schema), so unset means seed → fallback.
+  const detailById = new Map((spec.opencode?.models ?? []).map((m) => [m.id, m]));
 
   const providers = {
     ...((cfg.provider as Record<string, unknown> | undefined) ?? {}),
@@ -421,23 +575,58 @@ function applyOpencodeConfig(spec: RuntimeConfigSpec, secret: string, homeDir: s
       },
       // W10 — the default model leads the switchable set; the server already
       // drops the default from extras, this dedupe is belt-and-braces.
+      // #51 — registry metadata (snapshot in the spec) fills `name` and the
+      // REQUIRED `limit` block (see OPENCODE_FALLBACK_MAX_OUTPUT); bare ids
+      // get the fallback limit, never an empty entry. #62 — panel detail
+      // overlays the seed and adds the capability/body-key knobs.
       models: Object.fromEntries(
-        [...new Set([spec.model, ...(spec.models ?? [])])].map((id) => [id, {}]),
+        [...new Set([spec.model, ...(spec.models ?? [])])].map((id) => {
+          const e = entriesById.get(id);
+          const d = detailById.get(id);
+          return [
+            id,
+            {
+              ...(d?.name !== undefined
+                ? { name: d.name }
+                : e?.displayName !== undefined
+                  ? { name: e.displayName }
+                  : {}),
+              ...(d?.reasoning === true ? { reasoning: true } : {}),
+              ...(d?.temperatureEnabled === true ? { temperature: true } : {}),
+              ...(d?.vision === true ? { attachment: true } : {}),
+              ...(d?.options !== undefined && Object.keys(d.options).length > 0
+                ? { options: d.options }
+                : {}),
+              limit: {
+                output: d?.maxOutputTokens ?? e?.maxOutputTokens ?? OPENCODE_FALLBACK_MAX_OUTPUT,
+                context: d?.contextWindow ?? e?.contextWindow ?? OPENCODE_FALLBACK_CONTEXT,
+              },
+            },
+          ];
+        }),
       ),
     },
   };
-  writeSecretFile(
-    cfgPath,
-    `${JSON.stringify(
-      {
-        ...cfg,
-        provider: providers,
-        model: `${OPENCODE_PROVIDER_ID}/${spec.model}`,
-      },
-      null,
-      2,
-    )}\n`,
-  );
+  // #62 — top-level `small_model`/`autoupdate` are BASE_URL-style owned:
+  // configured → write, cleared → remove ours (a user's own value is
+  // clobbered while configured and removed when cleared — same trade as the
+  // managed base URL, documented in the design).
+  const managed: Record<string, unknown> = {
+    ...cfg,
+    provider: providers,
+    model: `${OPENCODE_PROVIDER_ID}/${spec.model}`,
+  };
+  if (spec.opencode?.smallModel !== undefined) {
+    managed.small_model = `${OPENCODE_PROVIDER_ID}/${spec.opencode.smallModel}`;
+  } else {
+    delete managed.small_model;
+  }
+  if (spec.opencode?.autoupdateDisabled === true) {
+    managed.autoupdate = false;
+  } else {
+    delete managed.autoupdate;
+  }
+  writeSecretFile(cfgPath, `${JSON.stringify(managed, null, 2)}\n`);
   writeSecretFile(keyPath, secret);
   return [display(homeDir, cfgPath), display(homeDir, keyPath)];
 }
@@ -467,6 +656,12 @@ const PI_API: Record<RuntimeConfigSpec['api'], string> = {
  *  3. `~/.pi/agent/harness-nexus.key` — the secret, 0600, NO trailing
  *     newline (`!cat` hands the bytes to pi verbatim).
  *
+ * #65 adds the panel overlay on the models array (`spec.pi.models`): per
+ * field panel value > #51 modelEntries seed > omitted (the family
+ * contract), plus the panel-only `reasoning: true` capability flag and
+ * `samplingParams` (free body keys, effective on the openai wires,
+ * silently ignored on anthropic). Bare ids stay `{ id }` byte-identical.
+ *
  * Both JSON files fail `JSON.parse` if hand-mangled → the job errors without
  * touching them (same stance as opencode). A baseUrl-less spec is rejected
  * at the route AND re-checked here — pi's custom provider REQUIRES an
@@ -484,6 +679,14 @@ function applyPiConfig(spec: RuntimeConfigSpec, secret: string, homeDir: string)
 
   const modelsDoc = readJson(modelsPath); // absent → fresh; malformed → throws, untouched
   const modelIds = [...new Set([spec.model, ...(spec.models ?? [])])];
+  // #51 — metadata from the provider registry (snapshot in the spec): ids
+  // with an entry get real contextWindow/maxTokens/name, so pi's usage
+  // contextSize stops hiding (W16's honest degradation resolves). Ids without
+  // stay bare — never guessed. #65 — the panel overlay wins per field
+  // (`spec.pi.models`), and adds the panel-only `reasoning` flag and
+  // `samplingParams`; a bare id with neither stays `{ id }`.
+  const entriesById = new Map((spec.modelEntries ?? []).map((e) => [e.id, e]));
+  const detailById = new Map((spec.pi?.models ?? []).map((m) => [m.id, m]));
   const providers = {
     ...((modelsDoc.providers as Record<string, unknown> | undefined) ?? {}),
     [PI_PROVIDER_ID]: {
@@ -491,7 +694,26 @@ function applyPiConfig(spec: RuntimeConfigSpec, secret: string, homeDir: string)
       baseUrl: spec.baseUrl,
       api: PI_API[spec.api],
       apiKey: `!cat ${JSON.stringify(keyPath)}`,
-      models: modelIds.map((id) => ({ id })),
+      models: modelIds.map((id) => {
+        const e = entriesById.get(id);
+        const d = detailById.get(id);
+        if (e === undefined && d === undefined) return { id };
+        const name = d?.name ?? e?.displayName;
+        const contextWindow = d?.contextWindow ?? e?.contextWindow;
+        const maxTokens = d?.maxOutputTokens ?? e?.maxOutputTokens;
+        const vision = d?.vision === true || e?.vision === true;
+        return {
+          id,
+          ...(name !== undefined && name !== '' ? { name } : {}),
+          ...(contextWindow !== undefined ? { contextWindow } : {}),
+          ...(maxTokens !== undefined ? { maxTokens } : {}),
+          ...(vision ? { input: ['text', 'image'] } : {}),
+          ...(d?.reasoning === true ? { reasoning: true } : {}),
+          ...(d?.samplingParams !== undefined && Object.keys(d.samplingParams).length > 0
+            ? { samplingParams: d.samplingParams }
+            : {}),
+        };
+      }),
     },
   };
   writeSecretFile(modelsPath, `${JSON.stringify({ ...modelsDoc, providers }, null, 2)}\n`);

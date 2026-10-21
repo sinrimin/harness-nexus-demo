@@ -1,6 +1,11 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ArrowUpIcon,
+  BotIcon,
   BoxIcon,
   BrainIcon,
   CircleStopIcon,
@@ -83,6 +88,11 @@ interface ComposerProps {
   /** Images picked/pasted/dropped — the page compresses and appends. */
   onPickImages: (files: File[]) => void;
   onOpenFilePicker: () => void;
+  /**
+   * The assistant 端 has no workspace, so its + menu offers images only —
+   * false hides the file-reference item. Defaults to true (machine ends).
+   */
+  filePickerAvailable?: boolean;
   /** From the ready push's promptCapabilities — gates the image attach item. */
   imageSupported: boolean;
   config: ComposerConfig;
@@ -470,6 +480,7 @@ export function Composer({
   onRemoveFileRef,
   onPickImages,
   onOpenFilePicker,
+  filePickerAvailable = true,
   imageSupported,
   config,
   onConfigSet,
@@ -547,6 +558,12 @@ export function Composer({
   const modeFromOptions = config.configOptions?.find((o) => o.category === 'mode');
   const modelOption = config.configOptions?.find((o) => o.category === 'model');
   const effortOption = config.configOptions?.find((o) => o.category === 'thought_level');
+  // #52 — the assistant 端 rides the same option surface with OPAQUE extra
+  // selects (e.g. configId 'agent'): every option in no known category
+  // renders as a generic labeled select, values compared by equality only.
+  const extraOptions = (config.configOptions ?? []).filter(
+    (o) => o.category === undefined && o.id !== 'model',
+  );
   const modeChoices: SelectChoice[] =
     modeFromOptions?.options?.map((o) => ({
       value: o.value,
@@ -774,10 +791,12 @@ export function Composer({
               <ImageIcon className="size-4" />
               {t('chat.attachImage')}
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={disabled} onClick={onOpenFilePicker}>
-              <PaperclipIcon className="size-4" />
-              {t('chat.attachFile')}
-            </DropdownMenuItem>
+            {filePickerAvailable ? (
+              <DropdownMenuItem disabled={disabled} onClick={onOpenFilePicker}>
+                <PaperclipIcon className="size-4" />
+                {t('chat.attachFile')}
+              </DropdownMenuItem>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
 
@@ -825,6 +844,26 @@ export function Composer({
             onPick={(v) => onConfigSet({ kind: 'option', configId: effortOption.id, value: v })}
           />
         )}
+
+        {extraOptions.map((opt) => (
+          <ConfigSelect
+            key={opt.id}
+            label={opt.name}
+            icon={<BotIcon className="size-4" />}
+            value={opt.currentValue}
+            choices={
+              opt.options?.map((o) => ({
+                value: o.value,
+                name: o.name,
+                description: o.description,
+                group: o.group,
+              })) ?? []
+            }
+            disabled={controlsDisabled}
+            hint={turnActive ? t('chat.appliesNextTurn') : undefined}
+            onPick={(v) => onConfigSet({ kind: 'option', configId: opt.id, value: v })}
+          />
+        ))}
 
         <span className="min-w-0 flex-1" />
         <ContextMeter usage={usage} />

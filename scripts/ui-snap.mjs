@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * ui-snap — visual snapshot rig for the Harness Nexus web UI.
  *
@@ -94,6 +98,8 @@ const ALL_ROUTES = [
   '/',
   '/machines',
   '/chat',
+  '/chat/assistants',
+  '/assistants',
   '/skills',
   '/hooks',
   '/mcp-servers',
@@ -106,6 +112,14 @@ const ALL_ROUTES = [
 // may grow; ids not registered there fall back to the default skin at render
 // time, so listing the union members is safe.
 const ALL_SKINS = ['signal', 'bay', 'ledger', 'nightwatch'];
+// Client-side redirects the SPA performs ON ARRIVAL (#52: /chat resolves to
+// the DEFAULT 端's page — assistant for the rig's fresh, unpinned contexts).
+// The landing assertion below must name the redirect's DESTINATION; landing
+// anywhere else is still a hard failure (a broken resolver shows up as an
+// unexpected path).
+const REDIRECTS = {
+  '/chat': '/chat/assistants',
+};
 const DEFAULT_SKINS = ['signal'];
 // The font families each skin's tokens.css puts on --app-font-{sans,mono,
 // display} (keep in sync with apps/web/src/skins/*/tokens.css). Skin fonts
@@ -824,9 +838,10 @@ async function captureShot(browser, { route, skin, mode, viewport, token }) {
       search: location.search,
     }));
     const wantPath = route.split('?')[0];
-    if (landed.path !== wantPath) {
+    const acceptPath = REDIRECTS[wantPath] ?? wantPath;
+    if (landed.path !== acceptPath) {
       throw new Error(
-        `landed on ${landed.path}${landed.search} instead of ${route}` +
+        `landed on ${landed.path}${landed.search} instead of ${acceptPath} (route ${route})` +
           `${landed.path === '/login' ? ' (token not installed / rejected)' : ''}`,
       );
     }

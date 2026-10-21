@@ -1,7 +1,13 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  existsSync,
   fstatSync,
+  mkdirSync,
   openSync,
   readSync,
   readdirSync,
@@ -41,6 +47,7 @@ import {
   type PromptBlock,
   type SessionConfigOption,
   type SessionModeState,
+  type SubagentChildEvent,
 } from '@harness-nexus/shared';
 import {
   AcpAgentConnection,
@@ -48,6 +55,7 @@ import {
   type JsonRpcId,
 } from './acp/agent-connection.js';
 import { resolveAcpCommand } from './acp/adapters.js';
+import { checkAcpVersion, type VersionGateResult } from './acp/version-gate.js';
 import { PiRpcConnection, resolvePiCommand } from './acp/pi-connection.js';
 import {
   auditAdapterLedger,
@@ -59,6 +67,7 @@ import { UsageLedger, hasTokenCounts, normalizeUsage, responseUsageMode } from '
 import { rewriteHistoryItems, rewriteSessionConfigOptions } from './model-options.js';
 import {
   createDshLiveMapper,
+  currentSessionLog,
   decodeTranscript,
   dshHistoryItems,
   findTranscript,
@@ -92,21 +101,26 @@ import {
  * keeps a bounded history ring (forwarded prompts + mapped events) so a
  * `chat:session.resync` (page refresh rejoin) can rebuild the browser's fold.
  *
- * dsh STREAMING (9 W7.1): its ACP adapter only commits whole blocks at turn
- * end (rig-verified — zero notifications during generation), so deepseek
- * channels stream from an auxiliary source with a purely-additive priority
- * chain: (1) the IN-PROCESS EVENT TAP — the daemon insert-mounts a zero-dep
- * cordis plugin at spawn (`dsh --patch`, assets in `daemon/dsh-tap/`) which
- * forwards the session event bus over a localhost JSON-line socket
- * (`dsh-tap-listener.ts`; zero latency, verbatim events); (2) on no
- * handshake within 3s (old dsh, plugin failure, `HN_DISABLE_DSH_TAP=1` A/B
- * switch) the W7 TRANSCRIPT-FILE TAIL (`TranscriptTail` — batches land as
- * zstd frames ~100–300ms behind); (3) neither → committed-only. Whichever
- * source is live feeds ONE `createDshLiveMapper` per session (deltas AND
- * complete blocks for unstreamed steps), so the wire's committed text chunks
- * are suppressed wholesale while it is live (letting them through would
- * double-render). A tap that dies mid-session leaves that session
- * committed-only — a fresh mapper cannot know what was already streamed.
+ * dsh STREAMING (9 W7.1; #46 ground truth dsh 0.2.0-rc.2): its ACP adapter
+ * only commits whole blocks at turn end (rig-verified — zero notifications
+ * during generation), so deepseek channels stream from an auxiliary source
+ * with a purely-additive priority chain: (1) the IN-PROCESS EVENT TAP — the
+ * daemon insert-mounts a zero-dep cordis plugin at spawn (`dsh --patch`,
+ * assets in `daemon/dsh-tap/`) which forwards BOTH the `session/event` bus
+ * (settlement rows, tools, turn markers) and the agent-scoped
+ * `agent/assistant-stream` FRAMES (the per-token deltas — dsh ≥0.1.3 moved
+ * them off the bus) over a localhost JSON-line socket (`dsh-tap-listener.ts`);
+ * (2) on no handshake within 3s (plugin failure, `HN_DISABLE_DSH_TAP=1` A/B
+ * switch) the W7 TRANSCRIPT-FILE TAIL (`TranscriptTail` on the
+ * generation-versioned log — settlement rows land as zstd frames ~100–300ms
+ * behind, so the fallback streams blocks at commit granularity); (3) neither
+ * → committed-only. Whichever source is live feeds ONE live mapper per
+ * session (frame deltas AND complete blocks for unstreamed steps), so the
+ * wire's committed text chunks are suppressed wholesale while it is live
+ * (letting them through would double-render). A tap that dies mid-session
+ * leaves that session committed-only — a fresh mapper cannot know what was
+ * already streamed. Out-of-range dsh never gets this far: the #46 version
+ * gate refuses the spawn with an upgrade hint.
  */
 
 interface DaemonSession {
@@ -175,12 +189,29 @@ interface DaemonSession {
    * has the same trade-off).
    */
   tapDead: boolean;
+  /**
+   * #71 — live native sub-agent session ids announced by `subagent_spawned`.
+   * Frames whose `sessionId` is in here route into wrapped `subagent_update`
+   * events instead of the main stream (claude-agent-acp only, via the
+   * `subagents` initialize capability).
+   */
+  subagents: Set<string>;
 }
 
 const HISTORY_MAX = 2000;
 
-/** How long after arming the tap plugin may take to say hello (design: 3s). */
-const TAP_HANDSHAKE_MS = 3000;
+/**
+ * How long the tap plugin may take to say hello AFTER the adapter start
+ * (initialize, or the pool's boot-to-initialize) has completed. The deadline
+ * rides the START, not the arm: a fixed arm-time window (the original 3s)
+ * lost slow cold boots — a small machine's first dsh spawn under load can
+ * legitimately outlive it, and on v4 session logs (no intra-turn rows) a
+ * tap-less channel then has NO streaming source at all for its whole life.
+ * Healthy taps say hello long before initialize resolves, so the grace is
+ * paid only when the plugin is truly absent (the channel opens
+ * committed-only, slightly later). Env-tunable (`HN_TAP_HELLO_GRACE_MS`).
+ */
+const TAP_HELLO_GRACE_DEFAULT_MS = 2500;
 
 /**
  * codex-acp's unknown-model notice (see `mapAcpUpdate`'s agent_message_chunk
@@ -224,6 +255,11 @@ export interface ChatHandlersOptions {
    * assert file lifetimes drive `auditAdapterLedger` directly).
    */
   auditIntervalMs?: number;
+  /**
+   * #46 — override the ACP client version-gate check (tests inject canned
+   * verdicts; default probes `<bin> --version` for gated targets).
+   */
+  versionGate?: (target: AgentTarget, env: NodeJS.ProcessEnv) => Promise<VersionGateResult>;
 }
 
 /** What `attachChatHandlers` hands back for other daemon handlers (issue #2). */
@@ -283,6 +319,13 @@ export interface ChatHandlersHandle {
    * connection rejects fast and the caller falls back to spawning.
    */
   liveConnectionFor: (target: string) => AgentConnection | null;
+  /**
+   * #55 — the target's live channels' NATIVE session ids (`acpSessionId`).
+   * The sessions-delete handler refuses these: a session an open channel is
+   * attached to must be closed first (deleting under a live adapter would
+   * leave a zombie channel writing into deleted storage).
+   */
+  liveNativeIdsFor: (target: string) => Set<string>;
   /** Issue #3 — is a prewarmed adapter READY (initialized, alive) for the target? */
   prewarmReady: (target: string) => boolean;
   /** #39 — live channels for the TUI's agents pane (oldest first). */
@@ -299,6 +342,9 @@ export function attachChatHandlers(
 ): ChatHandlersHandle {
   const env = opts.env ?? process.env;
   const home = opts.homeDir ?? homedir();
+  // #46 — the client version gate (channel open AND the prewarm pool).
+  const versionGate =
+    opts.versionGate ?? ((target: AgentTarget, e: NodeJS.ProcessEnv) => checkAcpVersion(target, e));
   const sessions = new Map<string, DaemonSession>();
   /**
    * Ids whose `chat:session.close` arrived BEFORE the session registered. A
@@ -353,6 +399,15 @@ export function attachChatHandlers(
       if (s.target === target) found = s.conn;
     }
     return found;
+  };
+
+  /** #55 — see `ChatHandlersHandle.liveNativeIdsFor`. */
+  const liveNativeIdsFor = (target: string): Set<string> => {
+    const ids = new Set<string>();
+    for (const s of sessions.values()) {
+      if (s.target === target) ids.add(s.acpSessionId);
+    }
+    return ids;
   };
 
   const pushHistory = (session: DaemonSession, item: HistoryItem): void => {
@@ -441,8 +496,13 @@ export function attachChatHandlers(
   interface TapArm {
     listener: TapListener;
     patchPath: string;
-    hello: Promise<boolean>;
-    bind(sink: (sessionId: string, event: Record<string, unknown>) => void, loss: () => void): void;
+    /** Resolves once the plugin says hello by `deadlineAt` (idempotent). */
+    waitHello: (deadlineAt: number) => Promise<boolean>;
+    bind(
+      sink: (sessionId: string, event: Record<string, unknown>) => void,
+      loss: () => void,
+      frameSink: (sessionId: string, frame: Record<string, unknown>) => void,
+    ): void;
   }
 
   /**
@@ -451,10 +511,10 @@ export function attachChatHandlers(
    * `~/.hnx/dsh-tap.patch.yml` and open the localhost listener the plugin
    * dials. Null = not applicable (non-deepseek, `HN_DISABLE_DSH_TAP=1` A/B
    * switch, assets missing, patch write or listen failure) — the transcript
-   * tail then streams exactly as before. The handshake races the spawn (the
-   * plugin loads during dsh's composition, i.e. typically before initialize
-   * resolves); no hello within the window → the caller closes the listener
-   * and falls through to the tail.
+   * tail then streams exactly as before. The plugin loads during dsh's
+   * composition and says hello typically before initialize resolves; the
+   * callers race it against start-completion + the tap hello grace (see
+   * there) — a miss closes the listener and falls through to the tail.
    */
   const armTap = (target: string): Promise<TapArm | null> => {
     if (target !== 'deepseek' || env.HN_DISABLE_DSH_TAP === '1') return Promise.resolve(null);
@@ -462,18 +522,21 @@ export function attachChatHandlers(
     const patchPath = writeTapPatch(home, tapPluginPath());
     if (patchPath === null) return Promise.resolve(null);
     let sink: ((sessionId: string, event: Record<string, unknown>) => void) | null = null;
+    let frameSink: ((sessionId: string, frame: Record<string, unknown>) => void) | null = null;
     let loss: (() => void) | null = null;
     return TapListener.create({
       onEvent: (sessionId, event) => sink?.(sessionId, event),
+      onFrame: (sessionId, frame) => frameSink?.(sessionId, frame),
       onLoss: () => loss?.(),
     })
       .then((listener): TapArm => ({
         listener,
         patchPath,
-        hello: listener.waitHello(Date.now() + TAP_HANDSHAKE_MS),
-        bind: (fnSink, fnLoss) => {
+        waitHello: (deadlineAt) => listener.waitHello(deadlineAt),
+        bind: (fnSink, fnLoss, fnFrameSink) => {
           sink = fnSink;
           loss = fnLoss;
+          frameSink = fnFrameSink;
         },
       }))
       .catch(() => null);
@@ -536,6 +599,12 @@ export function attachChatHandlers(
     return Number.isFinite(raw) && raw >= 0 ? raw : 120_000;
   })();
 
+  /** #47 — the tap hello grace after start-completion (see its doc). */
+  const tapHelloGraceMs = (() => {
+    const raw = Number.parseInt(env.HN_TAP_HELLO_GRACE_MS ?? '', 10);
+    return Number.isFinite(raw) && raw >= 0 ? raw : TAP_HELLO_GRACE_DEFAULT_MS;
+  })();
+
   /**
    * A prewarmed adapter: the FULL `start` result (the session caps and agent
    * identity came from initialize — already paid) plus the dsh tap that raced
@@ -560,10 +629,17 @@ export function attachChatHandlers(
     spawn: async (key) => {
       const cmd = resolveAcpCommand(key as AgentTarget, env, { homeDir: home });
       if (cmd === null) return null;
+      // #46 — never pre-warm an out-of-range client: the channel open would
+      // refuse it anyway (and surface the upgrade hint), so a pool entry
+      // would be a wasted spawn.
+      const gate = await versionGate(key as AgentTarget, env);
+      if (!gate.ok) return null;
       const tapArmed = await armTap(key);
-      // Same env layering as the channel spawn (target env + test spawnEnv),
-      // minus the cwd — a prewarm has no session yet, so it boots in `home`.
-      const baseEnv = { ...(cmd.env ?? {}), ...(opts.spawnEnv ?? {}) };
+      // Same env layering as the channel spawn: the daemon's own env is the
+      // BASE (#70 — a bare target env left the shim's `#!/usr/bin/env node`
+      // without a PATH, and Node's spawn-ENOENT blamed the adapter binary),
+      // with the target env and test spawnEnv layered on top.
+      const baseEnv = { ...process.env, ...(cmd.env ?? {}), ...(opts.spawnEnv ?? {}) };
       const ledgerPrewarm = (pgid: number): void => {
         writeAdapterLedgerEntry(home, {
           pgid,
@@ -583,8 +659,10 @@ export function attachChatHandlers(
             onSpawned: ledgerPrewarm,
           });
         } else {
-          [started, tapLive] = await Promise.all([
-            AcpAgentConnection.start(cmd.command, [...cmd.args, '--patch', tapArmed.patchPath], {
+          started = await AcpAgentConnection.start(
+            cmd.command,
+            [...cmd.args, '--patch', tapArmed.patchPath],
+            {
               cwd: home,
               env: {
                 ...baseEnv,
@@ -592,15 +670,19 @@ export function attachChatHandlers(
                 HNX_TAP_TOKEN: tapArmed.listener.token,
               },
               onSpawned: ledgerPrewarm,
-            }),
-            tapArmed.hello,
-          ]);
+            },
+          );
+          tapLive = await tapArmed.waitHello(Date.now() + tapHelloGraceMs);
           if (!tapLive) {
-            // A session-less listener that never handshook is dead weight; the
-            // consuming channel falls back to the transcript tail, same as a
-            // tap-less spawn.
+            // NEVER pool a tap-less streaming adapter: on v4 session logs
+            // (no intra-turn rows) a channel that adopts one has no
+            // streaming source at all for its whole life. Kill the boot and
+            // publish nothing — the next open spawns fresh with a new arm
+            // (the ledger entry stays behind for the W11 audit, as with any
+            // deliberate kill).
             tapArmed.listener.close();
-            return { started, tapArmed: null, tapLive: false };
+            started.conn.kill();
+            return null;
           }
         }
         return { started, tapArmed, tapLive };
@@ -639,9 +721,35 @@ export function attachChatHandlers(
       return;
     }
     ack?.({ accepted: true });
-    const { sessionId, target, cwd, resume, modelOptions, prewarm } = parsed.data;
+    const { sessionId, target, cwd, resume, modelOptions, defaultMode, prewarm, createDirectory } =
+      parsed.data;
     void (async () => {
       inFlightStarts.add(sessionId);
+      // #70 — the cwd may be a brand-new project directory (the assistant
+      // dispatch, or the picker's 自动创建目录): create it when asked, refuse
+      // HONESTLY when not — a missing cwd used to die as a spawn-ENOENT that
+      // blamed the adapter binary for a directory problem.
+      if (!existsSync(cwd)) {
+        if (createDirectory === true) {
+          try {
+            mkdirSync(cwd, { recursive: true });
+          } catch (e) {
+            socket.emit('chat:session.ready', {
+              sessionId,
+              error: `cannot create session directory '${cwd}': ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            });
+            return;
+          }
+        } else {
+          socket.emit('chat:session.ready', {
+            sessionId,
+            error: `session directory '${cwd}' does not exist on this machine — enable directory auto-create or pick an existing directory`,
+          });
+          return;
+        }
+      }
       // 9 W16 — pi rides the in-daemon ACP façade (PiRpcConnection), not an
       // ACP adapter subprocess; everything downstream is shared verbatim.
       const isPi = target === 'pi';
@@ -651,6 +759,14 @@ export function attachChatHandlers(
           sessionId,
           error: `no ACP adapter for target '${target}'`,
         });
+        return;
+      }
+      // #46 — the client version gate: a fast-moving target's out-of-range
+      // client is refused BEFORE any spawn/consume with an actionable upgrade
+      // hint (override-managed command lines skip the gate — see adapters.ts).
+      const gate = await versionGate(target, env);
+      if (!gate.ok) {
+        socket.emit('chat:session.ready', { sessionId, error: gate.message });
         return;
       }
       // Issue #3 — adopt a READY prewarmed adapter (skip spawn + initialize;
@@ -713,20 +829,21 @@ export function attachChatHandlers(
             });
           };
           // 9 W14.1 — target-scoped adapter env (claude-code's todo-tool
-          // opt-in) layers UNDER the daemon spawn env and the tap vars.
-          const baseEnv = { ...(cmd.env ?? {}), ...(opts.spawnEnv ?? {}) };
+          // opt-in) layers ON TOP of the daemon's own env (#70 — the base
+          // used to be dropped, leaving the pinned shim's
+          // `#!/usr/bin/env node` without a PATH: spawn-ENOENT blaming the
+          // adapter binary) and the tap vars.
+          const baseEnv = { ...process.env, ...(cmd.env ?? {}), ...(opts.spawnEnv ?? {}) };
           const spawnOpts = {
             cwd,
             onSpawned,
             ...(tapArmed === null
-              ? Object.keys(baseEnv).length > 0
-                ? { env: baseEnv }
-                : {}
+              ? { env: baseEnv }
               : {
                   env: {
                     ...baseEnv,
                     HNX_TAP_PORT: String(tapArmed.listener.port),
-                    HNX_TAP_TOKEN: tapArmed.listener.token,
+                    HNX_TAP_TOKEN: String(tapArmed.listener.token),
                   },
                 }),
           };
@@ -740,10 +857,10 @@ export function attachChatHandlers(
           } else if (tapArmed === null) {
             started = await AcpAgentConnection.start(cmd.command, args, spawnOpts);
           } else {
-            [started, tapLive] = await Promise.all([
-              AcpAgentConnection.start(cmd.command, args, spawnOpts),
-              tapArmed.hello,
-            ]);
+            started = await AcpAgentConnection.start(cmd.command, args, spawnOpts);
+            // The hello deadline rides the START (not the arm) — see
+            // the tap hello grace. Healthy taps resolve instantly here.
+            tapLive = await tapArmed.waitHello(Date.now() + tapHelloGraceMs);
           }
         }
         const { conn, agentInfo, sessionCaps, promptCaps } = started;
@@ -775,7 +892,7 @@ export function attachChatHandlers(
           // parse its transcript file instead).
           if (sessionCaps.load) {
             const captured: HistoryItem[] = [];
-            const stopCapture = wireCapture(conn, captured);
+            const stopCapture = wireCapture(conn, captured, resume.sessionId);
             try {
               const loaded = (await establish(conn, 'session/load', {
                 sessionId: resume.sessionId,
@@ -837,6 +954,7 @@ export function attachChatHandlers(
           tapMapper: null,
           tapTurnEndAt: 0,
           tapDead: false,
+          subagents: new Set(),
         };
         sessions.set(sessionId, session);
         liveConn = null; // registered — teardown owns the connection from here
@@ -875,7 +993,7 @@ export function attachChatHandlers(
               (sid, busEvent) => {
                 if (sessions.get(sessionId) !== session || sid !== session.acpSessionId) return;
                 if (busEvent['type'] === 'turn/end') session.tapTurnEndAt = Date.now();
-                for (const event of session.tapMapper?.(busEvent) ?? []) {
+                for (const event of session.tapMapper?.event(busEvent) ?? []) {
                   emitEvent(session, event);
                 }
               },
@@ -888,6 +1006,13 @@ export function attachChatHandlers(
                   '[chat] dsh event tap lost — committed-only streaming for this session',
                 );
               },
+              // #46 — the token-delta arm: `agent/assistant-stream` frames.
+              (sid, frame) => {
+                if (sessions.get(sessionId) !== session || sid !== session.acpSessionId) return;
+                for (const event of session.tapMapper?.frame(frame) ?? []) {
+                  emitEvent(session, event);
+                }
+              },
             );
           } else {
             tapArmed.listener.close();
@@ -899,6 +1024,36 @@ export function attachChatHandlers(
         // pending attach, so it cannot be active without the tail.
         ensureTail(session);
         emitHistory(session, history);
+        // Issue #49 — apply the platform's default permission mode BEFORE the
+        // config snapshot emits (one event, already the final mode). The
+        // claude wrapper resolves an EXPLICIT mode at session/new (CC's own
+        // auto default can never reach an ACP session — the wire carries no
+        // mode field), so the daemon re-issues the W9 set_mode lane here.
+        // OPAQUE value; applied ONLY when the session advertises it (honest
+        // absence = no-op); an adapter refusal keeps its own resolved mode.
+        if (
+          defaultMode !== undefined &&
+          session.config.modes?.availableModes.some((m) => m.id === defaultMode) === true
+        ) {
+          try {
+            await conn.request(
+              'session/set_mode',
+              { sessionId: acpSessionId, modeId: defaultMode },
+              15000,
+            );
+            session.config.modes = { ...session.config.modes, currentModeId: defaultMode };
+            // Keep the option surface in step too (an adapter that pushes
+            // nothing after the set would otherwise leave a stale value).
+            session.config.options = session.config.options.map((o) =>
+              o.id === 'mode' ? { ...o, currentValue: defaultMode } : o,
+            );
+          } catch (e) {
+            // keep the adapter-resolved mode
+            console.warn(
+              `[chat] #49 set_mode(${String(defaultMode)}) failed: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        }
         // 9 W9 A — the authoritative config snapshot rides AFTER the replayed
         // history (a load's replay patches settle first; last write wins) and
         // enters the ring, so a resync restores the selectors.
@@ -1235,6 +1390,7 @@ export function attachChatHandlers(
 
   return {
     liveConnectionFor,
+    liveNativeIdsFor,
     /** Issue #3 — is a prewarmed adapter READY (initialized, alive) for the target? */
     prewarmReady: (target: string): boolean => prewarmPool.readyKeys().includes(target),
     /** #39 — live channels, oldest first (the TUI's agents pane). */
@@ -1295,11 +1451,25 @@ async function establish(
  * used while `session/load` replays an agent's history (claude/codex replay
  * BEFORE the load response resolves). `user_message_chunk` becomes a USER
  * item (on the live path it is dropped as a browser echo); everything else
- * maps through the ordinary update mapping. Returns the deactivation.
+ * maps through the ordinary update mapping. #71 — sub-agent frames route the
+ * same way as the live path, so a replayed session reconstructs its child
+ * cards. Returns the deactivation.
  */
-function wireCapture(conn: AgentConnection, items: HistoryItem[]): () => void {
+function wireCapture(
+  conn: AgentConnection,
+  items: HistoryItem[],
+  rootSessionId: string,
+): () => void {
+  const subagents = new Set<string>();
   const handler = (method: string, params: Record<string, unknown>): void => {
     if (method !== 'session/update') return;
+    if (
+      routeSubagentFrame(params, rootSessionId, subagents, (e) =>
+        items.push({ type: 'event', event: e }),
+      )
+    ) {
+      return;
+    }
     const update = (params.update ?? {}) as Record<string, unknown>;
     if (update.sessionUpdate === 'user_message_chunk') {
       const text = textOf(update.contentBlock) || textOf(update.content);
@@ -1324,9 +1494,10 @@ function finishCaptured(items: HistoryItem[]): HistoryItem[] {
 
 /**
  * dsh resume history — the adapter restores the log WITHOUT replaying, so the
- * transcript file is the source. Best-effort by design: a missing/unreadable
- * transcript (or no zstd on this Node) resumes WITHOUT history rather than
- * failing the channel.
+ * transcript file is the source (the CURRENT generation-versioned artifact,
+ * #46 — a pre-v4 log reads as absent and resumes without history).
+ * Best-effort by design: a missing/unreadable transcript (or no zstd on this
+ * Node) resumes WITHOUT history rather than failing the channel.
  */
 async function dshTranscriptHistory(home: string, sessionId: string): Promise<HistoryItem[]> {
   try {
@@ -1334,11 +1505,18 @@ async function dshTranscriptHistory(home: string, sessionId: string): Promise<Hi
     const zstd = nativeZstd();
     if (zstd === null) return [];
     for (const slug of readdirSync(root)) {
-      const candidate = join(root, slug, sessionId, 'session.jsonl.zstd');
+      const dir = join(root, slug, sessionId);
       try {
-        return dshHistoryItems(decodeTranscript(readFileSync(candidate), zstd));
+        readdirSync(dir); // the session directory exists — a log may follow
       } catch {
-        // not under this slug (or undecodable) — try the next
+        continue; // not under this slug
+      }
+      const log = currentSessionLog(dir, (p) => readdirSync(p));
+      if (log === null) return []; // only pre-v4 artifacts — unsupported (#46)
+      try {
+        return dshHistoryItems(decodeTranscript(readFileSync(log.file), zstd));
+      } catch {
+        return []; // lazily materialized (no log yet) or undecodable
       }
     }
     return [];
@@ -1356,6 +1534,15 @@ function wireSession(
 
   conn.setNotificationHandler((method, params) => {
     if (method !== 'session/update') return;
+    // #71 — native sub-agent frames route BEFORE the root handling: child
+    // sessions must never fold into the main transcript.
+    if (
+      routeSubagentFrame(params, session.acpSessionId, session.subagents, (e) =>
+        emitEvent(session, e),
+      )
+    ) {
+      return;
+    }
     const update = (params.update ?? {}) as Record<string, unknown>;
     // 9 W9 A — session-config pushes merge into the daemon's snapshot and
     // re-emit it in full (needs the session state, so they are intercepted
@@ -1788,9 +1975,133 @@ export function mapAcpUpdate(params: UnknownRecord): ChatStreamEvent | null {
       // The browser echoes the user's message optimistically on the live
       // path; history batches (capture mode) turn these into USER items.
       return null;
+    case 'subagent_update': {
+      // #71 — the RFD sub-agent protocol (claude-agent-acp ≥0.93 for a client
+      // advertising plain `clientCapabilities.subagents`): the parent frame
+      // carries the child's lifecycle. `state.state === 'running'` is the
+      // ANNOUNCE (labels ride `title`/`description`); any later state ends
+      // the child — `idle` + `stopReason` maps onto our terminal states and
+      // `unknown` (unobservable) onto disconnected.
+      const subagentId = boundedId(update.sessionId);
+      if (subagentId === null) return null;
+      const state = asRecord(update.state);
+      const s = state !== null ? state.state : undefined;
+      if (s === 'running') {
+        return {
+          kind: 'subagent_spawned',
+          subagentId,
+          name: boundedText(update.title, 256),
+          task: boundedText(update.description, 8192),
+        };
+      }
+      const stopReason =
+        state !== null && typeof state.stopReason === 'string' ? state.stopReason : undefined;
+      const hasError = state !== null && state.error !== undefined;
+      const terminal: 'completed' | 'failed' | 'cancelled' | 'disconnected' =
+        s === 'unknown'
+          ? 'disconnected'
+          : stopReason === 'cancelled'
+            ? 'cancelled'
+            : stopReason === 'error' || hasError
+              ? 'failed'
+              : 'completed';
+      return { kind: 'subagent_done', subagentId, state: terminal };
+    }
+    case 'subagent_spawned': {
+      // The 0.79-era AIR draft shape (kept for back-compat; our pin is the
+      // RFD form above): the child's Task tool call is suppressed from the
+      // parent transcript and replaced by this announcement.
+      const subagentId = boundedId(update.subagentSessionId);
+      const name = boundedText(update.name, 256);
+      const task = boundedText(update.task, 8192);
+      if (subagentId === null) return null;
+      return { kind: 'subagent_spawned', subagentId, name, task };
+    }
+    case 'subagent_state_update': {
+      const subagentId = boundedId(update.subagentSessionId);
+      const state = update.state;
+      if (subagentId === null) return null;
+      if (
+        state === 'completed' ||
+        state === 'failed' ||
+        state === 'cancelled' ||
+        state === 'disconnected'
+      ) {
+        return { kind: 'subagent_done', subagentId, state };
+      }
+      return null;
+    }
     default:
       return { kind: 'raw', method: 'session/update', params: update };
   }
+}
+
+/** Non-empty bounded id (sub-agent session ids ride the update fields). */
+function boundedId(raw: unknown): string | null {
+  return typeof raw === 'string' && raw !== '' && raw.length <= 256 ? raw : null;
+}
+
+/** Non-empty bounded text, normalized to '' when absent. */
+function boundedText(raw: unknown, max: number): string {
+  if (typeof raw !== 'string' || raw === '') return '';
+  return raw.length <= max ? raw : raw.slice(0, max);
+}
+
+/**
+ * #71 — the child-side event set `subagent_update` may carry. Config, usage,
+ * plans and commands are root-session concerns; a child frame carrying one
+ * is dropped rather than wrapped (no adapter emits them today).
+ */
+function isSubagentChildEvent(event: ChatStreamEvent): event is SubagentChildEvent {
+  return (
+    event.kind === 'message_delta' ||
+    event.kind === 'thought_delta' ||
+    event.kind === 'tool_call' ||
+    event.kind === 'raw'
+  );
+}
+
+/**
+ * #71 — route one `session/update` frame for a channel whose root ACP session
+ * is `rootSessionId` and whose announced children live in `subagents`. Child
+ * frames wrap into `subagent_update`; parent-side spawn/state frames map and
+ * REGISTER the child id. Returns null when the frame is fully handled here,
+ * otherwise the caller maps it through the ordinary root path.
+ */
+function routeSubagentFrame(
+  params: UnknownRecord,
+  rootSessionId: string,
+  subagents: Set<string>,
+  emit: (event: ChatStreamEvent) => void,
+): boolean {
+  const update = (params.update ?? {}) as UnknownRecord;
+  const kind = update.sessionUpdate;
+  if (
+    kind === 'subagent_update' ||
+    kind === 'subagent_spawned' ||
+    kind === 'subagent_state_update'
+  ) {
+    const mapped = mapAcpUpdate(params);
+    if (mapped !== null) {
+      if (mapped.kind === 'subagent_spawned') subagents.add(mapped.subagentId);
+      emit(mapped);
+    }
+    return true;
+  }
+  const frameSessionId =
+    typeof params.sessionId === 'string' && params.sessionId !== '' ? params.sessionId : null;
+  if (
+    frameSessionId !== null &&
+    frameSessionId !== rootSessionId &&
+    subagents.has(frameSessionId)
+  ) {
+    const child = mapAcpUpdate(params);
+    if (child !== null && isSubagentChildEvent(child)) {
+      emit({ kind: 'subagent_update', subagentId: frameSessionId, event: child });
+    }
+    return true;
+  }
+  return false;
 }
 
 /** Extract display text from an ACP ContentBlock chunk. */

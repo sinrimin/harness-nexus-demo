@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { z } from 'zod';
 import {
   inventoryArtifactSchema,
@@ -669,6 +673,36 @@ export const chatStreamEventSchema = z.discriminatedUnion('kind', [
     commands: z.array(availableCommandViewSchema).max(64),
   }),
   z.object({ kind: z.literal('raw'), method: z.string().min(1).max(64), params: z.unknown() }),
+  // #71 — native sub-agent sessions (claude-agent-acp's `subagents`
+  // capability): the adapter announces each child (`subagent_spawned`), streams
+  // the child's updates on the CHILD's own sessionId, and closes with a state.
+  // The daemon routes by frame sessionId and wraps child events in
+  // `subagent_update`; the three kinds reach the browser only in that wrapped
+  // shape, so the child's activity renders inside a sub-agent card instead of
+  // interleaving with the main agent's transcript.
+  z.object({
+    kind: z.literal('subagent_spawned'),
+    subagentId: z.string().min(1).max(256),
+    name: z.string().max(256),
+    task: z.string().max(8192),
+  }),
+  z.object({
+    kind: z.literal('subagent_update'),
+    subagentId: z.string().min(1).max(256),
+    /** The child-side event set — config/usage/permissions are root-session
+     *  concerns and are never wrapped (the daemon drops them child-side). */
+    event: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('message_delta'), delta: z.string().min(0).max(100000) }),
+      z.object({ kind: z.literal('thought_delta'), delta: z.string().min(0).max(100000) }),
+      z.object({ kind: z.literal('tool_call'), call: acpToolCallViewSchema }),
+      z.object({ kind: z.literal('raw'), method: z.string().min(1).max(64), params: z.unknown() }),
+    ]),
+  }),
+  z.object({
+    kind: z.literal('subagent_done'),
+    subagentId: z.string().min(1).max(256),
+    state: z.enum(['completed', 'failed', 'cancelled', 'disconnected']),
+  }),
 ]);
 
 /** `chat:event` envelope — daemon→server and (relayed) server→browser share it. */
@@ -699,6 +733,14 @@ export const chatSessionOpenRequestSchema = z.object({
       cwd: z.string().min(1).max(1024),
     })
     .optional(),
+  /**
+   * #70 — the `directory` may NOT EXIST yet on the machine: true = the
+   * daemon creates it (recursively) before spawning the adapter. Absent or
+   * false = an existing-directory-only contract — a missing cwd fails
+   * honestly (`chat:session.failed`), never as a spawn-ENOENT masquerade.
+   * The assistant dispatch always sends true.
+   */
+  createDirectory: z.boolean().optional(),
 });
 
 /** server → daemon: spawn the agent subprocess for this channel. `cwd` defaults to the agent home. */
@@ -709,6 +751,8 @@ export const chatSessionStartEventSchema = z.object({
   cwd: z.string().min(1).max(1024),
   /** 9 W7 — present when this channel resumes a native session (`session/load` / `session/resume`). */
   resume: chatSessionOpenRequestSchema.shape.resume,
+  /** #70 — mirror of the open request's flag (mkdir -p the cwd before spawn). */
+  createDirectory: z.boolean().optional(),
   /**
    * 9 W13 — the machine's configured model set for this target,
    * `unique([spec.model, ...spec.models])` from the stored RuntimeConfig.
@@ -718,6 +762,16 @@ export const chatSessionStartEventSchema = z.object({
    * Optional + stripped by old daemons' non-strict parse, so purely additive.
    */
   modelOptions: z.array(z.string().min(1).max(128)).max(32).optional(),
+  /**
+   * Issue #49 — the machine's default chat permission mode for this target,
+   * stamped by the SERVER from the machine's `chatDefaultMode`. OPAQUE
+   * adapter mode id; the daemon applies it via one `session/set_mode` right
+   * after establishment — only when the established session advertises the
+   * mode (honest absence = no-op). Absent = no platform default
+   * (adapter-resolved mode). Optional + stripped by old daemons' non-strict
+   * parse, so purely additive.
+   */
+  defaultMode: z.string().min(1).max(64).optional(),
   /**
    * Issue #3 — the target's pre-warm switch is ON at open time. The daemon
    * re-arms one fresh prewarmed adapter AFTER this channel took one (or
@@ -995,6 +1049,24 @@ export const sessionsListResultEventSchema = z.object({
   error: z.string().max(512).optional(),
 });
 
+/**
+ * #55 — server → daemon: delete one of the target's native sessions. Same
+ * requestId/result round-trip over /ctl as `sessions:list`; deletion is
+ * IDEMPOTENT (ACP semantics — a session that is already gone succeeds).
+ */
+export const sessionsDeleteRequestSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  target: agentTargetSchema,
+  /** The target-native session id (the rail row's `sessionId`). */
+  sessionId: z.string().min(1).max(256),
+});
+
+/** daemon → server: the delete settled (`error` carries the reason). */
+export const sessionsDeleteResultEventSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  error: z.string().max(512).optional(),
+});
+
 /** server → browser lifecycle pushes (typed for the web client; server-constructed). */
 export const chatSessionReadyPushSchema = z.object({
   sessionId: z.string().min(1),
@@ -1100,6 +1172,14 @@ export type AcpPermissionOption = z.infer<typeof acpPermissionOptionSchema>;
 export type ElicitationField = z.infer<typeof elicitationFieldSchema>;
 export type PromptBlock = z.infer<typeof promptBlockSchema>;
 export type ChatStreamEvent = z.infer<typeof chatStreamEventSchema>;
+/**
+ * #71 — the child-side event shapes a `subagent_update` may carry (the wrapped
+ * arm of the union above; config/usage/permissions are root-session concerns).
+ */
+export type SubagentChildEvent = Extract<
+  ChatStreamEvent,
+  { kind: 'message_delta' } | { kind: 'thought_delta' } | { kind: 'tool_call' } | { kind: 'raw' }
+>;
 export type SessionMode = z.infer<typeof sessionModeSchema>;
 export type SessionModeState = z.infer<typeof sessionModeStateSchema>;
 export type SessionConfigValue = z.infer<typeof sessionConfigValueSchema>;
@@ -1130,5 +1210,7 @@ export type ChatHistoryEvent = z.infer<typeof chatHistoryEventSchema>;
 export type NativeSessionView = z.infer<typeof nativeSessionViewSchema>;
 export type SessionsListRequest = z.infer<typeof sessionsListRequestSchema>;
 export type SessionsListResultEvent = z.infer<typeof sessionsListResultEventSchema>;
+export type SessionsDeleteRequest = z.infer<typeof sessionsDeleteRequestSchema>;
+export type SessionsDeleteResultEvent = z.infer<typeof sessionsDeleteResultEventSchema>;
 export type AdapterProcessView = z.infer<typeof adapterProcessViewSchema>;
 export type AdaptersReportResultEvent = z.infer<typeof adaptersReportResultEventSchema>;

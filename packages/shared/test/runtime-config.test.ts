@@ -1,6 +1,11 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { describe, expect, it } from 'vitest';
 import {
   createMachineJobSchema,
+  hasClaudeOneMarker,
   harnessJobPayloadSchema,
   harnessResultDataSchema,
   runtimeConfigGetRequestSchema,
@@ -8,6 +13,8 @@ import {
   runtimeConfigViewEventSchema,
   runtimeSpecUnsupportedReason,
   RUNTIME_API_SUPPORT,
+  setClaudeOneMarker,
+  stripClaudeOneMarker,
 } from '../src/index.js';
 
 /** Phase 9 W3 — the provider-config spec, its per-target policy, and the apply-config job arm. */
@@ -36,6 +43,242 @@ describe('runtimeConfigSpecSchema', () => {
     expect(runtimeConfigSpecSchema.safeParse({ ...validSpec, credentialName: '' }).success).toBe(
       false,
     );
+  });
+
+  it('#60 — accepts a full claudeCode knob set and stays optional', () => {
+    expect(runtimeConfigSpecSchema.safeParse(validSpec).success).toBe(true);
+    const parsed = runtimeConfigSpecSchema.safeParse({
+      ...validSpec,
+      api: 'anthropic-messages',
+      model: 'gw-large[1m]',
+      claudeCode: {
+        authField: 'ANTHROPIC_API_KEY',
+        tiers: [
+          {
+            tier: 'sonnet',
+            model: 'gw-large[1m]',
+            displayName: 'Gateway Large',
+            capabilities: ['effort', 'thinking'],
+          },
+          { tier: 'haiku', model: 'gw-mini' },
+        ],
+        subagentModel: 'gw-mini[1m]',
+        maxOutputTokens: 64000,
+        maxContextTokens: 983616,
+        extraBody: { enable_thinking: true },
+      },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('#60 — rejects out-of-bounds knobs and unknown tiers', () => {
+    const base = { ...validSpec, api: 'anthropic-messages' as const };
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        claudeCode: { maxOutputTokens: 200000 },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, claudeCode: { maxContextTokens: 0 } }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        claudeCode: { tiers: [{ tier: 'mythos' as never, model: 'x' }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, claudeCode: { tiers: [{ tier: 'opus' }] } })
+        .success,
+    ).toBe(false);
+  });
+
+  it('#62 — accepts a full opencode knob set and stays optional', () => {
+    expect(runtimeConfigSpecSchema.safeParse(validSpec).success).toBe(true);
+    const parsed = runtimeConfigSpecSchema.safeParse({
+      ...validSpec,
+      opencode: {
+        models: [
+          {
+            id: 'gw-large',
+            name: 'Gateway Large',
+            contextWindow: 200_000,
+            maxOutputTokens: 32_000,
+            reasoning: true,
+            temperatureEnabled: true,
+            vision: true,
+            options: { enable_thinking: true },
+          },
+        ],
+        smallModel: 'gw-mini',
+        autoupdateDisabled: true,
+      },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('#62 — rejects non-positive limits and an id-less model detail', () => {
+    const base = { ...validSpec, api: 'openai' as const };
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        opencode: { models: [{ id: 'x', contextWindow: 0 }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        opencode: { models: [{ id: 'x', maxOutputTokens: -1 }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, opencode: { models: [{ name: 'x' }] } }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, opencode: { smallModel: '' } }).success,
+    ).toBe(false);
+  });
+
+  it('#63 — accepts a full codex knob set and stays optional', () => {
+    expect(runtimeConfigSpecSchema.safeParse(validSpec).success).toBe(true);
+    const parsed = runtimeConfigSpecSchema.safeParse({
+      ...validSpec,
+      codex: {
+        reasoningEffort: 'xhigh',
+        reasoningSummary: 'none',
+        verbosity: 'low',
+        contextWindow: 1_000_000,
+        autoCompactTokenLimit: 900_000,
+        switches: { updateCheckDisabled: true },
+      },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('#63 — rejects off-enum dials and non-positive token counts', () => {
+    const base = { ...validSpec, api: 'openai' as const };
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        codex: { reasoningEffort: 'ultra' },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, codex: { verbosity: 'terse' } }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        codex: { reasoningSummary: 'verbose' },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, codex: { contextWindow: 0 } }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        codex: { autoCompactTokenLimit: 20_000_001 },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('#64 — accepts a full deepseek detail set and stays optional', () => {
+    expect(runtimeConfigSpecSchema.safeParse(validSpec).success).toBe(true);
+    const parsed = runtimeConfigSpecSchema.safeParse({
+      ...validSpec,
+      api: 'anthropic-messages',
+      deepseek: {
+        models: [
+          {
+            id: 'gw-large',
+            name: 'Gateway Large',
+            contextWindow: 1_000_000,
+            maxOutputTokens: 384_000,
+            vision: true,
+          },
+          { id: 'gw-mini' },
+        ],
+      },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('#64 — rejects non-positive detail numbers and an id-less entry', () => {
+    const base = { ...validSpec, api: 'anthropic-messages' as const };
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        deepseek: { models: [{ id: 'x', contextWindow: 0 }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        deepseek: { models: [{ id: 'x', maxOutputTokens: -1 }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, deepseek: { models: [{ name: 'x' }] } }).success,
+    ).toBe(false);
+  });
+
+  it('#65 — accepts a full pi detail set and stays optional', () => {
+    expect(runtimeConfigSpecSchema.safeParse(validSpec).success).toBe(true);
+    const parsed = runtimeConfigSpecSchema.safeParse({
+      ...validSpec,
+      pi: {
+        models: [
+          {
+            id: 'gw-large',
+            name: 'Gateway Large',
+            contextWindow: 1_000_000,
+            maxOutputTokens: 384_000,
+            vision: true,
+            reasoning: true,
+            samplingParams: { enable_thinking: true, top_p: 0.9 },
+          },
+          { id: 'gw-mini' },
+        ],
+      },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('#65 — rejects non-positive detail numbers and an id-less entry', () => {
+    const base = { ...validSpec, api: 'openai' as const };
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        pi: { models: [{ id: 'x', contextWindow: 0 }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({
+        ...base,
+        pi: { models: [{ id: 'x', maxOutputTokens: -1 }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      runtimeConfigSpecSchema.safeParse({ ...base, pi: { models: [{ name: 'x' }] } }).success,
+    ).toBe(false);
+  });
+});
+
+describe('claude-code [1m] marker helpers (#60)', () => {
+  it('detects case-insensitively and round-trips strip/set', () => {
+    expect(hasClaudeOneMarker('qwen-plus[1m]')).toBe(true);
+    expect(hasClaudeOneMarker('qwen-plus[1M] ')).toBe(true);
+    expect(hasClaudeOneMarker('qwen-plus')).toBe(false);
+    expect(stripClaudeOneMarker('qwen-plus[1m]')).toBe('qwen-plus');
+    expect(stripClaudeOneMarker('qwen-plus [1M]\t')).toBe('qwen-plus');
+    expect(stripClaudeOneMarker('qwen-plus')).toBe('qwen-plus');
+    expect(setClaudeOneMarker('qwen-plus', true)).toBe('qwen-plus[1m]');
+    // setting is idempotent and stripping a bare id is a no-op
+    expect(setClaudeOneMarker(setClaudeOneMarker(' qwen-plus ', true), true)).toBe('qwen-plus[1m]');
+    expect(setClaudeOneMarker('qwen-plus[1m]', false)).toBe('qwen-plus');
+    expect(setClaudeOneMarker('', true)).toBe('');
   });
 });
 

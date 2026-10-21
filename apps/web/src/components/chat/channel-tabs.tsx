@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { useEffect, useState } from 'react';
 import { ChevronDownIcon, CircleXIcon, EraserIcon, Loader2Icon } from 'lucide-react';
 import { Button } from '@/components/ui/button.js';
@@ -11,7 +15,8 @@ import { useI18n } from '@/i18n';
 import { ConfirmDialog } from '@/components/kit';
 import { StateSignal } from '@/components/state-signal';
 import { cn } from '@/lib/utils.js';
-import type { ChatChannelView } from '@/realtime.js';
+import { BotIcon } from 'lucide-react';
+import type { AssistantLiveSessionView, ChatChannelView } from '@/realtime.js';
 
 /**
  * 9 W11 B — the live-channel tab strip. Rendered at the top of both chat
@@ -58,6 +63,14 @@ interface ChannelTabsProps {
   /** Runs only after the confirm dialog is answered — return the ack's promise
    *  so the dialog can hold its confirm button busy while it runs. */
   onCleanup: (idleOnly: boolean) => Promise<void> | void;
+  /**
+   * #52 M3 — the user's BUSY assistant sessions, rendered as tabs ahead of
+   * the machine channels (a running platform turn is a live thing worth
+   * jumping back into). × cancels that turn — the session row persists.
+   */
+  assistantBusy?: AssistantLiveSessionView[];
+  onActivateAssistant?: (session: AssistantLiveSessionView) => void;
+  onStopAssistant?: (session: AssistantLiveSessionView) => void;
 }
 
 export function ChannelTabs({
@@ -66,6 +79,9 @@ export function ChannelTabs({
   onActivate,
   onClose,
   onCleanup,
+  assistantBusy = [],
+  onActivateAssistant,
+  onStopAssistant,
 }: ChannelTabsProps) {
   const { t, lang } = useI18n();
   // Idle-age labels advance with wall time; snapshot pushes only fire on
@@ -80,8 +96,10 @@ export function ChannelTabs({
     const timer = setInterval(() => setNow(Date.now()), 60_000);
     return () => clearInterval(timer);
   }, [channels.length]);
-  if (channels.length === 0) return null;
+  if (channels.length === 0 && assistantBusy.length === 0) return null;
 
+  // The broom closes MACHINE channels only — assistant turns are stopped
+  // per-tab (×), so they never count toward the "busy" deferral figure.
   const busyCount = channels.filter((ch) => ch.busy).length;
   async function runCleanup(): Promise<void> {
     const pending = cleanup;
@@ -98,6 +116,46 @@ export function ChannelTabs({
   return (
     <div className="bg-sidebar/30 flex h-9 shrink-0 items-center gap-1 border-b px-2">
       <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+        {assistantBusy.map((s) => {
+          const active = s.id === activeSessionId;
+          const label = s.title !== '' ? s.title : s.id.slice(0, 8);
+          return (
+            <div
+              key={s.id}
+              className={cn(
+                'group/tab flex max-w-52 shrink-0 items-center gap-1.5 rounded-md border px-2 py-1',
+                active ? 'bg-background shadow-sm' : 'hover:bg-background/60 border-transparent',
+              )}
+            >
+              <button
+                type="button"
+                className="flex min-w-0 items-center gap-1.5"
+                onClick={() => onActivateAssistant?.(s)}
+                title={t('assistants.endAssistant')}
+              >
+                <BotIcon className="text-muted-foreground size-3 shrink-0" />
+                <span
+                  className={cn(
+                    'truncate font-mono text-xs',
+                    active ? 'text-foreground' : 'text-muted-foreground',
+                  )}
+                >
+                  {label}
+                </span>
+                <StateSignal state="busy" aria-hidden className="size-1.5" />
+              </button>
+              <button
+                type="button"
+                className="text-muted-foreground hover:text-foreground shrink-0"
+                onClick={() => onStopAssistant?.(s)}
+                title={t('chat.tabStopAssistant', { id: label })}
+                aria-label={t('chat.tabStopAssistant', { id: label })}
+              >
+                <CircleXIcon className="size-3.5" />
+              </button>
+            </div>
+          );
+        })}
         {channels.map((ch) => {
           const active = ch.sessionId === activeSessionId;
           const idleMs = now - (ch.lastActiveAt ?? ch.openedAt);
@@ -165,29 +223,31 @@ export function ChannelTabs({
           );
         })}
       </div>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="text-muted-foreground hover:text-foreground h-7 shrink-0 gap-1 px-2 text-xs"
-            title={t('chat.tabsCleanupTitle')}
-          >
-            <EraserIcon className="size-3.5" />
-            {t('chat.tabsCleanup')}
-            <ChevronDownIcon className="size-3 opacity-60" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          <DropdownMenuItem onClick={() => setCleanup({ idleOnly: false })}>
-            {t('chat.tabsCleanupAll')}
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => setCleanup({ idleOnly: true })}>
-            {t('chat.tabsCleanupIdle')}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {channels.length > 0 ? (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground hover:text-foreground h-7 shrink-0 gap-1 px-2 text-xs"
+              title={t('chat.tabsCleanupTitle')}
+            >
+              <EraserIcon className="size-3.5" />
+              {t('chat.tabsCleanup')}
+              <ChevronDownIcon className="size-3 opacity-60" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => setCleanup({ idleOnly: false })}>
+              {t('chat.tabsCleanupAll')}
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => setCleanup({ idleOnly: true })}>
+              {t('chat.tabsCleanupIdle')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : null}
 
       {cleanup !== null ? (
         <ConfirmDialog

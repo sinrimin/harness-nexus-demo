@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import type { FastifyInstance } from 'fastify';
 import socketIOPlugin from 'fastify-socket.io';
 import type { Server, Socket } from 'socket.io';
@@ -14,6 +18,14 @@ import {
   type MachineStatusEvent,
 } from '@harness-nexus/shared';
 import { jobProgressEventSchema, jobResultEventSchema, type JobView } from '@harness-nexus/shared';
+import {
+  assistantConfigSetRequestSchema,
+  assistantMessageSendRequestSchema,
+  assistantQueueCancelRequestSchema,
+  assistantSessionCloseRequestSchema,
+  assistantSessionOpenRequestSchema,
+  assistantTurnCancelRequestSchema,
+} from '@harness-nexus/shared';
 import {
   chatChannelsCloseAllRequestSchema,
   chatChannelsSyncRequestSchema,
@@ -32,6 +44,7 @@ import {
   chatTurnCancelEventSchema,
   adaptersReportResultEventSchema,
   sessionsListResultEventSchema,
+  sessionsDeleteResultEventSchema,
   workspaceListEventSchema,
 } from '@harness-nexus/shared';
 import { hashToken, PAT_PREFIX, generateId } from '../infra/crypto.js';
@@ -44,8 +57,23 @@ import { SessionsCoordinator } from '../realtime/sessions.js';
 import { AdaptersReportCoordinator } from '../realtime/adapters.js';
 import { DetectedInstanceSync } from '../realtime/runtime-instances.js';
 import { ChatService } from '../realtime/chat.js';
+import { AssistantDispatchService } from '../realtime/assistant-dispatch.js';
+import { AssistantRealtimeService } from '../realtime/assistant.js';
 import { ReconnectGuard } from '../realtime/reconnect.js';
 import { JobService } from '../jobs/service.js';
+
+/** #68 — a send's text (string or blocks) for the dispatch backflow note. */
+function chatTextOf(content: string | unknown[]): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(
+      (b): b is { type: 'text'; text: string } =>
+        typeof b === 'object' && b !== null && (b as { type?: unknown }).type === 'text',
+    )
+    .map((b) => b.text)
+    .join('\n');
+}
 
 /**
  * Realtime channel (Phase 8) — Socket.IO attached to the Fastify HTTP server.
@@ -70,6 +98,10 @@ export interface RealtimeService {
   jobs: JobService;
   /** Chat routing/gating/audit (C5) — /app ↔ /ctl with permission watchdogs. */
   chat: ChatService;
+  /** Platform assistant turns (#52) — /app rooms over persisted sessions. */
+  assistant: AssistantRealtimeService;
+  /** #67 — the assistant's client-agent dispatch coordinator (tests + tools). */
+  assistantDispatch: AssistantDispatchService;
   /** Redacted config-view waiters (Phase 9 W4). */
   configView: ConfigViewerCoordinator;
   /** Workspace directory-listing waiters (Phase 9 W6 chat picker). */
@@ -100,6 +132,7 @@ export async function registerRealtime(
     chatReadyTimeoutMs: number;
     chatReconnectGraceMs: number;
     chatIdleTtlMs: number;
+    chatViewerGraceMs: number;
     sessionsListTimeoutMs: number;
     adaptersReportTimeoutMs: number;
   },
@@ -148,8 +181,61 @@ export async function registerRealtime(
       permissionTimeoutMs: opts.chatPermissionTimeoutMs,
       readyTimeoutMs: opts.chatReadyTimeoutMs,
       idleTtlMs: opts.chatIdleTtlMs,
+      viewerGraceMs: opts.chatViewerGraceMs,
     },
   );
+  // #67 — ONE coordinator instance: the assistant's tool seam and the
+  // RealtimeService export (tests) must share the in-flight records.
+  const assistantDispatch = new AssistantDispatchService(chat);
+  const assistant = new AssistantRealtimeService(
+    {
+      uow: app.uow,
+      credentialEncryptionKey: app.credentialEncryptionKey,
+      skills: {
+        search: app.skillSearch,
+        catalog: app.skillCatalog,
+        allowlist: app.marketplaceAllowlist,
+      },
+      dispatch: assistantDispatch,
+    },
+    {
+      toChannel: (sessionId, event, payload) => {
+        appNs.to(`chan:${sessionId}`).emit(event, payload);
+      },
+      toUser: (userId, event, payload) => {
+        appNs.to(`user:${userId}`).emit(event, payload);
+      },
+      joinChannel: (socketId, sessionId) => {
+        const socket = appNs.sockets.get(socketId);
+        if (socket) void socket.join(`chan:${sessionId}`);
+      },
+      // #57 — the assistant axis's viewer-grace re-check (same source as the
+      // chat axis's).
+      userSockets: async (userId) =>
+        (await appNs.in(`user:${userId}`).fetchSockets()).map((s) => s.id),
+    },
+    // M2 — the MCP registry seam. LAZY on purpose: mountMcpProxy decorates
+    // `app.mcpRegistry` AFTER registerRealtime runs, so the closures resolve
+    // it per call (turn time), never at wiring time.
+    {
+      listTools: (serverIds) => app.mcpRegistry.listTools(serverIds),
+      callTool: (namespacedName, args) => app.mcpRegistry.callTool(namespacedName, args),
+    },
+    // M3 — write-gate watchdog; #57 — the SAME viewer grace the chat axis
+    // uses (CHAT_VIEWER_GRACE_MS): one knob, one "browser comes back" budget.
+    { permissionTimeoutMs: opts.chatPermissionTimeoutMs, viewerGraceMs: opts.chatViewerGraceMs },
+  );
+  // #68 — the dispatch backflow sink: user operations / completions on driven
+  // channels land as model-visible notes in the owning assistant session, and
+  // the session's dispatch snapshot pushes to the owner's /app sockets (the
+  // stop-choice UI's source of truth).
+  assistantDispatch.attach({
+    note: (sessionId, text) => assistant.addDispatchNote(sessionId, text),
+    dispatches: (userId, sessionId, views) => {
+      appNs.to(`user:${userId}`).emit('assistant:dispatches', { sessionId, dispatches: views });
+    },
+  });
+
   const jobs = new JobService(
     {
       uow: app.uow,
@@ -184,6 +270,8 @@ export async function registerRealtime(
     inventory,
     jobs,
     chat,
+    assistant,
+    assistantDispatch,
     configView,
     workspace,
     sessions,
@@ -300,6 +388,9 @@ export async function registerRealtime(
         realtime.broadcastStatus(updated, true);
         // The daemon is back — drain anything queued while it was offline.
         void realtime.jobs.dispatchPending(machineId);
+        // #66 — re-flush parked chat send-queue entries held back by the
+        // offline guard (same transition, same reason as dispatchPending).
+        realtime.chat.onMachineOnline(machineId);
       }
     })();
 
@@ -415,6 +506,18 @@ export async function registerRealtime(
       }
       const { requestId, ...evt } = parsed.data;
       const known = sessions.onList(requestId, evt);
+      ack?.(known ? { accepted: true } : { error: 'unknown-request' });
+    });
+
+    // #55 — daemon reply for `sessions:delete` (native session deletion).
+    socket.on('sessions:delete:result', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = sessionsDeleteResultEventSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      const { requestId, ...evt } = parsed.data;
+      const known = sessions.onDelete(requestId, evt);
       ack?.(known ? { accepted: true } : { error: 'unknown-request' });
     });
 
@@ -571,6 +674,12 @@ export async function registerRealtime(
 
   app.io.of('/app').on('connection', (socket: Socket) => {
     void socket.join(`user:${socket.data.userId as string}`);
+    // #66 — a reconnecting viewer cancels any armed viewer-grace reap FIRST
+    // (before the snapshot below can race the reap's close pushes).
+    realtime.chat.onViewerBack(socket.data.userId as string);
+    // #57 — the assistant axis arms the same reap (abrupt tab deaths leaked
+    // the live flag until a server restart).
+    realtime.assistant.onViewerBack(socket.data.userId as string);
     // 9 W11 B — fresh /app sockets get the live-channel snapshot immediately
     // (the tab bar's initial paint; later changes arrive as pushes).
     realtime.chat.sendSnapshot(socket.data.userId as string);
@@ -593,6 +702,7 @@ export async function registerRealtime(
           socket.id,
           parsed.data.directory,
           parsed.data.resume,
+          parsed.data.createDirectory,
         );
         if (!result.ok) {
           ack?.({ error: result.code });
@@ -636,6 +746,16 @@ export async function registerRealtime(
         parsed.data.sessionId,
         parsed.data.content,
       );
+      if (result.ok) {
+        // #68 — an interjection into a driven channel flows back to the
+        // dispatching assistant session (it runs as the channel's next turn).
+        realtime.assistantDispatch.noteUserOp(
+          socket.data.userId as string,
+          parsed.data.sessionId,
+          'message.send',
+          { text: chatTextOf(parsed.data.content) },
+        );
+      }
       // #10 — `queued` tells the Sender its message parked in the slot (the
       // queue_state event follows as the durable truth).
       ack?.(result.ok ? { accepted: true, queued: result.queued } : { error: result.code });
@@ -652,6 +772,13 @@ export async function registerRealtime(
         socket.data.userId as string,
         parsed.data.sessionId,
       );
+      if (result.ok) {
+        realtime.assistantDispatch.noteUserOp(
+          socket.data.userId as string,
+          parsed.data.sessionId,
+          'queue.cancel',
+        );
+      }
       ack?.(result.ok ? { accepted: true } : { error: result.code });
     });
 
@@ -665,6 +792,15 @@ export async function registerRealtime(
         socket.data.userId as string,
         parsed.data.sessionId,
       );
+      if (result.ok) {
+        // #68 — "the user stopped it" reaches the assistant as intent, not a
+        // failure to retry (a driven channel's cancel is ambiguous otherwise).
+        realtime.assistantDispatch.noteUserOp(
+          socket.data.userId as string,
+          parsed.data.sessionId,
+          'turn.cancel',
+        );
+      }
       ack?.(result.ok ? { accepted: true } : { error: result.code });
     });
 
@@ -679,6 +815,16 @@ export async function registerRealtime(
       }
       const { sessionId, ...set } = parsed.data;
       const result = realtime.chat.onConfigSet(socket.data.userId as string, sessionId, set);
+      if (result.ok) {
+        realtime.assistantDispatch.noteUserOp(
+          socket.data.userId as string,
+          sessionId,
+          'config.set',
+          {
+            config: set,
+          },
+        );
+      }
       ack?.(result.ok ? { accepted: true } : { error: result.code });
     });
 
@@ -694,6 +840,16 @@ export async function registerRealtime(
         parsed.data.requestId,
         parsed.data.optionId,
       );
+      if (result.ok) {
+        realtime.assistantDispatch.noteUserOp(
+          socket.data.userId as string,
+          parsed.data.sessionId,
+          'permission.respond',
+          {
+            ...(parsed.data.optionId !== undefined ? { optionId: parsed.data.optionId } : {}),
+          },
+        );
+      }
       ack?.(result.ok ? { accepted: true } : { error: result.code });
     });
 
@@ -712,6 +868,14 @@ export async function registerRealtime(
         action,
         values,
       );
+      if (result.ok) {
+        realtime.assistantDispatch.noteUserOp(
+          socket.data.userId as string,
+          sessionId,
+          'elicitation.respond',
+          { action },
+        );
+      }
       ack?.(result.ok ? { accepted: true } : { error: result.code });
     });
 
@@ -727,6 +891,13 @@ export async function registerRealtime(
           parsed.data.sessionId,
           parsed.data.reason,
         );
+        if (result.ok) {
+          realtime.assistantDispatch.noteUserOp(
+            socket.data.userId as string,
+            parsed.data.sessionId,
+            'session.close',
+          );
+        }
         ack?.(result.ok ? { closed: true } : { error: result.code });
       })();
     });
@@ -745,6 +916,9 @@ export async function registerRealtime(
           socket.data.userId as string,
           parsed.data.idleOnly ?? false,
         );
+        if (result.closed > 0 || result.deferred > 0) {
+          realtime.assistantDispatch.noteCloseAll(socket.data.userId as string);
+        }
         ack?.(result);
       })();
     });
@@ -762,12 +936,158 @@ export async function registerRealtime(
       ack?.(realtime.chat.snapshotFor(socket.data.userId as string));
     });
 
+    // ---- #52 — platform assistant handlers (same envelope discipline) ----
+
+    socket.on('assistant:session.open', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = assistantSessionOpenRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      void (async () => {
+        const result = await realtime.assistant.open(
+          socket.data.userId as string,
+          parsed.data.assistantId,
+          parsed.data.sessionId,
+          socket.id,
+        );
+        if (!result.ok) {
+          ack?.({ error: result.code });
+          return;
+        }
+        // #68 — the stop-choice UI needs this session's live dispatches.
+        realtime.assistantDispatch.pushFor(socket.data.userId as string, result.sessionId);
+        ack?.({ sessionId: result.sessionId, assistantName: result.assistantName });
+      })();
+    });
+
+    // A freshly MOUNTED rail asks for the current snapshot (the connect-time
+    // push predates SPA navigations — the socket survives them).
+    socket.on('assistant:sessions.sync', (_payload: unknown, ack?: (res: unknown) => void) => {
+      void realtime.assistant.snapshotFor(socket.data.userId as string).then((snap) => ack?.(snap));
+    });
+
+    // Re-push one session's open bundle (the open-ack/listener race).
+    socket.on('assistant:session.sync', (payload: unknown, ack?: (res: unknown) => void) => {
+      const sid =
+        typeof payload === 'object' && payload !== null && 'sessionId' in payload
+          ? String((payload as { sessionId: unknown }).sessionId)
+          : '';
+      if (sid === '') {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      void realtime.assistant.resync(socket.data.userId as string, sid, socket.id).then((ok) => {
+        if (ok) realtime.assistantDispatch.pushFor(socket.data.userId as string, sid);
+        ack?.(ok ? { synced: true } : { error: 'SESSION_NOT_FOUND' });
+      });
+    });
+
+    socket.on('assistant:message.send', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = assistantMessageSendRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      void (async () => {
+        const result = await realtime.assistant.onMessageSend(
+          socket.data.userId as string,
+          parsed.data.sessionId,
+          parsed.data.content,
+        );
+        ack?.(
+          result.ok
+            ? { accepted: true, ...(result.queued !== undefined ? { queued: result.queued } : {}) }
+            : { error: result.code },
+        );
+      })();
+    });
+
+    socket.on('assistant:permission.respond', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = chatPermissionRespondRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      const result = realtime.assistant.onPermissionRespond(
+        socket.data.userId as string,
+        parsed.data.sessionId,
+        parsed.data.requestId,
+        parsed.data.optionId,
+      );
+      ack?.(result.ok ? { accepted: true } : { error: result.code });
+    });
+
+    socket.on('assistant:turn.cancel', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = assistantTurnCancelRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      const result = realtime.assistant.onTurnCancel(
+        socket.data.userId as string,
+        parsed.data.sessionId,
+      );
+      ack?.(result.ok ? { accepted: true } : { error: result.code });
+    });
+
+    socket.on('assistant:queue.cancel', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = assistantQueueCancelRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      const result = realtime.assistant.onQueueCancel(
+        socket.data.userId as string,
+        parsed.data.sessionId,
+      );
+      ack?.(result.ok ? { accepted: true } : { error: result.code });
+    });
+
+    socket.on('assistant:config.set', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = assistantConfigSetRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      void (async () => {
+        const { sessionId, configId, value } = parsed.data;
+        const result = await realtime.assistant.onConfigSet(
+          socket.data.userId as string,
+          sessionId,
+          {
+            configId,
+            value,
+          },
+        );
+        ack?.(result.ok ? { accepted: true } : { error: result.code });
+      })();
+    });
+
+    socket.on('assistant:session.close', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = assistantSessionCloseRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      void (async () => {
+        const result = await realtime.assistant.close(
+          socket.data.userId as string,
+          parsed.data.sessionId,
+          parsed.data.reason ?? 'user',
+        );
+        ack?.(result.ok ? { closed: true } : { error: result.code });
+      })();
+    });
+
     // A viewer socket died (tab closed / full page refresh — SPA navigation
     // keeps the socket alive). Channels whose room is now EMPTY close so their
     // adapters die instead of piling up on the machine; a mid-turn channel
     // waits out the turn (ChatService.onViewerGone).
     socket.on('disconnect', () => {
       void realtime.chat.onViewerGone(socket.data.userId as string);
+      // #57 — assistant channels reap under the same user-scoped grace.
+      void realtime.assistant.onViewerGone(socket.data.userId as string);
     });
   });
 }

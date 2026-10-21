@@ -1,4 +1,8 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -339,7 +343,7 @@ describe('deriveSessionCaps (resume dialect per adapter family)', () => {
         loadSession: true,
         agentCapabilities: { sessionCapabilities: { load: {}, resume: {}, list: {} } },
       }),
-    ).toEqual({ load: true, resume: true, list: true });
+    ).toEqual({ load: true, resume: true, list: true, delete: false });
   });
 
   it('official @agentclientprotocol shape: loadSession NESTED in agentCapabilities, caps say resume but NOT load', () => {
@@ -349,21 +353,31 @@ describe('deriveSessionCaps (resume dialect per adapter family)', () => {
       deriveSessionCaps({
         agentCapabilities: {
           loadSession: true,
-          sessionCapabilities: { resume: {}, list: {}, close: {} },
+          sessionCapabilities: { resume: {}, list: {}, close: {}, delete: {} },
         },
       }),
-    ).toEqual({ load: true, resume: true, list: true });
+    ).toEqual({ load: true, resume: true, list: true, delete: true });
   });
 
   it('dsh shape: resume only — a native resume without replay', () => {
     expect(
       deriveSessionCaps({ agentCapabilities: { sessionCapabilities: { resume: {} } } }),
-    ).toEqual({ load: false, resume: true, list: false });
+    ).toEqual({ load: false, resume: true, list: false, delete: false });
   });
 
   it('no caps at all: nothing offered', () => {
-    expect(deriveSessionCaps({})).toEqual({ load: false, resume: false, list: false });
-    expect(deriveSessionCaps(undefined)).toEqual({ load: false, resume: false, list: false });
+    expect(deriveSessionCaps({})).toEqual({
+      load: false,
+      resume: false,
+      list: false,
+      delete: false,
+    });
+    expect(deriveSessionCaps(undefined)).toEqual({
+      load: false,
+      resume: false,
+      list: false,
+      delete: false,
+    });
   });
 });
 
@@ -469,7 +483,7 @@ describe('resolveAcpCommand', () => {
       resolveAcpCommand('claude-code', {}, { homeDir: mkdtempSync(join(tmpdir(), 'hnx-home-')) }),
     ).toEqual({
       command: 'npx',
-      args: ['-y', '@agentclientprotocol/claude-agent-acp@0.79.0'],
+      args: ['-y', '@agentclientprotocol/claude-agent-acp@0.93.0'],
       env: { CLAUDE_CODE_ENABLE_TODO_TOOLS: '1' },
     });
     // 9 W12 — opencode speaks ACP NATIVELY (`opencode acp`).
@@ -514,6 +528,91 @@ describe('session round-trip vs the fixture agent', () => {
       tick();
     });
   }
+
+  it('#70: a missing cwd refuses honestly; the create flag mkdir-paths it', async () => {
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      homeDir: LEDGER_HOME,
+    });
+
+    // No flag + a directory that does not exist: the honest refusal, NOT a
+    // spawn-ENOENT blaming the adapter binary.
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-70a',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp/hnx-70-definitely-missing/sub',
+    });
+    const refused = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(refused.error).toContain('does not exist');
+    expect(refused.error).toContain('/tmp/hnx-70-definitely-missing/sub');
+
+    // With the flag: the directory is created and the agent boots in it.
+    const made = `/tmp/hnx-70-created-${String(process.pid)}`;
+    rmSync(made, { recursive: true, force: true });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-70b',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: join(made, 'project'),
+      createDirectory: true,
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find(
+          (e) =>
+            e.event === 'chat:session.ready' &&
+            (e.payload as { sessionId?: string }).sessionId === 'sess-70b',
+        )?.payload as { agentName?: string; error?: string } | undefined,
+    );
+    expect(ready.error).toBeUndefined();
+    expect(existsSync(join(made, 'project'))).toBe(true);
+    socket.receive('chat:session.close', { sessionId: 'sess-70b', reason: 'test' });
+    await waitFor(() =>
+      socket.emitted.some(
+        (e) =>
+          e.event === 'chat:session.closed' &&
+          (e.payload as { sessionId?: string }).sessionId === 'sess-70b',
+      )
+        ? true
+        : undefined,
+    );
+    rmSync(made, { recursive: true, force: true });
+  }, 15000);
+
+  it('#70: the adapter spawn carries the daemon env base (PATH et al.)', async () => {
+    const socket = new FakeSocket();
+    // A var on the DAEMON's own process.env — pre-#70 the spawn env was ONLY
+    // cmd.env + spawnEnv, so this never reached the adapter (and a PATH-less
+    // `#!/usr/bin/env node` shim died as spawn-ENOENT).
+    process.env.FIXTURE_AGENT_NAME = 'env-base-probe';
+    try {
+      attachChatHandlers(socket as never, {
+        env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}` },
+        homeDir: LEDGER_HOME,
+      });
+      socket.receive('chat:session.start', {
+        sessionId: 'sess-70c',
+        agentInstanceId: 'ag-1',
+        target: 'hermes',
+        cwd: '/tmp',
+      });
+      const ready = await waitFor(
+        () =>
+          socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+            { agentName?: string; error?: string } | undefined,
+      );
+      expect(ready.error).toBeUndefined();
+      expect(ready.agentName).toBe('env-base-probe');
+    } finally {
+      delete process.env.FIXTURE_AGENT_NAME;
+    }
+  }, 15000);
 
   it('start → ready → prompt → echo turn → permission turn → close', async () => {
     const socket = new FakeSocket();
@@ -1857,12 +1956,12 @@ describe('dsh live streaming via transcript tail (9 W7)', () => {
     const sid = 'fx-tail-1';
     const dir = join(home, '.dsh', 'sessions', '--tail--', sid);
     mkdirSync(dir, { recursive: true });
-    const transcript = join(dir, 'session.jsonl.zstd');
+    const transcript = join(dir, 'session.v4.jsonl.zstd');
     const frame = (entries: unknown[]): Buffer =>
       Buffer.concat(entries.map((e) => zstd(Buffer.from(`${JSON.stringify(e)}\n`))));
     writeFileSync(
       transcript,
-      frame([{ type: 'session', cwd: '/tmp', createdAt: 1, delegationDepth: 0 }]),
+      frame([{ type: 'session', version: 4, cwd: '/tmp', createdAt: 1, delegationDepth: 0 }]),
     );
 
     const socket = new FakeSocket();
@@ -1891,16 +1990,22 @@ describe('dsh live streaming via transcript tail (9 W7)', () => {
     expect(ready.nativeSessionId).toBe(sid);
 
     // The turn is in flight (the fixture waits FIXTURE_DELAY_PROMPT_MS) —
-    // "dsh" appends token batches to the transcript DURING generation.
+    // "dsh" appends settlement batches to the transcript DURING generation
+    // (v4 rows carry the blocks; token deltas ride only the tap, which this
+    // test disables — the tail streams at commit granularity).
     setTimeout(() => {
       appendFileSync(
         transcript,
         frame([
           {
-            type: 'text-chunks',
-            seq0: 1,
-            time0: 1,
-            data: { turn: 1, step: 0, index: 0, dt: [1], texts: ['你好', '，'] },
+            type: 'assistant/message',
+            seq: 1,
+            time: 1,
+            data: {
+              turn: 1,
+              step: 0,
+              message: { content: [{ type: 'text', text: '你好，' }] },
+            },
           },
         ]),
       );
@@ -1910,12 +2015,16 @@ describe('dsh live streaming via transcript tail (9 W7)', () => {
         transcript,
         frame([
           {
-            type: 'text-chunks',
-            seq0: 3,
-            time0: 2,
-            data: { turn: 1, step: 0, index: 0, dt: [], texts: ['世界'] },
+            type: 'assistant/message',
+            seq: 2,
+            time: 2,
+            data: {
+              turn: 1,
+              step: 1,
+              message: { content: [{ type: 'text', text: '世界' }] },
+            },
           },
-          { type: 'turn/end', seq: 4, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+          { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
         ]),
       );
     }, 600);
@@ -2000,7 +2109,7 @@ describe('dsh live streaming via transcript tail (9 W7)', () => {
     const sid = 'fx-lazy-1';
     const dir = join(home, '.dsh', 'sessions', '--lazy--', sid);
     mkdirSync(dir, { recursive: true });
-    const transcript = join(dir, 'session.jsonl.zstd');
+    const transcript = join(dir, 'session.v4.jsonl.zstd');
     const frame = (entries: unknown[]): Buffer =>
       Buffer.concat(entries.map((e) => zstd(Buffer.from(`${JSON.stringify(e)}\n`))));
 
@@ -2038,12 +2147,16 @@ describe('dsh live streaming via transcript tail (9 W7)', () => {
       writeFileSync(
         transcript,
         frame([
-          { type: 'session', cwd: '/tmp', createdAt: 1, delegationDepth: 0 },
+          { type: 'session', version: 4, cwd: '/tmp', createdAt: 1, delegationDepth: 0 },
           {
-            type: 'text-chunks',
-            seq0: 1,
-            time0: 1,
-            data: { turn: 1, step: 0, index: 0, dt: [1], texts: ['早到的批次'] },
+            type: 'assistant/message',
+            seq: 1,
+            time: 1,
+            data: {
+              turn: 1,
+              step: 0,
+              message: { content: [{ type: 'text', text: '早到的批次' }] },
+            },
           },
         ]),
       );
@@ -2053,12 +2166,16 @@ describe('dsh live streaming via transcript tail (9 W7)', () => {
         transcript,
         frame([
           {
-            type: 'text-chunks',
-            seq0: 3,
-            time0: 2,
-            data: { turn: 1, step: 0, index: 0, dt: [], texts: ['后到的批次'] },
+            type: 'assistant/message',
+            seq: 2,
+            time: 2,
+            data: {
+              turn: 1,
+              step: 1,
+              message: { content: [{ type: 'text', text: '后到的批次' }] },
+            },
           },
-          { type: 'turn/end', seq: 4, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+          { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
         ]),
       );
     }, 900);
@@ -2209,6 +2326,116 @@ describe('dsh live streaming via the in-process event tap (9 W7.1)', () => {
     );
     const closeAck = vi.fn();
     socket.receive('chat:session.close', { sessionId: 'sess-nt2', reason: 'user' }, closeAck);
+    expect(closeAck).toHaveBeenCalledWith({ closed: true });
+  }, 20000);
+
+  it('prewarm NEVER publishes a tap-less deepseek adapter — the boot is killed and the next open spawns fresh (#47)', async () => {
+    const { mkdtempSync, writeFileSync, readFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const home = mkdtempSync(join(tmpdir(), 'hnx-dsh-pw-notap-'));
+    const exitFile = join(home, 'exits.txt');
+    writeFileSync(exitFile, '', 'utf8');
+
+    const socket = new FakeSocket();
+    const handle = attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_DEEPSEEK: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      // No FIXTURE_TAP_SPEAKER: the prewarmed boot gets the tap env but
+      // never dials. On v4 session logs a channel that adopted it would have
+      // NO streaming source at all (the tail settles, it does not stream) —
+      // the pool must drop the boot instead of caching it.
+      spawnEnv: { ...process.env, FIXTURE_SESSION_ID: 'fx-pw-notap', FIXTURE_EXIT_FILE: exitFile },
+      homeDir: home,
+    });
+
+    const ack = vi.fn();
+    socket.receive('chat:adapter.prewarm', { target: 'deepseek' }, ack);
+    expect(ack).toHaveBeenCalledWith({ accepted: true });
+
+    // The deliberate kill leaves its exit marker (boot + grace), and the
+    // pool published nothing.
+    await waitFor(
+      () => (readFileSync(exitFile, 'utf8').match(/^exit \d+$/m) ? true : undefined),
+      8000,
+    );
+    expect(handle.prewarmReady('deepseek')).toBe(false);
+
+    // The miss is recoverable: the next open spawns FRESH and works
+    // (committed-only here — the worst-case lane, never a dead adoption).
+    socket.receive('chat:session.start', {
+      sessionId: 'pw-nt3',
+      agentInstanceId: 'ag-1',
+      target: 'deepseek',
+      cwd: '/tmp',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toBeUndefined();
+    socket.receive('chat:message.send', {
+      sessionId: 'pw-nt3',
+      prompt: [{ type: 'text', text: 'hi recover' }],
+    });
+    await waitFor(() =>
+      socket.chatEvents().find((e) => e.kind === 'message_delta' && e.delta === 'echo: hi recover'),
+    );
+    const closeAck = vi.fn();
+    socket.receive('chat:session.close', { sessionId: 'pw-nt3', reason: 'user' }, closeAck);
+    expect(closeAck).toHaveBeenCalledWith({ closed: true });
+  }, 20000);
+
+  it('slow tap hello — past the retired arm-time window, inside start+grace — still wins the streaming lane (#47)', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const home = mkdtempSync(join(tmpdir(), 'hnx-dsh-slowtap-'));
+
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: {
+        HN_ACP_COMMAND_DEEPSEEK: `node ${FIXTURE}`,
+        PATH: process.env.PATH ?? '',
+        HN_TAP_HELLO_GRACE_MS: '6000',
+      },
+      // The plugin dials 4s after boot: a slow cold boot that the old
+      // fixed arm-time 3s window used to lose (the channel then streamed
+      // nothing for its whole life).
+      spawnEnv: {
+        ...process.env,
+        FIXTURE_SESSION_ID: 'fx-slowtap',
+        FIXTURE_TAP_SPEAKER: '1',
+        FIXTURE_TAP_DELAY_MS: '4000',
+      },
+      homeDir: home,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-slow',
+      agentInstanceId: 'ag-1',
+      target: 'deepseek',
+      cwd: '/tmp',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+      12000,
+    );
+    expect(ready.error).toBeUndefined();
+    socket.receive('chat:message.send', {
+      sessionId: 'sess-slow',
+      prompt: [{ type: 'text', text: 'slow tap' }],
+    });
+    // The frame deltas streamed via the late-but-live tap (under the old
+    // window this turn would render committed-only).
+    await waitFor(() =>
+      socket
+        .chatEvents()
+        .find((e) => e.kind === 'message_delta' && String(e.delta).includes('tap-流式-1')),
+    );
+    const closeAck = vi.fn();
+    socket.receive('chat:session.close', { sessionId: 'sess-slow', reason: 'user' }, closeAck);
     expect(closeAck).toHaveBeenCalledWith({ closed: true });
   }, 20000);
 
@@ -2371,6 +2598,101 @@ describe('session config (9 W9 A)', () => {
     });
   });
 
+  it('#49 — defaultMode from the start event is applied via set_mode before the config snapshot', async () => {
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      spawnEnv: { FIXTURE_SESSION_CONFIG: '1', FIXTURE_SESSION_ID: 'fx-defmode' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-dm',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+      defaultMode: 'auto',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toBeUndefined();
+    // The FIRST config snapshot already carries the applied mode (set_mode
+    // precedes the emit — no default→auto flicker on the wire).
+    const snapshot = await waitFor(() => {
+      const first = socket.chatEvents().find((e) => e.kind === 'session_config');
+      return first;
+    });
+    if (snapshot.kind !== 'session_config') throw new Error('unreachable');
+    expect(snapshot.modes?.currentModeId).toBe('auto');
+    const closeAck = vi.fn();
+    socket.receive('chat:session.close', { sessionId: 'sess-dm', reason: 'user' }, closeAck);
+    expect(closeAck).toHaveBeenCalledWith({ closed: true });
+  }, 15000);
+
+  it('#49 — defaultMode applies on RESUME too (the load path)', async () => {
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      spawnEnv: { FIXTURE_SESSION_CONFIG: '1', FIXTURE_SESSION_ID: 'fx-defmode-r' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-dm-r',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+      resume: { sessionId: 'fx-native-1', cwd: '/tmp' },
+      defaultMode: 'auto',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toBeUndefined();
+    const snapshot = await waitFor(() =>
+      socket.chatEvents().find((e) => e.kind === 'session_config'),
+    );
+    if (snapshot.kind !== 'session_config') throw new Error('unreachable');
+    expect(snapshot.modes?.currentModeId).toBe('auto');
+    const closeAck = vi.fn();
+    socket.receive('chat:session.close', { sessionId: 'sess-dm-r', reason: 'user' }, closeAck);
+    expect(closeAck).toHaveBeenCalledWith({ closed: true });
+  }, 15000);
+
+  it('#49 — a defaultMode the session does NOT advertise is an honest no-op', async () => {
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      spawnEnv: { FIXTURE_SESSION_CONFIG: '1', FIXTURE_SESSION_ID: 'fx-defmode2' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-dm2',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+      defaultMode: 'bypassPermissions',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toBeUndefined();
+    const snapshot = await waitFor(() =>
+      socket.chatEvents().find((e) => e.kind === 'session_config'),
+    );
+    if (snapshot.kind !== 'session_config') throw new Error('unreachable');
+    // Not in availableModes → the adapter-resolved mode stands.
+    expect(snapshot.modes?.currentModeId).toBe('default');
+    const closeAck = vi.fn();
+    socket.receive('chat:session.close', { sessionId: 'sess-dm2', reason: 'user' }, closeAck);
+    expect(closeAck).toHaveBeenCalledWith({ closed: true });
+  }, 15000);
+
   it('establishment snapshot → ready caps → config.set round-trip → pushes merge', async () => {
     const socket = new FakeSocket();
     attachChatHandlers(socket as never, {
@@ -2430,6 +2752,7 @@ describe('session config (9 W9 A)', () => {
       'default',
       'acceptEdits',
       'plan',
+      'auto',
     ]);
 
     // Option switch: the fixture's config_option_update REPLACES the option
@@ -2637,4 +2960,243 @@ describe('adapter report (9 W11 C)', () => {
     expect(ack).toHaveBeenCalledWith({ error: 'proto:invalid' });
     expect(socket.emitted.filter((e) => e.event === 'adapters:report:result')).toHaveLength(0);
   });
+});
+
+describe('ACP client version gate (#46)', () => {
+  function waitFor<T>(fn: () => T | undefined, ms = 5000): Promise<T> {
+    const started = Date.now();
+    return new Promise((resolve, reject) => {
+      const tick = (): void => {
+        const v = fn();
+        if (v !== undefined) return resolve(v);
+        if (Date.now() - started > ms) return reject(new Error('waitFor: timeout'));
+        setTimeout(tick, 20);
+      };
+      tick();
+    });
+  }
+
+  const REFUSED = {
+    ok: false as const,
+    version: '0.1.2-rc.1',
+    min: '0.2.0-rc.2',
+    message:
+      'dsh 0.1.2-rc.1 is not supported (minimum 0.2.0-rc.2) — upgrade with: npm install -g @deepseek-ai/dsh@latest',
+  };
+
+  it('an out-of-range client is refused at open AND never pre-warmed', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const home = mkdtempSync(join(tmpdir(), 'hnx-dsh-gate-'));
+    // No HN_ACP_COMMAND_DEEPSEEK: the gate owns this spawn decision.
+    const versionGate = vi.fn(async () => REFUSED);
+
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { PATH: process.env.PATH ?? '' },
+      versionGate,
+      homeDir: home,
+    });
+
+    // The prewarm pool refuses to warm an out-of-range client (silent — the
+    // pool is a cache), and no adapter process may have been ledgered.
+    const pAck = vi.fn();
+    socket.receive('chat:adapter.prewarm', { target: 'deepseek' }, pAck);
+    expect(pAck).toHaveBeenCalledWith({ accepted: true });
+    await waitFor(() => (versionGate.mock.calls.length >= 1 ? true : undefined));
+    expect(readAdapterLedger(home)).toHaveLength(0);
+
+    // The open is refused with the actionable upgrade hint — BEFORE any spawn.
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-gate',
+      agentInstanceId: 'ag-1',
+      target: 'deepseek',
+      cwd: '/tmp',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toBe(REFUSED.message);
+    expect(readAdapterLedger(home)).toHaveLength(0);
+    expect(versionGate).toHaveBeenCalledWith('deepseek', expect.anything());
+  }, 10000);
+
+  it('the default gate refuses a real (fake) out-of-range `dsh` on PATH', async () => {
+    // No injected gate and no HN_ACP_COMMAND_DEEPSEEK override: the DEFAULT
+    // check runs `<dsh> --version` against the env's PATH — a fake old dsh
+    // must be refused with the upgrade hint and no spawn.
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const home = mkdtempSync(join(tmpdir(), 'hnx-dsh-gate2-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'hnx-dsh-bin-'));
+    writeFileSync(join(binDir, 'dsh'), '#!/bin/sh\necho 0.1.2-rc.1\n', { mode: 0o755 });
+
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { PATH: binDir }, // process.env.PATH deliberately EXCLUDED
+      homeDir: home,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-gate2',
+      agentInstanceId: 'ag-1',
+      target: 'deepseek',
+      cwd: '/tmp',
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toContain('dsh 0.1.2-rc.1 is not supported');
+    expect(ready.error).toContain('@deepseek-ai/dsh@latest');
+    expect(readAdapterLedger(home)).toHaveLength(0);
+  }, 10000);
+});
+
+describe('native sub-agent sessions (#71)', () => {
+  function waitFor<T>(fn: () => T | undefined, ms = 5000): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const tick = (): void => {
+        const v = fn();
+        if (v !== undefined) return resolve(v);
+        if (Date.now() - started > ms) return reject(new Error('waitFor: timeout'));
+        setTimeout(tick, 20);
+      };
+      tick();
+    });
+  }
+
+  it('initialize advertises the subagents capability', async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const initFile = join(mkdtempSync(join(tmpdir(), 'hnx-init-')), 'init.jsonl');
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      spawnEnv: { FIXTURE_INIT_FILE: initFile },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-sub-cap',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+    });
+    await waitFor(() => socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload);
+    const params = JSON.parse(readFileSync(initFile, 'utf8')) as {
+      clientCapabilities?: { subagents?: unknown; elicitation?: unknown };
+    };
+    expect(params.clientCapabilities?.subagents).toEqual({});
+    expect(params.clientCapabilities?.elicitation).toEqual({ form: {} });
+    rmSync(initFile, { recursive: true, force: true });
+  }, 10000);
+
+  it('live: child frames wrap into subagent_* events and never leak into the root stream', async () => {
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-sub-1',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+    });
+    await waitFor(() => socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload);
+
+    socket.receive('chat:message.send', {
+      sessionId: 'sess-sub-1',
+      prompt: [{ type: 'text', text: 'please run-subagent now' }],
+    });
+    await waitFor(() => socket.chatEvents().find((e) => e.kind === 'subagent_done'));
+
+    const events = socket.chatEvents();
+    const spawned = events.find((e) => e.kind === 'subagent_spawned') as
+      { subagentId: string; name: string; task: string } | undefined;
+    expect(spawned).toEqual({
+      kind: 'subagent_spawned',
+      subagentId: 'fx-sub-1',
+      name: 'fixture-worker',
+      task: 'Write the fixture greeting',
+    });
+    // The child's incoming prompt (session_message → raw), text and tool call
+    // arrive WRAPPED — the root stream only keeps the parent's own frames
+    // (the Agent launch tool call included: the RFD form keeps it ordinary).
+    const updates = events.filter((e) => e.kind === 'subagent_update') as {
+      subagentId: string;
+      event: ChatStreamEvent;
+    }[];
+    expect(updates.map((u) => u.event.kind)).toEqual(['raw', 'message_delta', 'tool_call']);
+    expect(updates.every((u) => u.subagentId === 'fx-sub-1')).toBe(true);
+    const childTool = updates[2]!.event as { call: { toolName?: string } };
+    expect(childTool.call.toolName).toBe('Write');
+    // Child usage never wraps (root-session concern).
+    expect(updates.some((u) => u.event.kind === 'usage')).toBe(false);
+    // Nothing leaked: no root-level delta/tool row from the child, and the
+    // parent's own text is intact.
+    const rootDeltas = events.filter((e) => e.kind === 'message_delta') as { delta: string }[];
+    expect(rootDeltas.map((d) => d.delta).join('')).toContain('echo: subagent finished');
+    expect(rootDeltas.some((d) => d.delta.includes('child step one'))).toBe(false);
+    expect(
+      events.some(
+        (e) =>
+          e.kind === 'tool_call' &&
+          (e as { call: { toolCallId: string } }).call.toolCallId === 'fx-sub-write-1',
+      ),
+    ).toBe(false);
+    const done = events.find((e) => e.kind === 'subagent_done') as { state: string };
+    expect(done.state).toBe('completed');
+  }, 15000);
+
+  it('resume: the session/load replay routes the child the same way (capture path)', async () => {
+    const socket = new FakeSocket();
+    attachChatHandlers(socket as never, {
+      env: { HN_ACP_COMMAND_HERMES: `node ${FIXTURE}`, PATH: process.env.PATH ?? '' },
+      homeDir: LEDGER_HOME,
+    });
+    socket.receive('chat:session.start', {
+      sessionId: 'sess-sub-2',
+      agentInstanceId: 'ag-1',
+      target: 'hermes',
+      cwd: '/tmp',
+      resume: { sessionId: 'fx-native-sub', cwd: '/tmp' },
+    });
+    const ready = await waitFor(
+      () =>
+        socket.emitted.find((e) => e.event === 'chat:session.ready')?.payload as
+          { error?: string } | undefined,
+    );
+    expect(ready.error).toBeUndefined();
+
+    const history = socket.eventsOf('chat:history')[0]!.payload as {
+      items: { type: string; event?: ChatStreamEvent }[];
+    };
+    const kinds = history.items.map((i) =>
+      i.type === 'user' ? 'user' : (i.event!.kind as string),
+    );
+    expect(kinds).toEqual([
+      'user',
+      'tool_call',
+      'subagent_spawned',
+      'subagent_update',
+      'subagent_update',
+      'subagent_update',
+      'subagent_done',
+      'tool_call',
+      'turn_result',
+    ]);
+    const updates = history.items.filter((i) => i.event?.kind === 'subagent_update');
+    expect(updates.map((u) => (u.event as { event: ChatStreamEvent }).event.kind)).toEqual([
+      'raw',
+      'message_delta',
+      'tool_call',
+    ]);
+  }, 15000);
 });

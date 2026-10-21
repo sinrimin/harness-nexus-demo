@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * @harness-nexus/sdk — thin HTTP client for the Harness Nexus REST API.
  *
@@ -21,6 +25,7 @@ import type {
   SkillBundle,
   Machine,
   ChatPrewarmSettings,
+  ChatDefaultModeSettings,
 } from '@harness-nexus/core';
 import type {
   JobView,
@@ -36,11 +41,27 @@ import type {
   RuntimeTarget,
   HarnessAction,
   RuntimeConfigSpec,
+  ClaudeCodeConfig,
+  ClaudeCodeTier,
+  OpencodeConfig,
+  OpencodeModelDetail,
+  CodexConfig,
+  DeepseekConfig,
+  DeepseekModelDetail,
+  PiConfig,
+  PiModelDetail,
   RuntimeConfigView,
   LlmProviderView,
   LlmModelInfo,
   ProviderApiKind,
+  ProviderModelConfig,
+  ProviderModelConfigInput,
+  ProviderModelConfigWarning,
+  ProviderModelConfigWarningCode,
   ProviderModelsQueryInput,
+  AssistantConfigView,
+  AssistantSessionView,
+  AssistantToolGroup,
 } from '@harness-nexus/shared';
 export {
   SCANNABLE_TARGETS,
@@ -48,7 +69,19 @@ export {
   PROVIDER_API_SUPPORT,
   PREWARM_ADAPTER_TARGETS,
   DEFAULT_CHAT_PREWARM_SETTINGS,
+  DEFAULT_ASSISTANT_SYSTEM_PROMPT,
   providerApiToSpecApi,
+  providerModelConfigWarnings,
+  CLAUDE_CODE_TIERS,
+  CODEX_REASONING_EFFORTS,
+  CODEX_REASONING_SUMMARIES,
+  CODEX_VERBOSITIES,
+  hasClaudeOneMarker,
+  stripClaudeOneMarker,
+  setClaudeOneMarker,
+  SERVER_TOOL_PRESETS,
+  EXTRA_BODY_PRESETS,
+  EXTRA_BODY_BOOLEAN_KEYS,
   jobViewSchema,
   HOOK_EVENTS,
   HOOK_SUPPORT,
@@ -62,6 +95,7 @@ export {
 } from '@harness-nexus/shared';
 export type {
   ChatPrewarmSettings,
+  ChatDefaultModeSettings,
   JobView,
   InventorySnapshot,
   InventoryDiff,
@@ -69,10 +103,26 @@ export type {
   RuntimeTarget,
   HarnessAction,
   RuntimeConfigSpec,
+  ClaudeCodeConfig,
+  ClaudeCodeTier,
+  OpencodeConfig,
+  OpencodeModelDetail,
+  CodexConfig,
+  DeepseekConfig,
+  DeepseekModelDetail,
+  PiConfig,
+  PiModelDetail,
   RuntimeConfigView,
   LlmProviderView,
   LlmModelInfo,
   ProviderApiKind,
+  ProviderModelConfig,
+  ProviderModelConfigInput,
+  ProviderModelConfigWarning,
+  ProviderModelConfigWarningCode,
+  AssistantConfigView,
+  AssistantSessionView,
+  AssistantToolGroup,
   MarketplaceCatalog,
   MarketplacePlugin,
   MarketplaceSource,
@@ -406,6 +456,8 @@ export class HarnessNexusClient {
       baseWorkspace?: string | null;
       /** Issue #3 — machine-scoped per-target pre-warm switches (replace semantics). */
       chatPrewarm?: ChatPrewarmSettings;
+      /** Issue #49 — machine-scoped default chat permission modes (replace). */
+      chatDefaultMode?: ChatDefaultModeSettings;
     },
   ): Promise<MachineView> {
     const res = await this.request('PATCH', `/api/machines/${id}`, input);
@@ -559,6 +611,18 @@ export class HarnessNexusClient {
     return this.request('GET', `/api/agent-instances/${agentInstanceId}/sessions${qs}`);
   }
 
+  /**
+   * #55 — delete one of the agent's NATIVE sessions (the target's own
+   * store, via the daemon). 409 `NATIVE_SESSION_LIVE` when a live channel
+   * holds it, 409 `DAEMON_NO_SESSIONS_DELETE` on a pre-#55 daemon.
+   */
+  async deleteAgentSession(agentInstanceId: string, nativeSessionId: string): Promise<void> {
+    await this.request(
+      'DELETE',
+      `/api/agent-instances/${agentInstanceId}/sessions/${encodeURIComponent(nativeSessionId)}`,
+    );
+  }
+
   /** The resolved profile bundle a deploy fetches (machine PAT exception #2). */
   async getDeployBundle(profileId: string): Promise<{ profile: Profile; artifacts: unknown[] }> {
     return this.request(
@@ -624,6 +688,8 @@ export class HarnessNexusClient {
     baseUrl?: string;
     credentialName: string;
     scope?: 'global' | 'personal';
+    /** #51 — the configured model registry (full replace; omit = empty). */
+    models?: ProviderModelConfigInput[];
   }): Promise<{ provider: LlmProviderView }> {
     return this.request('POST', '/api/llm-providers', input);
   }
@@ -636,6 +702,8 @@ export class HarnessNexusClient {
       /** `null` clears the override back to the official endpoint. */
       baseUrl?: string | null;
       credentialName?: string;
+      /** #51 — full replace of the configured model registry. */
+      models?: ProviderModelConfigInput[];
     },
   ): Promise<{ provider: LlmProviderView }> {
     return this.request('PATCH', `/api/llm-providers/${id}`, input);
@@ -643,6 +711,90 @@ export class HarnessNexusClient {
 
   async deleteLlmProvider(id: string): Promise<void> {
     await this.request('DELETE', `/api/llm-providers/${id}`);
+  }
+
+  // ---- platform assistant (#52 — configs, sessions, transcript) ----
+  async listAssistants(): Promise<AssistantConfigView[]> {
+    const res = await this.request('GET', '/api/assistants');
+    return res.assistants;
+  }
+
+  async createAssistant(input: {
+    name: string;
+    description?: string;
+    providerId: string;
+    defaultModel: string;
+    systemPromptOverride?: string;
+    enabledToolGroups?: AssistantToolGroup[];
+    /** M2 — full replace; visibility validated server-side. */
+    mcpServerIds?: string[];
+    skillResourceIds?: string[];
+    /** M3 — null/unset = unlimited. */
+    dailyTokenBudget?: number | null;
+  }): Promise<{ assistant: AssistantConfigView }> {
+    return this.request('POST', '/api/assistants', input);
+  }
+
+  async getAssistant(id: string): Promise<{ assistant: AssistantConfigView }> {
+    return this.request('GET', `/api/assistants/${id}`);
+  }
+
+  async updateAssistant(
+    id: string,
+    input: {
+      name?: string;
+      description?: string | null;
+      providerId?: string;
+      defaultModel?: string;
+      systemPromptOverride?: string | null;
+      enabledToolGroups?: AssistantToolGroup[];
+      mcpServerIds?: string[];
+      skillResourceIds?: string[];
+      /** M3 — `null` clears back to unlimited. */
+      dailyTokenBudget?: number | null;
+    },
+  ): Promise<{ assistant: AssistantConfigView }> {
+    return this.request('PATCH', `/api/assistants/${id}`, input);
+  }
+
+  /** Soft-delete: pickers drop it, its sessions stay readable. */
+  async deleteAssistant(id: string): Promise<void> {
+    await this.request('DELETE', `/api/assistants/${id}`);
+  }
+
+  async listAssistantSessions(assistantId?: string): Promise<AssistantSessionView[]> {
+    const res = await this.request(
+      'GET',
+      assistantId === undefined
+        ? '/api/assistant-sessions'
+        : `/api/assistants/${assistantId}/sessions`,
+    );
+    return res.sessions;
+  }
+
+  async createAssistantSession(assistantId: string): Promise<{ session: AssistantSessionView }> {
+    return this.request('POST', `/api/assistants/${assistantId}/sessions`);
+  }
+
+  async getAssistantSession(
+    id: string,
+  ): Promise<{ session: AssistantSessionView; assistant: AssistantConfigView }> {
+    return this.request('GET', `/api/assistant-sessions/${id}`);
+  }
+
+  async renameAssistantSession(
+    id: string,
+    title: string,
+  ): Promise<{ session: AssistantSessionView }> {
+    return this.request('PATCH', `/api/assistant-sessions/${id}`, { title });
+  }
+
+  async deleteAssistantSession(id: string): Promise<void> {
+    await this.request('DELETE', `/api/assistant-sessions/${id}`);
+  }
+
+  async listAssistantSessionMessages(id: string): Promise<{ messages: unknown[] }> {
+    return this.request('GET', `/api/assistant-sessions/${id}/messages`);
   }
 
   /** 获取模型 — discover the endpoint's model list (server-side fetch). */
@@ -660,6 +812,15 @@ export class HarnessNexusClient {
 
   async setRegistration(allowRegistration: boolean): Promise<{ allowRegistration: boolean }> {
     return this.request('PUT', '/api/settings/registration', { allowRegistration });
+  }
+
+  /** #59 — the assistant image retention window (days). Admin-only endpoint. */
+  async getImageRetention(): Promise<{ imageRetentionDays: number }> {
+    return this.request('GET', '/api/settings/image-retention');
+  }
+
+  async setImageRetention(imageRetentionDays: number): Promise<{ imageRetentionDays: number }> {
+    return this.request('PUT', '/api/settings/image-retention', { imageRetentionDays });
   }
 
   // ---- credentials ----

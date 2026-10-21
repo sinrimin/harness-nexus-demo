@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import { describe, expect, it } from 'vitest';
 import {
   llmProviderCreateSchema,
@@ -8,7 +12,12 @@ import {
   providerModelsQuerySchema,
   providerModelsUrls,
   providerModelsResultSchema,
+  providerModelsSchema,
+  providerModelConfigWarnings,
   PROVIDER_DEFAULT_BASE_URLS,
+  EXTRA_BODY_BOOLEAN_KEYS,
+  EXTRA_BODY_PRESETS,
+  SERVER_TOOL_PRESETS,
   runtimeConfigSpecSchema,
 } from '../src/index.js';
 
@@ -128,5 +137,89 @@ describe('runtimeConfigSpecSchema — W10 additions', () => {
   it('caps the discovered model list result', () => {
     expect(providerModelsResultSchema.safeParse({ models: [] }).success).toBe(true);
     expect(providerModelsResultSchema.safeParse({ models: [{ id: '' }] }).success).toBe(false);
+  });
+});
+
+describe('providerModelsSchema — #51 model registry', () => {
+  const model = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: 'gw-large',
+    ...over,
+  });
+
+  it('defaults type to chat and rejects duplicate ids', () => {
+    const one = providerModelsSchema.parse([model()]);
+    expect(one[0]!.type).toBe('chat');
+    expect(one[0]!.type).not.toBe('embedding');
+
+    const dup = providerModelsSchema.safeParse([model(), model({ id: 'gw-large' })]);
+    expect(dup.success).toBe(false);
+  });
+
+  it('accepts the embedding reservation and the advanced fields', () => {
+    expect(
+      providerModelsSchema.safeParse([
+        model({ type: 'embedding' }),
+        model({
+          id: 'gw-r',
+          temperature: 0.2,
+          topP: 0.9,
+          serverTools: ['web_search'],
+          extraBody: { reasoning: { effort: 'high' } },
+        }),
+      ]).success,
+    ).toBe(true);
+  });
+
+  it('bounds the numeric fields', () => {
+    expect(providerModelsSchema.safeParse([model({ contextWindow: 0 })]).success).toBe(false);
+    expect(providerModelsSchema.safeParse([model({ temperature: 3 })]).success).toBe(false);
+    expect(providerModelsSchema.safeParse([model({ topP: 1.5 })]).success).toBe(false);
+  });
+});
+
+describe('providerModelConfigWarnings — warn, never reject (#51)', () => {
+  it('flags serverTools only on openai-chat; extraBody on anthropic (#56)', () => {
+    expect(
+      providerModelConfigWarnings('openai-chat', [
+        { id: 'm1', type: 'chat', serverTools: ['enable_search'] },
+      ]),
+    ).toEqual([{ code: 'serverToolsIrrelevant', modelId: 'm1' }]);
+    expect(
+      providerModelConfigWarnings('anthropic', [{ id: 'm2', type: 'chat', extraBody: { x: 1 } }]),
+    ).toEqual([{ code: 'extraBodyIrrelevant', modelId: 'm2' }]);
+  });
+
+  it('stays silent when serverTools ride a wire that supports them (#56)', () => {
+    expect(
+      providerModelConfigWarnings('openai-responses', [
+        { id: 'm1', type: 'chat', serverTools: ['web_search'] },
+      ]),
+    ).toEqual([]);
+    // #56 — the anthropic wire now carries serverTools too (dated types).
+    expect(
+      providerModelConfigWarnings('anthropic', [
+        { id: 'm2', type: 'chat', serverTools: ['web_search_20250305'] },
+      ]),
+    ).toEqual([]);
+    expect(providerModelConfigWarnings('anthropic', [{ id: 'm3', type: 'chat' }])).toEqual([]);
+  });
+});
+
+describe('#56 preset tables — Bailian-baselined, open lists', () => {
+  it('SERVER_TOOL_PRESETS: dated value on anthropic, none on openai-chat', () => {
+    expect(SERVER_TOOL_PRESETS.anthropic).toContain('web_search_20250305');
+    expect(SERVER_TOOL_PRESETS['openai-responses']).toContain('web_search');
+    expect(SERVER_TOOL_PRESETS['openai-chat']).toEqual([]);
+  });
+
+  it('EXTRA_BODY_PRESETS: openai-chat carries the Bailian search keys', () => {
+    expect(EXTRA_BODY_PRESETS['openai-chat']).toContain('enable_search');
+    expect(EXTRA_BODY_PRESETS['openai-chat']).toContain('search_options');
+    expect(EXTRA_BODY_PRESETS.anthropic).toEqual([]);
+    // Boolean keys are a subset of the union of presets (value-editor shape).
+    for (const k of EXTRA_BODY_BOOLEAN_KEYS) {
+      const known = Object.values(EXTRA_BODY_PRESETS).some((keys) => keys.includes(k));
+      expect(known, k).toBe(true);
+    }
   });
 });

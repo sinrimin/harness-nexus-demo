@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
@@ -32,6 +36,7 @@ import { workspaceRoutes } from './modules/workspace.js';
 import { clientConfigRoutes } from './modules/client-config.js';
 import { mountMcpProxy } from './mcp/proxy.js';
 import { marketplaceRoutes } from './modules/marketplace.js';
+import { assistantRoutes } from './modules/assistant.js';
 import { MarketplaceEmitter } from './marketplace/emitter.js';
 import { SkillCatalogService } from './infra/source-fetchers/catalog-service.js';
 import { parseAllowlist, type MarketplaceEntry } from './infra/source-fetchers/allowlist.js';
@@ -119,6 +124,23 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
   // W10 — budget for provider model-list discovery (outbound surface #2).
   app.decorate('providerModelsTimeoutMs', config.providerModelsTimeoutMs);
 
+  // #59 — expired image blobs are reclaimed at boot and every 12h after.
+  // Reads already degrade expired refs to placeholders, so the sweep is
+  // pure reclamation, never a correctness gate. Unref'd timer: a shutdown
+  // must not wait on it.
+  const sweepImageBlobs = async (): Promise<void> => {
+    try {
+      const purged = await uow.fileBlobs.purgeExpired(new Date().toISOString());
+      if (purged > 0) app.log.info({ purged }, 'expired image blobs purged');
+    } catch (err) {
+      app.log.warn({ err }, 'image blob sweep failed (will retry on schedule)');
+    }
+  };
+  void sweepImageBlobs();
+  const sweepTimer = setInterval(() => void sweepImageBlobs(), 12 * 60 * 60 * 1000);
+  sweepTimer.unref();
+  app.addHook('onClose', async () => clearInterval(sweepTimer));
+
   // Phase 7.2 — marketplace catalog service + its allowlist. The only
   // outbound-fetch surface in the server. `createMarketplaceFetcher` returns a
   // fixture reader when `MARKETPLACE_FIXTURE_PATH` is set (test mode).
@@ -203,6 +225,7 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
     chatReadyTimeoutMs: config.chatReadyTimeoutMs,
     chatReconnectGraceMs: config.chatReconnectGraceMs,
     chatIdleTtlMs: config.chatIdleTtlMs,
+    chatViewerGraceMs: config.chatViewerGraceMs,
   });
   app.realtime.jobs.start();
   app.addHook('onClose', async () => {
@@ -263,6 +286,7 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
     await workspaceRoutes(api);
     await clientConfigRoutes(api);
     await marketplaceRoutes(api);
+    await assistantRoutes(api);
   });
 
   await mountMcpProxy(app);

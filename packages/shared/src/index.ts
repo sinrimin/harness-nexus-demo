@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 sinrimin
+//
+// SPDX-License-Identifier: MIT
+
 export * from './schemas/profile.js';
 export * from './schemas/auth.js';
 export * from './schemas/mcp.js';
@@ -7,6 +11,8 @@ export * from './schemas/machine.js';
 export * from './schemas/inventory.js';
 export * from './schemas/runtime-config.js';
 export * from './schemas/llm-provider.js';
+export * from './schemas/assistant.js';
+export * from './schemas/settings.js';
 export * from './hooks.js';
 export * from './trust.js';
 export * from './realtime.js';
@@ -17,3 +23,4 @@ export * from './diff-inventory.js';
 export * from './utils/errors.js';
 export * from './utils/placeholders.js';
 export * from './utils/safe-path.js';
+export * from './assistant-prompt.js';
