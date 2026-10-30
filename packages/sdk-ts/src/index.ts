@@ -26,6 +26,12 @@ import type {
   Machine,
   ChatPrewarmSettings,
   ChatDefaultModeSettings,
+  ChatApprovalsSettings,
+  Note,
+  NoteAnnotation,
+  NoteCategory,
+  NoteStatus,
+  NoteVisibility,
 } from '@harness-nexus/core';
 import type {
   JobView,
@@ -52,16 +58,34 @@ import type {
   PiModelDetail,
   RuntimeConfigView,
   LlmProviderView,
+  DecisionRecordView,
   LlmModelInfo,
+  ProviderApiEndpoint,
+  ProviderApiEndpointInput,
   ProviderApiKind,
   ProviderModelConfig,
   ProviderModelConfigInput,
   ProviderModelConfigWarning,
   ProviderModelConfigWarningCode,
   ProviderModelsQueryInput,
+  UserDefaultModels,
+  UserDefaultModelsInput,
+  ModelCapabilitiesView,
+  ModelCapabilitySlot,
   AssistantConfigView,
   AssistantSessionView,
   AssistantToolGroup,
+  ApiToolServiceView,
+  ApiToolServiceBundle,
+  ApiToolDefInput,
+  CreateNoteInput,
+  UpdateNoteInput,
+  ListNotesQuery,
+  ListSquareQuery,
+  CreateAnnotationInput,
+  UpdateAnnotationInput,
+  CreateCategoryInput,
+  UpdateCategoryInput,
 } from '@harness-nexus/shared';
 export {
   SCANNABLE_TARGETS,
@@ -72,6 +96,10 @@ export {
   DEFAULT_ASSISTANT_SYSTEM_PROMPT,
   providerApiToSpecApi,
   providerModelConfigWarnings,
+  isChatApiKind,
+  providerEndpointUrl,
+  PROVIDER_DEFAULT_PATHS,
+  PROVIDER_DEFAULT_BASE_URLS,
   CLAUDE_CODE_TIERS,
   CODEX_REASONING_EFFORTS,
   CODEX_REASONING_SUMMARIES,
@@ -94,8 +122,13 @@ export {
   type HookEvent,
 } from '@harness-nexus/shared';
 export type {
+  ApiToolServiceView,
+  ApiToolServiceBundle,
+  ApiToolDefInput,
+  DecisionRecordView,
   ChatPrewarmSettings,
   ChatDefaultModeSettings,
+  ChatApprovalsSettings,
   JobView,
   InventorySnapshot,
   InventoryDiff,
@@ -115,11 +148,17 @@ export type {
   RuntimeConfigView,
   LlmProviderView,
   LlmModelInfo,
+  ProviderApiEndpoint,
+  ProviderApiEndpointInput,
   ProviderApiKind,
   ProviderModelConfig,
   ProviderModelConfigInput,
   ProviderModelConfigWarning,
   ProviderModelConfigWarningCode,
+  UserDefaultModels,
+  UserDefaultModelsInput,
+  ModelCapabilitiesView,
+  ModelCapabilitySlot,
   AssistantConfigView,
   AssistantSessionView,
   AssistantToolGroup,
@@ -267,6 +306,30 @@ export interface CredentialView {
   createdAt: string;
   updatedAt: string;
 }
+
+// ---- notes (#88) ----
+
+/** A square card carries its author's name (enriched server-side). */
+export interface SquareNoteView extends Note {
+  ownerName: string;
+}
+
+/** A feed/board card carries its annotation counts (owner-only figures). */
+export interface FeedNoteView extends Note {
+  annotationCount: number;
+  openAnnotationCount: number;
+}
+
+export type {
+  CreateNoteInput,
+  UpdateNoteInput,
+  ListNotesQuery,
+  ListSquareQuery,
+  CreateAnnotationInput,
+  UpdateAnnotationInput,
+  CreateCategoryInput,
+  UpdateCategoryInput,
+};
 // McpServer is re-exported directly from core (it carries no secret fields).
 // McpTransport likewise, so callers can build typed transport objects.
 // Profile is re-exported from core too (its entries reference McpServer ids).
@@ -458,6 +521,8 @@ export class HarnessNexusClient {
       chatPrewarm?: ChatPrewarmSettings;
       /** Issue #49 — machine-scoped default chat permission modes (replace). */
       chatDefaultMode?: ChatDefaultModeSettings;
+      /** Issue #92 — machine-scoped delegated-approvals config (replace). */
+      chatApprovals?: ChatApprovalsSettings;
     },
   ): Promise<MachineView> {
     const res = await this.request('PATCH', `/api/machines/${id}`, input);
@@ -684,7 +749,8 @@ export class HarnessNexusClient {
 
   async createLlmProvider(input: {
     name: string;
-    api: ProviderApiKind;
+    /** #95 — the enabled wires (>=1, kinds unique). */
+    apis: ProviderApiEndpointInput[];
     baseUrl?: string;
     credentialName: string;
     scope?: 'global' | 'personal';
@@ -698,7 +764,8 @@ export class HarnessNexusClient {
     id: string,
     input: {
       name?: string;
-      api?: ProviderApiKind;
+      /** #95 — full replace of the enabled wires. */
+      apis?: ProviderApiEndpointInput[];
       /** `null` clears the override back to the official endpoint. */
       baseUrl?: string | null;
       credentialName?: string;
@@ -707,6 +774,30 @@ export class HarnessNexusClient {
     },
   ): Promise<{ provider: LlmProviderView }> {
     return this.request('PATCH', `/api/llm-providers/${id}`, input);
+  }
+
+  /** #95 — the caller's default model slots (embedding/rerank reserved). */
+  async getUserDefaultModels(): Promise<UserDefaultModels> {
+    const res = await this.request('GET', '/api/users/me/default-models');
+    return res.defaultModels;
+  }
+
+  /** #95 — full replace; an empty object clears every slot. */
+  async setUserDefaultModels(input: UserDefaultModelsInput): Promise<UserDefaultModels> {
+    const res = await this.request('PATCH', '/api/users/me/default-models', input);
+    return res.defaultModels;
+  }
+
+  /** #100 — the derived per-slot capability view (config re-validated + breaker health). */
+  async getModelCapabilities(): Promise<ModelCapabilitiesView> {
+    const res = await this.request('GET', '/api/users/me/default-models');
+    return res.capabilities;
+  }
+
+  /** #100 — clear a slot's breaker; the next real use is the probe. Returns the refreshed view. */
+  async retryModelCapability(slot: ModelCapabilitySlot): Promise<ModelCapabilitiesView> {
+    const res = await this.request('POST', `/api/users/me/default-models/${slot}/retry`, {});
+    return res.capabilities;
   }
 
   async deleteLlmProvider(id: string): Promise<void> {
@@ -803,6 +894,185 @@ export class HarnessNexusClient {
   ): Promise<LlmModelInfo[]> {
     const res = await this.request('POST', '/api/llm-providers/query-models', query);
     return res.models;
+  }
+
+  // ---- API tools (#80) ----
+
+  async listApiToolServices(): Promise<{ services: ApiToolServiceView[] }> {
+    return this.request('GET', '/api/api-tools');
+  }
+
+  async getApiToolService(id: string): Promise<{ service: ApiToolServiceView }> {
+    return this.request('GET', `/api/api-tools/${id}`);
+  }
+
+  async createApiToolService(
+    bundle: unknown,
+    scope?: 'global' | 'personal',
+  ): Promise<{ service: ApiToolServiceView }> {
+    return this.request('POST', '/api/api-tools', {
+      bundle,
+      ...(scope !== undefined ? { scope } : {}),
+    });
+  }
+
+  async updateApiToolService(
+    id: string,
+    bundle: unknown,
+  ): Promise<{ service: ApiToolServiceView }> {
+    return this.request('PUT', `/api/api-tools/${id}`, { bundle });
+  }
+
+  /** #80 — run one tool call against the real target (the probe panel). */
+  async probeApiToolService(
+    id: string,
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<{
+    result: { output: string; isError: boolean };
+    debug?: { method: string; url: string; status: number; contentType: string };
+  }> {
+    return this.request('POST', `/api/api-tools/${id}/probe`, { tool, args });
+  }
+
+  /** #85 — the outbound policy: default action + external/internal rule lists. */
+  async getApiToolOutbound(): Promise<{
+    mode: 'allow' | 'deny';
+    rules: { external: string[]; internal: string[] };
+  }> {
+    return this.request('GET', '/api/settings/api-tool-outbound');
+  }
+
+  async setApiToolOutbound(
+    mode: 'allow' | 'deny',
+    rules: { external: string[]; internal: string[] },
+  ): Promise<{ mode: 'allow' | 'deny'; rules: { external: string[]; internal: string[] } }> {
+    return this.request('PUT', '/api/settings/api-tool-outbound', { mode, rules });
+  }
+  async deleteApiToolService(id: string): Promise<void> {
+    await this.request('DELETE', `/api/api-tools/${id}`);
+  }
+  // ---- notes (#88 — capture, organize, annotate) ----
+
+  async listNotes(query?: Partial<ListNotesQuery>): Promise<{ notes: FeedNoteView[] }> {
+    const qs = new URLSearchParams();
+    if (query?.categoryId !== undefined) qs.set('categoryId', query.categoryId);
+    if (query?.category !== undefined) qs.set('category', query.category);
+    if (query?.status !== undefined) qs.set('status', query.status);
+    if (query?.visibility !== undefined) qs.set('visibility', query.visibility);
+    if (query?.tag !== undefined) qs.set('tag', query.tag);
+    if (query?.search !== undefined) qs.set('search', query.search);
+    if (query?.limit !== undefined) qs.set('limit', String(query.limit));
+    if (query?.offset !== undefined) qs.set('offset', String(query.offset));
+    const suffix = qs.toString();
+    return this.request('GET', `/api/notes${suffix ? `?${suffix}` : ''}`);
+  }
+
+  async listSquareNotes(query?: Partial<ListSquareQuery>): Promise<{ notes: SquareNoteView[] }> {
+    const qs = new URLSearchParams();
+    if (query?.tag !== undefined) qs.set('tag', query.tag);
+    if (query?.search !== undefined) qs.set('search', query.search);
+    if (query?.limit !== undefined) qs.set('limit', String(query.limit));
+    if (query?.offset !== undefined) qs.set('offset', String(query.offset));
+    const suffix = qs.toString();
+    return this.request('GET', `/api/notes/square${suffix ? `?${suffix}` : ''}`);
+  }
+
+  async createNote(input: CreateNoteInput): Promise<{ note: Note }> {
+    return this.request('POST', '/api/notes', input);
+  }
+
+  async getNote(id: string): Promise<{ note: Note }> {
+    return this.request('GET', `/api/notes/${id}`);
+  }
+
+  async updateNote(id: string, input: UpdateNoteInput): Promise<{ note: Note }> {
+    return this.request('PATCH', `/api/notes/${id}`, input);
+  }
+
+  async deleteNote(id: string): Promise<void> {
+    await this.request('DELETE', `/api/notes/${id}`);
+  }
+
+  async listNoteAnnotations(noteId: string): Promise<{ annotations: NoteAnnotation[] }> {
+    return this.request('GET', `/api/notes/${noteId}/annotations`);
+  }
+
+  async createNoteAnnotation(
+    noteId: string,
+    input: CreateAnnotationInput,
+  ): Promise<{ annotation: NoteAnnotation }> {
+    return this.request('POST', `/api/notes/${noteId}/annotations`, input);
+  }
+
+  async updateNoteAnnotation(
+    noteId: string,
+    annotationId: string,
+    input: UpdateAnnotationInput,
+  ): Promise<{ annotation: NoteAnnotation }> {
+    return this.request('PATCH', `/api/notes/${noteId}/annotations/${annotationId}`, input);
+  }
+
+  async deleteNoteAnnotation(noteId: string, annotationId: string): Promise<void> {
+    await this.request('DELETE', `/api/notes/${noteId}/annotations/${annotationId}`);
+  }
+
+  async listNoteCategories(): Promise<{ categories: NoteCategory[] }> {
+    return this.request('GET', '/api/notes/categories');
+  }
+
+  async createNoteCategory(input: CreateCategoryInput): Promise<{ category: NoteCategory }> {
+    return this.request('POST', '/api/notes/categories', input);
+  }
+
+  async updateNoteCategory(
+    id: string,
+    input: UpdateCategoryInput,
+  ): Promise<{ category: NoteCategory }> {
+    return this.request('PATCH', `/api/notes/categories/${id}`, input);
+  }
+
+  async deleteNoteCategory(id: string): Promise<void> {
+    await this.request('DELETE', `/api/notes/categories/${id}`);
+  }
+
+  /** #88 AI pass — one-shot LLM summary of (possibly unsaved) note content. */
+  async summarizeNote(input: { title?: string; contentMd: string }): Promise<{ summary: string }> {
+    return this.request('POST', '/api/notes/summarize', input);
+  }
+
+  /**
+   * #88 revision loop — every open annotation + the current body go to the
+   * model; the rewritten markdown saves as the next immutable version and
+   * the addressed annotations flip to done. Long-running by LLM standards.
+   */
+  async reviseNote(id: string): Promise<{
+    note: Note;
+    resolved: NoteAnnotation[];
+  }> {
+    return this.request('POST', `/api/notes/${id}/revise`);
+  }
+
+  // ---- delegated-decision audit (#97) ----
+
+  async listDecisionRecords(
+    query?: Partial<{
+      sessionId: string;
+      machineId: string;
+      outcome: string;
+      before: string;
+      limit: number;
+    }>,
+  ): Promise<DecisionRecordView[]> {
+    const qs = new URLSearchParams();
+    if (query?.sessionId !== undefined) qs.set('sessionId', query.sessionId);
+    if (query?.machineId !== undefined) qs.set('machineId', query.machineId);
+    if (query?.outcome !== undefined) qs.set('outcome', query.outcome);
+    if (query?.before !== undefined) qs.set('before', query.before);
+    if (query?.limit !== undefined) qs.set('limit', String(query.limit));
+    const suffix = qs.toString();
+    const res = await this.request('GET', `/api/decision-records${suffix ? `?${suffix}` : ''}`);
+    return res.records;
   }
 
   // ---- settings ----
@@ -1100,4 +1370,10 @@ export type {
   TrustTier,
   SkillMeta,
   SkillBundle,
+  // #88 — notes domain types.
+  Note,
+  NoteAnnotation,
+  NoteCategory,
+  NoteStatus,
+  NoteVisibility,
 };

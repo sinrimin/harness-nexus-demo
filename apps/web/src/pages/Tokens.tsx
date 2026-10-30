@@ -217,14 +217,14 @@ export function TokensPage() {
           {visible?.map((p) => (
             <TableRow key={p.id}>
               <TableCell className="font-medium">{p.name}</TableCell>
-              <TableCell className="font-mono text-xs tabular-nums">{p.prefix}…</TableCell>
+              <TableCell className="text-muted-foreground role-data-sm">{p.prefix}…</TableCell>
               <TableCell>
                 {p.scopes.length === 0 ? (
                   <span className="text-muted-foreground">—</span>
                 ) : (
                   <div className="flex flex-wrap gap-1">
                     {p.scopes.map((s) => (
-                      <Badge key={s} variant="secondary" className="font-mono text-[10px]">
+                      <Badge key={s} variant="secondary" className="role-data-sm">
                         {s}
                       </Badge>
                     ))}

@@ -10,12 +10,26 @@ import {
   isRuntimeTarget,
 } from '@harness-nexus/shared';
 import type {
+  ChatApprovalsView,
   ChatChannelView,
   ChatStreamEvent,
+  DelegationDenialReason,
   PromptBlock,
   PromptCapabilities,
 } from '@harness-nexus/shared';
 import { generateId } from '../infra/crypto.js';
+import type { SystemOneFetch } from '../infra/systemone.js';
+import {
+  decideApproval,
+  type ApprovalBands,
+  type ApprovalGateOutcome,
+  GATE_TOOL_INPUT_CHAR_CAP,
+  PROMPT_RETAIN_CHAR_CAP,
+  PROMPT_RETAIN_WINDOW,
+  toolInputText,
+} from './approvals-gate.js';
+import type { ModelCapabilities } from '../services/model-capabilities.js';
+import type { DecisionHumanResponse } from '@harness-nexus/core';
 
 /**
  * Chat routing + gating (Phase 8 C5, reworked 9 W7). wiki design-phase-8-c5.md
@@ -55,6 +69,26 @@ export interface ChatServiceDeps {
   /** Is the machine's daemon connected right now? */
   isOnline: (machineId: string) => boolean;
   io: ChatIO;
+  /**
+   * #92 — the delegated-approvals gate's needs. Absent (unit tests, or a
+   * deployment with the feature off) = the gate never engages; permission
+   * cards behave exactly as before.
+   */
+  /**
+   * #100 — the decision-model capability breaker. Present in production;
+   * absent in unit tests = unwrapped fetches and a delegation view that
+   * ignores breaker health.
+   */
+  capabilities?: ModelCapabilities;
+  approvals?: {
+    credentialEncryptionKey: string;
+    timeoutMs: number;
+    log?: { warn: (msg: string) => void };
+    /** Injectable for tests. */
+    fetchImpl?: SystemOneFetch;
+    /** v2 verdict bands (ENV constants; absent = the gate's defaults). */
+    bands?: ApprovalBands;
+  };
 }
 
 export type ChatOpenResult =
@@ -151,8 +185,23 @@ interface LiveSession {
   dispatch: boolean;
   readyTimer: NodeJS.Timeout | null;
   permissionTimers: Map<string, NodeJS.Timeout>;
+  /**
+   * #97 — the pending card's allow-option ids (requestId → ids), so a HUMAN
+   * settle can be classified allow/reject for the audit backfill. Cleared
+   * wherever `permissionTimers` is.
+   */
+  permissionAllowOptions: Map<string, Set<string>>;
   /** 9 W14.1 — elicitation watchdogs, same policy as permissions. */
   elicitationTimers: Map<string, NodeJS.Timeout>;
+  /** #92 — the session's approvals responder view (machine default + live switch). */
+  approvals: ChatApprovalsView;
+  /**
+   * #92 — the user's own prompts since open (bounded window), the ONLY
+   * free-text the decision model ever sees: context hygiene forbids file
+   * bodies and tool outputs, and an agent-controlled string must never be
+   * able to argue its way past the gate.
+   */
+  recentPrompts: string[];
 }
 
 export class ChatService {
@@ -339,7 +388,10 @@ export class ChatService {
       dispatch: openerSocketId === null,
       readyTimer: null,
       permissionTimers: new Map(),
+      permissionAllowOptions: new Map(),
       elicitationTimers: new Map(),
+      approvals: await this.resolveApprovalsView(ownerId, machine),
+      recentPrompts: [],
     };
     session.readyTimer = setTimeout(() => {
       void this.closeInternal(session, 'spawn-timeout', { notifyDaemon: true, failed: true });
@@ -396,6 +448,12 @@ export class ChatService {
       ...(modelOptions !== undefined ? { modelOptions } : {}),
       ...(defaultMode !== undefined ? { defaultMode } : {}),
       ...(prewarm ? { prewarm: true } : {}),
+      // #92/#95 — the approvals view for the daemon's session_config
+      // synthesis. ALWAYS advertised (even manual with no resolvable model)
+      // so the sender's permissions control renders on every session; the
+      // web disables the switch and points at the provider defaults when
+      // `modelId` is absent.
+      approvals: session.approvals,
     });
     this.pushSnapshot(ownerId);
     return { ok: true, sessionId, joined: false, phase: 'starting', cwd };
@@ -470,6 +528,7 @@ export class ChatService {
         ? { promptCapabilities: existing.promptCapabilities }
         : {}),
     });
+    this.pushApprovalsConfig(existing);
     // 9 W7 — the refreshed page lost its local fold; the daemon re-emits the
     // channel's history into the room.
     this.deps.io.toCtl(existing.machineId, 'chat:session.resync', {
@@ -635,6 +694,7 @@ export class ChatService {
         ? { promptCapabilities: evt.promptCapabilities }
         : {}),
     });
+    this.pushApprovalsConfig(session);
     // Re-push the history AFTER ready as well: a browser that attached its
     // listeners between the daemon's direct history push and this moment
     // still catches this one (history ingestion rebuilds from scratch, so a
@@ -653,12 +713,54 @@ export class ChatService {
     const session = this.live.get(sessionId);
     if (!session || session.machineId !== machineId) return { ok: false };
 
+    // A daemon-side settlement (user answered in another viewer is impossible
+    // — answers route through us — but the daemon itself settles cards on
+    // cancel, backstop, and $/cancel_request). Clear our watchdog for the
+    // card or it later fires a phantom respond into the daemon (#B report:
+    // a cancelled card's timer answered a request that no longer existed).
+    if (event.kind === 'permission_resolved') {
+      const timer = session.permissionTimers.get(event.requestId);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        session.permissionTimers.delete(event.requestId);
+        // #97 — a daemon-initiated settle of a still-armed card (cancel /
+        // backstop): the human's side of the pair, for the audit row. Our
+        // own delegated settles already cleared the timer, so they never
+        // reach this backfill.
+        const allowIds = session.permissionAllowOptions.get(event.requestId);
+        this.backfillHumanResponse(
+          session,
+          event.requestId,
+          event.outcome === 'cancelled'
+            ? 'cancel'
+            : event.outcome === 'timeout'
+              ? 'timeout'
+              : (event.optionId !== undefined && allowIds?.has(event.optionId)) === true
+                ? 'allow'
+                : 'reject',
+        );
+        session.permissionAllowOptions.delete(event.requestId);
+      }
+    } else if (event.kind === 'elicitation_resolved') {
+      const timer = session.elicitationTimers.get(event.requestId);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        session.elicitationTimers.delete(event.requestId);
+      }
+    }
+
     if (event.kind === 'permission_request') {
       const { requestId } = event;
+      session.permissionAllowOptions.set(
+        requestId,
+        new Set(event.options.filter((o) => o.kind.startsWith('allow')).map((o) => o.optionId)),
+      );
       session.permissionTimers.set(
         requestId,
         setTimeout(() => {
           session.permissionTimers.delete(requestId);
+          session.permissionAllowOptions.delete(requestId);
+          this.backfillHumanResponse(session, requestId, 'timeout');
           // Timeout ⇒ answer the agent with cancelled and settle every viewer's card.
           this.deps.io.toCtl(session.machineId, 'chat:permission.respond', {
             sessionId,
@@ -670,6 +772,18 @@ export class ChatService {
           });
         }, this.opts.permissionTimeoutMs),
       );
+      // #92 — the delegated gate runs BESIDE the human card (the card stays
+      // visible and answerable; first responder wins). Every failure path
+      // inside leaves the card untouched = escalation to the human.
+      if (
+        this.deps.approvals !== undefined &&
+        session.approvals.responder === 'delegated' &&
+        session.phase === 'ready'
+      ) {
+        void this.runApprovalsGate(session, event.requestId, event.toolCall, event.options).catch(
+          () => {},
+        );
+      }
     } else if (event.kind === 'elicitation_request') {
       // 9 W14.1 — same policy and latency budget as permissions: an
       // unanswered question must not wedge the agent forever.
@@ -787,6 +901,43 @@ export class ChatService {
     return { ok: true };
   }
 
+  /**
+   * Daemon's `chat:history.page` — relay one older-history page to the room
+   * (the browser PREPENDS it; never a rebuild). Companion of onHistory.
+   */
+  onHistoryPage(
+    machineId: string,
+    payload: { sessionId: string; items: unknown[] },
+  ): {
+    ok: boolean;
+  } {
+    const session = this.live.get(payload.sessionId);
+    if (!session || session.machineId !== machineId) return { ok: false };
+    this.deps.io.toChannel(payload.sessionId, 'chat:history.page', payload);
+    return { ok: true };
+  }
+
+  /** Browser's `chat:history.fetch` — relay the paging request to the daemon. */
+  onHistoryFetch(
+    ownerId: string,
+    sessionId: string,
+    beforeSeq?: number,
+    limit?: number,
+  ): { ok: boolean; code?: string } {
+    const session = this.live.get(sessionId);
+    if (!session || session.ownerId !== ownerId) return { ok: false, code: 'SESSION_NOT_FOUND' };
+    if (session.phase !== 'ready') return { ok: false, code: 'SESSION_NOT_READY' };
+    if (!this.deps.isOnline(session.machineId)) {
+      return { ok: false, code: 'MACHINE_OFFLINE' };
+    }
+    this.deps.io.toCtl(session.machineId, 'chat:history.fetch', {
+      sessionId,
+      ...(beforeSeq !== undefined ? { beforeSeq } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    return { ok: true };
+  }
+
   /** Browser's `chat:message.send` — owner check, queue-on-busy, normalization. */
   onMessageSend(
     ownerId: string,
@@ -865,6 +1016,19 @@ export class ChatService {
    * turn starts).
    */
   private emitUserMessage(session: LiveSession, blocks: PromptBlock[]): void {
+    // #92 — the retained prompt window for the decision model (context
+    // hygiene: user-authored text only, never agent output). v2: retention
+    // is a generous MEMORY bound; the gate applies the real window and the
+    // head/tail cut, so an ENV-raised window needs no second storage path.
+    const text = blocks
+      .filter((b): b is Extract<PromptBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text.trim())
+      .filter((t) => t !== '')
+      .join(' ')
+      .slice(0, PROMPT_RETAIN_CHAR_CAP);
+    if (text !== '') {
+      session.recentPrompts = [...session.recentPrompts, text].slice(-PROMPT_RETAIN_WINDOW);
+    }
     this.deps.io.toChannel(session.sessionId, 'chat:event', {
       sessionId: session.sessionId,
       event: { kind: 'user_message', blocks },
@@ -907,6 +1071,425 @@ export class ChatService {
     return { ok: true };
   }
 
+  /**
+   * #95 — the EFFECTIVE decision model: the machine's override pair when set,
+   * else the USER's default slot. Null when nothing resolves (or the row no
+   * longer carries the named systemone model). Best effort — the gate must
+   * never block or crash an open.
+   */
+  private async resolveDecisionModel(
+    ownerId: string,
+    machine: {
+      chatApprovals?: {
+        providerId?: string | undefined;
+        responder: 'manual' | 'delegated';
+        modelId?: string | undefined;
+      };
+    },
+  ): Promise<{ providerName: string; modelId: string } | null> {
+    try {
+      const cfg = machine.chatApprovals;
+      const ref =
+        cfg?.providerId !== undefined && cfg?.modelId !== undefined
+          ? { providerId: cfg.providerId, modelId: cfg.modelId }
+          : (await this.deps.uow.users.findById(ownerId))?.defaultModels?.decision;
+      if (ref === undefined) return null;
+      const provider = await this.deps.uow.llmProviders.findById(ref.providerId);
+      if (provider === null) return null;
+      if (!provider.models.some((m) => m.id === ref.modelId && m.apiKind === 'systemone')) {
+        return null;
+      }
+      return { providerName: provider.name, modelId: ref.modelId };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * #92 — the session's MACHINE-DEFAULT approvals view (open-time only):
+   * delegation stays opt-in, so the responder follows the machine row. #95 —
+   * the view also carries the RESOLVED model's provenance when one exists
+   * (machine override or user default), even while manual: the sender's
+   * switch is rendered from it, so a user default alone makes the live
+   * toggle discoverable instead of unreachable (the chicken-and-egg of a
+   * manual machine that never advertised the capability).
+   */
+  private async resolveApprovalsView(
+    ownerId: string,
+    machine: {
+      chatApprovals?: {
+        providerId?: string | undefined;
+        responder: 'manual' | 'delegated';
+        modelId?: string | undefined;
+      };
+    },
+  ): Promise<ChatApprovalsView> {
+    const cfg = machine.chatApprovals;
+    const resolved = await this.resolveDecisionModel(ownerId, machine);
+    // #100 — while the breaker holds the slot degraded, the honest
+    // open-time answer is manual: the gate would fail closed on every card
+    // anyway, and the sender's switch must not promise a delegation the
+    // model cannot deliver. Cooldown expiry restores it with no config
+    // change (the breaker is runtime state, never stored).
+    // #95 — the axis is ALWAYS advertised. The sender renders the switch even
+    // when nothing resolves (disabled + a "configure a default model" hint),
+    // which is what makes the capability discoverable at all; delegation
+    // itself still requires a resolvable model.
+    const degraded = this.deps.capabilities?.degraded(ownerId) ?? null;
+    return {
+      responder:
+        cfg?.responder === 'delegated' && resolved !== null && degraded === null
+          ? 'delegated'
+          : 'manual',
+      ...(resolved ?? {}),
+    };
+  }
+
+  /**
+   * #92/#95 — push the approvals slice to the channel as a `session_config`
+   * event straight from the SERVER. The daemon synthesizes the same slice
+   * for its own viewers, but only #92-era+ daemons know the field — a
+   * machine on an older CLI would otherwise never surface the switch. Same
+   * value from both writers, so the web's merge stays idempotent. Always
+   * pushed (a manual view with no model is what renders the disabled
+   * switch + configuration hint).
+   */
+  private pushApprovalsConfig(session: LiveSession): void {
+    this.deps.io.toChannel(session.sessionId, 'chat:event', {
+      sessionId: session.sessionId,
+      event: { kind: 'session_config', approvals: session.approvals },
+    });
+  }
+
+  /**
+   * #92 — browser's `chat:approvals.set`: switch the LIVE session's responder
+   * (next-REQUEST effect). The server owns the truth; the daemon only
+   * re-synthesizes the session_config slice for the viewers.
+   */
+  async setApprovals(
+    ownerId: string,
+    sessionId: string,
+    responder: 'manual' | 'delegated',
+  ): Promise<ChatSimpleResult> {
+    const session = this.live.get(sessionId);
+    if (!session || session.ownerId !== ownerId) return { ok: false, code: 'SESSION_NOT_FOUND' };
+    if (session.phase !== 'ready') return { ok: false, code: 'SESSION_NOT_READY' };
+    // #95 — delegated is offerable iff a decision model RESOLVES (machine
+    // override or the user's default slot), regardless of the machine's
+    // responder default: the live switch is the user's own opt-in.
+    const machine = (await this.deps.uow.machines.findById(session.machineId)) ?? {};
+    const resolved =
+      responder === 'delegated' ? await this.resolveDecisionModel(ownerId, machine) : null;
+    const view: ChatApprovalsView =
+      responder === 'delegated' && resolved !== null
+        ? { responder: 'delegated', ...resolved }
+        : { responder: 'manual' };
+    if (responder === 'delegated' && view.responder !== 'delegated') {
+      return { ok: false, code: 'CHAT_APPROVALS_NO_PROVIDER' };
+    }
+    session.approvals = view;
+    if (this.deps.isOnline(session.machineId)) {
+      this.deps.io.toCtl(session.machineId, 'chat:approvals.set', {
+        sessionId,
+        approvals: view,
+      });
+    }
+    this.pushApprovalsConfig(session);
+    return { ok: true };
+  }
+
+  /**
+   * #103 — can a FORCED delegated stance engage for a dispatch to this agent?
+   * Answers the stance question ONLY: a missing/foreign instance or machine
+   * returns `true` so `open()` still reports its own honest code. The
+   * coordinator refuses BEFORE opening a channel when this answers false —
+   * fail fast, never spawn an unattended run whose cards would
+   * watchdog-cancel one by one.
+   */
+  async delegatedStanceOfferable(ownerId: string, agentInstanceId: string): Promise<boolean> {
+    const agent = await this.deps.uow.agentInstances.findById(agentInstanceId);
+    if (agent === null || agent.ownerId !== ownerId) return true;
+    const machine = await this.deps.uow.machines.findById(agent.machineId);
+    if (machine === null) return true;
+    if ((this.deps.capabilities?.degraded(ownerId) ?? null) !== null) return false;
+    return (await this.resolveDecisionModel(ownerId, machine)) !== null;
+  }
+
+  /**
+   * #92 — the delegated gate. The decision core (floor → eligibility →
+   * decision call → verdict/advisory) lives in `approvals-gate.ts`, shared
+   * with the platform assistant (#95 follow-up); this method owns the
+   * LIVE-session arbitration and settlement. Every thrown/rejected path =
+   * escalation (the card stays with the human); the gate NEVER fail-opens.
+   */
+  private async runApprovalsGate(
+    session: LiveSession,
+    requestId: string,
+    toolCall: {
+      title?: string | undefined;
+      kind?: string | undefined;
+      rawInput?: Record<string, unknown> | undefined;
+    },
+    options: readonly { optionId: string; kind: string; name: string }[],
+  ): Promise<void> {
+    const gate = this.deps.approvals;
+    if (gate === undefined) return;
+    let machine;
+    try {
+      machine = await this.deps.uow.machines.findById(session.machineId);
+    } catch {
+      return; // unreadable config ⇒ human decides
+    }
+    const cfg = machine?.chatApprovals;
+    const startedAt = Date.now();
+    const outcome = await decideApproval(
+      {
+        uow: this.deps.uow,
+        credentialEncryptionKey: gate.credentialEncryptionKey,
+        timeoutMs: gate.timeoutMs,
+        ...(gate.log !== undefined ? { log: gate.log } : {}),
+        // #100 — the breaker rides the fetch seam: while degraded the
+        // wrapper rejects with the gate's own "uncertain" error shape
+        // (floor + pre-filter still settle locally), and real outcomes
+        // feed the breaker.
+        ...(this.deps.capabilities !== undefined
+          ? {
+              fetchImpl: this.deps.capabilities.wrapFetch(session.ownerId, gate.fetchImpl),
+            }
+          : { ...(gate.fetchImpl !== undefined ? { fetchImpl: gate.fetchImpl } : {}) }),
+        ...(gate.bands !== undefined ? { bands: gate.bands } : {}),
+      },
+      {
+        ownerId: session.ownerId,
+        target: session.target,
+        recentPrompts: session.recentPrompts,
+        ...(cfg !== undefined
+          ? {
+              policy: {
+                ...(cfg.neverAllow !== undefined ? { neverAllow: cfg.neverAllow } : {}),
+                ...(cfg.confidenceThreshold !== undefined
+                  ? { confidenceThreshold: cfg.confidenceThreshold }
+                  : {}),
+                ...(cfg.denyNote !== undefined ? { denyNote: cfg.denyNote } : {}),
+                ...(cfg.providerId !== undefined && cfg.modelId !== undefined
+                  ? { decision: { providerId: cfg.providerId, modelId: cfg.modelId } }
+                  : {}),
+              },
+            }
+          : {}),
+        view: session.approvals,
+        toolCall: {
+          title: toolCall.title,
+          kind: toolCall.kind,
+          // #92 — the arguments the severity/intent questions judge; the
+          // daemon already bounds rawInput's fields, the gate bounds the text.
+          input: toolInputText(toolCall.rawInput),
+          // v2 — the PARSED arguments feed the metadata pre-filter (the
+          // Bash verb pinning and the read-kind path checks read real
+          // fields, not the JSON text).
+          raw: toolCall.rawInput,
+        },
+        // v2 — the pre-filter's "inside the working area" root.
+        workspaceRoot: session.cwd,
+        options,
+      },
+    );
+    // #97 — the audit row rides every outcome the gate produced. #104 — a
+    // pre-model escalate is silent ONLY when the gate was never applicable
+    // (no one-shot options); an unavailable delegation (no model / timeout /
+    // provider error / unusable answer) is named on the card and audited.
+    this.recordDecision(session, requestId, toolCall, outcome, Date.now() - startedAt);
+    if (outcome.kind === 'escalate') {
+      if (outcome.unavailable !== undefined) {
+        this.deps.io.toChannel(session.sessionId, 'chat:event', {
+          sessionId: session.sessionId,
+          event: {
+            kind: 'permission_escalated',
+            requestId,
+            reason: outcome.unavailable,
+          },
+        });
+      }
+      return;
+    }
+    // First responder wins: a human answer or the watchdog may have settled
+    // the card while the model ran.
+    if (session.permissionTimers.get(requestId) === undefined) return;
+    if (outcome.kind === 'advisory') {
+      this.deps.io.toChannel(session.sessionId, 'chat:event', {
+        sessionId: session.sessionId,
+        event: {
+          kind: 'permission_advisory',
+          requestId,
+          lean: outcome.lean,
+          confidence: outcome.confidence,
+          ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
+          ...(outcome.severity !== undefined ? { severity: outcome.severity } : {}),
+          ...(outcome.intent !== undefined ? { intent: outcome.intent } : {}),
+        },
+      });
+      return;
+    }
+    await this.settleDelegated(session, requestId, outcome.optionId, {
+      responder: 'delegated',
+      decidedBy: outcome.decidedBy,
+      providerName: session.approvals.providerName ?? 'decision-model',
+      modelId: session.approvals.modelId ?? '',
+      ...(outcome.confidence !== undefined ? { confidence: outcome.confidence } : {}),
+      ...(outcome.denial !== undefined ? { denial: outcome.denial } : {}),
+      ...(outcome.denyMessage !== undefined ? { meta: { denyMessage: outcome.denyMessage } } : {}),
+      ...(outcome.queueNote !== undefined ? { queueNote: outcome.queueNote } : {}),
+    });
+  }
+
+  /**
+   * #97 — one audit row per gate verdict, fire-and-forget (a failed audit
+   * write must never break the settle). Floor rows stay lean (no model
+   * fields); a model-ran row carries the raw verdict, the configured
+   * decision model, and the call latency.
+   */
+  private recordDecision(
+    session: LiveSession,
+    requestId: string,
+    toolCall: {
+      title?: string | undefined;
+      kind?: string | undefined;
+      rawInput?: Record<string, unknown> | undefined;
+    },
+    outcome: ApprovalGateOutcome,
+    latencyMs: number,
+  ): void {
+    const unavailable = outcome.kind === 'escalate' ? outcome.unavailable : undefined;
+    if (outcome.kind === 'escalate' && outcome.verdict === undefined && unavailable === undefined) {
+      return;
+    }
+    const preview = toolInputText(toolCall.rawInput)?.slice(0, GATE_TOOL_INPUT_CHAR_CAP);
+    const v = outcome.verdict;
+    void this.deps.uow.decisionRecords
+      .append({
+        id: generateId(),
+        ownerId: session.ownerId,
+        createdAt: new Date().toISOString(),
+        axis: 'chat',
+        machineId: session.machineId,
+        sessionId: session.sessionId,
+        requestId,
+        target: session.target,
+        toolTitle: toolCall.title ?? '',
+        ...(toolCall.kind !== undefined ? { toolKind: toolCall.kind } : {}),
+        ...(preview !== undefined ? { toolInputPreview: preview } : {}),
+        outcome:
+          outcome.kind === 'decide'
+            ? outcome.denial !== undefined
+              ? 'deny'
+              : 'allow'
+            : 'escalate',
+        decidedBy: outcome.kind === 'decide' ? outcome.decidedBy : 'model',
+        ...(v !== undefined
+          ? {
+              ...(v.severity !== undefined ? { severity: v.severity } : {}),
+              ...(v.intent !== undefined ? { intent: v.intent } : {}),
+              ...(v.why !== undefined ? { why: v.why } : {}),
+              ...(v.sevConfidence !== undefined ? { sevConfidence: v.sevConfidence } : {}),
+              ...(v.intentConfidence !== undefined ? { intentConfidence: v.intentConfidence } : {}),
+            }
+          : {}),
+        // #104 — an unavailable escalate carries the configured provenance
+        // and the failed call's latency even without a verdict, so the audit
+        // shows WHAT was attempted.
+        ...(v !== undefined || unavailable !== undefined
+          ? {
+              ...(session.approvals.providerName !== undefined
+                ? { providerName: session.approvals.providerName }
+                : {}),
+              ...(session.approvals.modelId !== undefined
+                ? { modelId: session.approvals.modelId }
+                : {}),
+              latencyMs,
+            }
+          : {}),
+        ...(outcome.kind === 'decide' && outcome.denial !== undefined
+          ? { denialReason: outcome.denial.reason }
+          : {}),
+        ...(outcome.kind === 'advisory' && outcome.reason !== undefined
+          ? { denialReason: outcome.reason }
+          : {}),
+      })
+      .catch(() => {});
+  }
+
+  /** #97 — backfill the human's answer onto the escalated row (no row = no-op). */
+  private backfillHumanResponse(
+    session: LiveSession,
+    requestId: string,
+    response: DecisionHumanResponse,
+  ): void {
+    void this.deps.uow.decisionRecords
+      .markHumanResponse(session.ownerId, session.sessionId, requestId, response)
+      .catch(() => {});
+  }
+
+  /**
+   * #92 — settle a card the gate decided: answer the agent (optionId sacred,
+   * `_meta.denyMessage` where the channel exists), settle every viewer with
+   * the attribution, and optionally park the correction note. First
+   * responder wins — the permissionTimers map is the arbiter.
+   */
+  private async settleDelegated(
+    session: LiveSession,
+    requestId: string,
+    optionId: string,
+    info: {
+      responder: 'delegated';
+      decidedBy: 'floor' | 'model';
+      providerName: string;
+      modelId: string;
+      confidence?: number;
+      denial?: { reason: DelegationDenialReason };
+      meta?: { denyMessage: string };
+      queueNote?: string;
+    },
+  ): Promise<void> {
+    const timer = session.permissionTimers.get(requestId);
+    if (timer === undefined) return; // raced: the human or the watchdog won
+    clearTimeout(timer);
+    session.permissionTimers.delete(requestId);
+    session.permissionAllowOptions.delete(requestId);
+    const delegated = {
+      providerName: info.providerName,
+      modelId: info.modelId,
+      ...(info.confidence !== undefined ? { confidence: info.confidence } : {}),
+      ...(info.denial !== undefined ? { denial: info.denial } : {}),
+    };
+    this.deps.io.toCtl(session.machineId, 'chat:permission.respond', {
+      sessionId: session.sessionId,
+      requestId,
+      optionId,
+      ...(info.meta !== undefined ? { meta: info.meta } : {}),
+      attribution: { responder: 'delegated', decidedBy: info.decidedBy, ...delegated },
+    });
+    this.deps.io.toChannel(session.sessionId, 'chat:event', {
+      sessionId: session.sessionId,
+      event: {
+        kind: 'permission_resolved',
+        requestId,
+        outcome: 'selected',
+        optionId,
+        responder: 'delegated',
+        decidedBy: info.decidedBy,
+        delegated,
+      },
+    });
+    // The fallback explanation for targets with no deny-reason channel:
+    // parked as the next prompt (the #10 queue lane). A full slot drops it —
+    // the settled line and the audit keep the reason.
+    if (info.queueNote !== undefined && session.queuedPrompt === null) {
+      const blocks: PromptBlock[] = [{ type: 'text', text: info.queueNote }];
+      session.queuedPrompt = blocks;
+      this.emitQueueState(session, blocks, false);
+    }
+  }
+
   /** Browser's `chat:permission.respond` — forward verbatim (optionId is sacred). */
   onPermissionRespond(
     ownerId: string,
@@ -924,6 +1507,19 @@ export class ChatService {
     if (!this.deps.isOnline(session.machineId)) return { ok: false, code: 'MACHINE_OFFLINE' };
     clearTimeout(timer);
     session.permissionTimers.delete(requestId);
+    const allowIds = session.permissionAllowOptions.get(requestId);
+    session.permissionAllowOptions.delete(requestId);
+    // #97 — the human's side of the labeled pair (the model's lean is
+    // already on the escalated row).
+    this.backfillHumanResponse(
+      session,
+      requestId,
+      optionId === undefined
+        ? 'cancel'
+        : (allowIds !== undefined && allowIds.has(optionId)) === true
+          ? 'allow'
+          : 'reject',
+    );
     this.deps.io.toCtl(session.machineId, 'chat:permission.respond', {
       sessionId,
       requestId,
@@ -1176,6 +1772,7 @@ export class ChatService {
     if (session.readyTimer !== null) clearTimeout(session.readyTimer);
     for (const timer of session.permissionTimers.values()) clearTimeout(timer);
     session.permissionTimers.clear();
+    session.permissionAllowOptions.clear();
     for (const timer of session.elicitationTimers.values()) clearTimeout(timer);
     session.elicitationTimers.clear();
 

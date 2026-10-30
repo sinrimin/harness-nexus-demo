@@ -22,7 +22,28 @@
  * config and approval-gated per call.
  */
 export type AssistantToolGroup =
-  'resources' | 'profiles' | 'mcp' | 'skills-hub' | 'machines' | 'agent-dispatch' | 'system';
+  | 'resources'
+  | 'profiles'
+  | 'mcp'
+  | 'skills-hub'
+  | 'notes'
+  | 'machines'
+  | 'agent-dispatch'
+  | 'api-tools'
+  | 'system';
+
+/**
+ * #79 — how the config treats WRITE-class tool calls: `'prompt'` (default)
+ * surfaces the approval card per call; `'autoWrite'` runs them silently.
+ * READ tools are silent in every mode; META tools prompt in every mode (no
+ * silent tier exists for boundary-changing operations).
+ *
+ * #95 follow-up — `'delegated'` keeps the same prompt points but hands the
+ * answer to the owner's default decision model (#92's gate). Writes and META
+ * calls still surface through the seam; a decisive model verdict answers,
+ * anything uncertain falls back to the human card.
+ */
+export type AssistantPermissionMode = 'prompt' | 'autoWrite' | 'delegated';
 
 /** One named assistant configuration — many per user, name unique per owner. */
 export interface AssistantConfig {
@@ -37,6 +58,8 @@ export interface AssistantConfig {
   defaultModel: string;
   /** Replaces the platform's default assistant prompt when set. */
   systemPromptOverride?: string | undefined;
+  /** #79 — write-tool policy; absent = `'prompt'`. See `AssistantPermissionMode`. */
+  permissionMode?: AssistantPermissionMode | undefined;
   enabledToolGroups: AssistantToolGroup[];
   /**
    * M2 — server-dialed MCP servers the assistant may call (visibility is
@@ -49,6 +72,8 @@ export interface AssistantConfig {
    * prompt index + the `read_skill` tool (progressive disclosure).
    */
   skillResourceIds: string[];
+  /** #80 — visible API tool service ids whose tools join the turn. */
+  apiToolServiceIds: string[];
   /**
    * M3 — the config's sessions may spend this many tokens (input+output,
    * summed over assistant turns) per UTC day before further turns refuse
@@ -72,6 +97,13 @@ export interface AssistantSession {
   createdAt: string;
   updatedAt: string;
   lastMessageAt: string | null;
+  /**
+   * #79 — the conversation's OWN write-policy, switchable from the chat
+   * sender (`assistant:config.set` `permissionMode`); the config's
+   * `permissionMode` is only the DEFAULT stamped at open. Undefined = a
+   * legacy row (pre-v27), which falls back to the config default at open.
+   */
+  permissionMode?: AssistantPermissionMode | undefined;
 }
 
 /**

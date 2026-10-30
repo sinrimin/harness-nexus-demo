@@ -25,6 +25,11 @@ import {
   sqliteRuntimeConfigRepository,
   sqliteLlmProviderRepository,
   sqliteAssistantRepository,
+  sqliteApiToolRepository,
+  sqliteNoteRepository,
+  sqliteNoteAnnotationRepository,
+  sqliteNoteCategoryRepository,
+  sqliteDecisionRecordRepository,
 } from './repos.js';
 
 /**
@@ -66,5 +71,10 @@ export function createSqliteUnitOfWork(dbPath: string): UnitOfWork {
     llmProviders: sqliteLlmProviderRepository(db),
     assistants: sqliteAssistantRepository(db),
     fileBlobs: sqliteFileBlobRepository(db, filesDir),
+    apiTools: sqliteApiToolRepository(db),
+    notes: sqliteNoteRepository(db),
+    noteAnnotations: sqliteNoteAnnotationRepository(db),
+    noteCategories: sqliteNoteCategoryRepository(db),
+    decisionRecords: sqliteDecisionRecordRepository(db),
   };
 }

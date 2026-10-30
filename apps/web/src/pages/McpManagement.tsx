@@ -8,8 +8,6 @@ import {
   ServerIcon,
   PlusIcon,
   TrashIcon,
-  GlobeIcon,
-  UserIcon,
   MoreHorizontalIcon,
   FileJsonIcon,
   ChevronRightIcon,
@@ -27,7 +25,9 @@ import {
   DataTable,
   FilterBar,
   FilterSelect,
+  Lamp,
   PageIntro,
+  ScopeBadge,
   TableSearch,
   Well,
   tableState,
@@ -120,13 +120,6 @@ const TRANSPORT_TYPES: TransportType[] = ['stdio', 'sse', 'streamable-http'];
  * (cyan) is deliberately NOT used here — it is reserved for liveness/links.
  * Hoisted to module scope (static config, per the React perf rule in AGENTS.md).
  */
-const STATUS_DOT_CLASS: Record<McpServerStatus['status'], string> = {
-  connected: 'bg-ok',
-  error: 'bg-danger',
-  connecting: 'bg-warn',
-  disconnected: 'bg-muted-foreground/50',
-};
-
 /** Location/launch info shown for a row, per transport shape. */
 function endpointOf(s: McpServer): string {
   if (s.transport.type === 'stdio') return s.transport.command;
@@ -469,7 +462,7 @@ function ServerRow({
 
   // Common cells shared by server-dialed and client-dialed rows.
   const dialSiteCell = (
-    <Badge variant={isServerDialed ? 'default' : 'secondary'} className="font-mono text-[10px]">
+    <Badge variant={isServerDialed ? 'default' : 'secondary'}>
       {server.dialSite === 'auto'
         ? t('mcp.dialAutoDerived', {
             site: site === 'client' ? t('mcp.dialClient') : t('mcp.dialServer'),
@@ -478,20 +471,11 @@ function ServerRow({
     </Badge>
   );
   const transportCell = (
-    <Badge variant="secondary" className="font-mono text-[10px]">
+    <Badge variant="secondary" className="role-data-sm">
       {server.transport.type}
     </Badge>
   );
-  const scopeCell = (
-    <Badge variant={server.scope === 'global' ? 'default' : 'secondary'} className="gap-1">
-      {server.scope === 'global' ? (
-        <GlobeIcon className="size-3" />
-      ) : (
-        <UserIcon className="size-3" />
-      )}
-      {server.scope === 'global' ? t('common.scopeGlobal') : t('common.scopePersonal')}
-    </Badge>
-  );
+  const scopeCell = <ScopeBadge scope={server.scope} />;
   const actionsCell = (
     <TableCell className="pr-6 text-right">
       <div className="flex items-center justify-end gap-1">
@@ -500,6 +484,7 @@ function ServerRow({
             variant="ghost"
             size="sm"
             className="text-muted-foreground h-(--row-ctl-h)"
+            disabled={server.scope === 'global' && !isAdmin}
             onClick={() => onAsk('disconnect', server)}
           >
             <PlugZapIcon className="size-4" />
@@ -540,7 +525,7 @@ function ServerRow({
           <TableCell className="pl-6 font-medium">{server.name}</TableCell>
           <TableCell>{dialSiteCell}</TableCell>
           <TableCell>
-            <Badge variant="outline" className="font-mono text-[10px]">
+            <Badge variant="secondary" className="role-data-sm">
               {t('mcp.dialedByShim')}
             </Badge>
           </TableCell>
@@ -560,7 +545,10 @@ function ServerRow({
           <TableRow data-state={open ? 'open' : 'closed'}>
             <TableCell className="pl-6 font-medium">
               <div className="flex items-center gap-2">
-                {/* The trigger is the chevron + name; only meaningful when connected. */}
+                {/* The trigger is the chevron + name; only meaningful when
+                 * connected. Non-admins on a global row MAY expand — the
+                 * panel then explains that inspection is admin-only instead
+                 * of fetching into a 404. */}
                 <CollapsibleTrigger asChild>
                   <button
                     type="button"
@@ -589,6 +577,7 @@ function ServerRow({
                     variant="ghost"
                     size="sm"
                     className="text-muted-foreground h-(--row-ctl-h)"
+                    disabled={server.scope === 'global' && !isAdmin}
                     onClick={() => onAsk('disconnect', server)}
                   >
                     <PlugZapIcon className="size-4" />
@@ -599,7 +588,7 @@ function ServerRow({
                     variant="outline"
                     size="sm"
                     className="h-(--row-ctl-h)"
-                    disabled={isConnecting}
+                    disabled={isConnecting || (server.scope === 'global' && !isAdmin)}
                     onClick={connect}
                   >
                     {isConnecting ? (
@@ -623,7 +612,10 @@ function ServerRow({
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
                     {isConnected ? (
-                      <DropdownMenuItem onClick={() => onAsk('disconnect', server)}>
+                      <DropdownMenuItem
+                        disabled={server.scope === 'global' && !isAdmin}
+                        onClick={() => onAsk('disconnect', server)}
+                      >
                         <PlugZapIcon /> {t('mcp.disconnect')}
                       </DropdownMenuItem>
                     ) : null}
@@ -648,7 +640,11 @@ function ServerRow({
           <CollapsibleContent asChild>
             <TableRow className="hover:bg-transparent">
               <TableCell colSpan={6} className="bg-muted/30 px-6 py-4">
-                <ToolList serverId={server.id} serverName={server.name} logout={logout} />
+                {server.scope === 'global' && !isAdmin ? (
+                  <p className="text-muted-foreground text-xs">{t('mcp.toolsAdminOnly')}</p>
+                ) : (
+                  <ToolList serverId={server.id} serverName={server.name} logout={logout} />
+                )}
               </TableCell>
             </TableRow>
           </CollapsibleContent>
@@ -659,9 +655,9 @@ function ServerRow({
 }
 
 /**
- * Live connection status badge — a colored dot (state-encoded, see
- * STATUS_DOT_CLASS) + a label, plus a tool-count badge when connected. Uses
- * neutral Badge variants; color comes from the dot only (Signal system).
+ * Live connection status — the two-channel status device (`Lamp`: the lamp
+ * carries the tone, the word the state) plus a tool-count badge when
+ * connected and the error detail when present.
  */
 function StatusBadge({
   status,
@@ -674,21 +670,20 @@ function StatusBadge({
 }) {
   const { t } = useI18n();
   const resolved: McpServerStatus['status'] = status ?? 'disconnected';
-  const dotClass = STATUS_DOT_CLASS[resolved];
-  const label = resolved;
   return (
     <>
       <div className="flex items-center gap-2">
-        <Badge variant="secondary" className="gap-1.5 font-mono text-[10px]">
-          <span className={`inline-block size-2 rounded-full ${dotClass}`} aria-hidden="true" />
-          {label}
-        </Badge>
+        <Lamp
+          state={resolved === 'disconnected' ? 'offline' : resolved}
+          word={resolved}
+          pulse={resolved === 'connecting'}
+        />
         {resolved === 'connected' ? (
-          <Badge variant="outline" className="nums font-mono text-[10px]">
+          <span className="text-muted-foreground nums text-xs">
             {toolCount === 1
               ? t('mcp.toolOne', { count: toolCount })
               : t('mcp.toolMany', { count: toolCount })}
-          </Badge>
+          </span>
         ) : null}
         {resolved === 'error' && detail ? (
           <span className="text-muted-foreground truncate text-xs" title={detail}>
@@ -1067,7 +1062,7 @@ function McpServerDialog({
               hint <p>, and without it align-content:stretch distributes that
               extra height into the OTHER cells' rows — pushing their inputs
               around (the same alignment bug the Profiles edit dialog fixed). */}
-            <div className="grid content-start gap-2">
+            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-2">
               <Label htmlFor="mcp-name">{t('common.name')}</Label>
               <Input
                 id="mcp-name"
@@ -1079,10 +1074,10 @@ function McpServerDialog({
                 required
               />
             </div>
-            <div className="grid content-start gap-2">
+            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-2">
               <Label htmlFor="mcp-dial-site">{t('mcp.dialSite')}</Label>
               <Select value={dialSite} onValueChange={(v) => setDialSite(v as DialSite)}>
-                <SelectTrigger id="mcp-dial-site">
+                <SelectTrigger className="w-full [&>span]:truncate" id="mcp-dial-site">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1094,10 +1089,10 @@ function McpServerDialog({
                 </SelectContent>
               </Select>
             </div>
-            <div className="grid content-start gap-2">
+            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-2">
               <Label htmlFor="mcp-type">{t('mcp.transport')}</Label>
               <Select value={type} onValueChange={(v) => onTypeChange(v as TransportType)}>
-                <SelectTrigger id="mcp-type">
+                <SelectTrigger className="w-full [&>span]:truncate" id="mcp-type">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1109,7 +1104,7 @@ function McpServerDialog({
                 </SelectContent>
               </Select>
             </div>
-            <div className="grid content-start gap-2">
+            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-2">
               <Label htmlFor="mcp-scope">{t('common.scope')}</Label>
               <Select
                 value={scope}

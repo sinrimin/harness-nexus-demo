@@ -315,3 +315,76 @@ describe('native sub-agent rows (#71)', () => {
     ).toBe(true);
   });
 });
+
+describe('fold history ingestion (#95: session config survives a row rebuild)', () => {
+  it('keeps the server approvals slice when a pre-#92 daemon batch re-emits config without it', () => {
+    const approvals = {
+      responder: 'manual' as const,
+      providerName: 'bailian-decision',
+      modelId: 'decision-model-preview',
+    };
+    let state = fold(createFoldState(), {
+      type: 'event',
+      event: { kind: 'session_config', approvals },
+    });
+    // Reattach: the server pushed approvals, then the daemon's resync batch
+    // re-emitted its own modes/configOptions — but an alpha.8 daemon never
+    // carries approvals, and history starts from a fresh row state.
+    state = fold(state, {
+      type: 'history',
+      items: [
+        { type: 'user', blocks: [{ type: 'text', text: 'Q0' }] },
+        {
+          type: 'event',
+          event: { kind: 'session_config', modes: { currentModeId: 'auto' } },
+        },
+        { type: 'event', event: { kind: 'message_delta', delta: 'reply' } },
+      ],
+    });
+    expect(state.config.approvals).toMatchObject(approvals);
+    expect(state.config.currentModeId).toBe('auto');
+  });
+});
+
+describe('delegated permission fallbacks (#104)', () => {
+  const request = {
+    kind: 'permission_request' as const,
+    requestId: 'perm-1',
+    toolCall: { toolCallId: 'tc-1', title: 'Bash(sleep 1)', kind: 'execute' },
+    options: [
+      { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+      { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+    ],
+  };
+
+  it('names the unavailable reason on the pending card, without settling it', () => {
+    let state = fold(createFoldState(), { type: 'event', event: request });
+    state = fold(state, {
+      type: 'event',
+      event: { kind: 'permission_escalated', requestId: 'perm-1', reason: 'timeout' },
+    });
+    expect(state.permissions).toHaveLength(1);
+    expect(state.permissions[0]?.settled).toBe(false);
+    expect(state.permissions[0]?.escalation).toEqual({ reason: 'timeout' });
+  });
+
+  it('a later human settle keeps the escalation note on the settled card', () => {
+    let state = fold(createFoldState(), { type: 'event', event: request });
+    state = fold(state, {
+      type: 'event',
+      event: { kind: 'permission_escalated', requestId: 'perm-1', reason: 'no-model' },
+    });
+    state = fold(state, {
+      type: 'event',
+      event: {
+        kind: 'permission_resolved',
+        requestId: 'perm-1',
+        outcome: 'selected',
+        optionId: 'allow_once',
+      },
+    });
+    expect(state.permissions[0]?.settled).toBe(true);
+    expect(state.permissions[0]?.escalation).toEqual({ reason: 'no-model' });
+    expect(state.permissions[0]?.resolution).toBeUndefined();
+  });
+});

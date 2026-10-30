@@ -29,7 +29,15 @@ import { PROVIDER_DEFAULT_BASE_URLS } from '@harness-nexus/shared';
 
 /** pi-ai api id per provider kind (the subpath modules' wire). */
 export type GatewayApi = 'anthropic-messages' | 'openai-completions' | 'openai-responses';
-export const PI_API_BY_KIND: Record<ProviderApiKind, GatewayApi> = {
+/**
+ * The CHAT kinds only — `systemone` (#92, the decision protocol) and
+ * `openai-embedding` (#95) have no chat wire, so the map deliberately
+ * excludes them; the type narrows to its chat-kind domain.
+ */
+export const PI_API_BY_KIND: Record<
+  Exclude<ProviderApiKind, 'systemone' | 'openai-embedding'>,
+  GatewayApi
+> = {
   anthropic: 'anthropic-messages',
   'openai-chat': 'openai-completions',
   'openai-responses': 'openai-responses',
@@ -64,7 +72,7 @@ export interface GatewayModel {
 }
 
 export function buildGatewayModel(input: {
-  kind: ProviderApiKind;
+  kind: Exclude<ProviderApiKind, 'systemone' | 'openai-embedding'>;
   /** null = the kind's official endpoint. */
   baseUrl: string | null;
   providerLabel: string;

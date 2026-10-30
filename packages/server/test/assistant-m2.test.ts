@@ -18,6 +18,9 @@ import type { AggregatedTool } from '@harness-nexus/mcp-runtime';
  * pool). Covers: config validation (visibility, skill kind/source rules),
  * the read_skill round trip, the MCP `<server>__<tool>` round trip, prompt
  * notes for unavailable servers/skills, and the toolset gate for MCP names.
+ * NOTE (#79): the configs below set permissionMode 'autoWrite' — pooled MCP
+ * tools classify as write (the conservative default), and these tests
+ * exercise WIRING, not the approval gate.
  */
 
 const KEY = 'test-secret-0123456789abcdef';
@@ -77,12 +80,12 @@ async function setup(): Promise<Harness> {
   await uow.llmProviders.save({
     id: 'prov-1',
     name: 'Gateway',
-    api: 'openai-chat',
+    apis: [{ kind: 'openai-chat', path: null }],
     baseUrl: 'https://gw.example.com/v1',
     credentialName: 'gw-key',
     scope: 'personal',
     ownerId: owner.userId,
-    models: [{ id: 'gw-large', type: 'chat' }],
+    models: [{ id: 'gw-large', apiKind: 'openai-chat' }],
     createdAt: now,
     updatedAt: now,
   });
@@ -215,6 +218,7 @@ describe('#52 M2 — config validation (visibility, skill rules)', () => {
       name: 'Ops',
       providerId: 'prov-1',
       defaultModel: 'gw-large',
+      permissionMode: 'autoWrite',
       mcpServerIds: ['mcp-live', 'mcp-client'],
       skillResourceIds: ['skill-live'],
     });
@@ -249,6 +253,7 @@ describe('#52 M2 — read_skill + MCP tools in the live turn', () => {
       name: 'Ops',
       providerId: 'prov-1',
       defaultModel: 'gw-large',
+      permissionMode: 'autoWrite',
       enabledToolGroups: ['system'],
       mcpServerIds: ['mcp-live', 'mcp-client'],
       skillResourceIds: ['skill-live'],
@@ -286,6 +291,7 @@ describe('#52 M2 — read_skill + MCP tools in the live turn', () => {
       name: 'Ops',
       providerId: 'prov-1',
       defaultModel: 'gw-large',
+      permissionMode: 'autoWrite',
       enabledToolGroups: ['system'],
       mcpServerIds: ['mcp-client'],
       skillResourceIds: ['skill-live'],
@@ -316,6 +322,7 @@ describe('#52 M2 — read_skill + MCP tools in the live turn', () => {
       name: 'Ops',
       providerId: 'prov-1',
       defaultModel: 'gw-large',
+      permissionMode: 'autoWrite',
       skillResourceIds: ['skill-live'],
     });
     h.faux.setResponses([

@@ -19,6 +19,8 @@ import type {
   AssistantConfig,
   AssistantMessageRow,
   AssistantRepository,
+  ApiToolRepository,
+  ApiToolService,
   AssistantSession,
   Machine,
   MachineInventorySnapshot,
@@ -34,14 +36,25 @@ import type {
   LlmProviderRepository,
   UserRepository,
   PersonalAccessTokenRepository,
+  SystemSettings,
   SystemSettingsRepository,
   McpServerRepository,
+  Note,
+  NoteAnnotation,
+  NoteAnnotationRepository,
+  NoteCategory,
+  NoteCategoryRepository,
+  NoteRepository,
+  NoteVersion,
+  DecisionRecord,
+  DecisionRecordListFilter,
+  DecisionRecordRepository,
   CredentialRepository,
   ProfileRepository,
   ResourceRepository,
   MachineRepository,
 } from '@harness-nexus/core';
-import { DEFAULT_SYSTEM_SETTINGS as DEFAULTS } from '@harness-nexus/core';
+import { DEFAULT_SYSTEM_SETTINGS as DEFAULTS, DECISION_RECORDS_CAP } from '@harness-nexus/core';
 
 // ---- row shapes ----
 interface UserRow {
@@ -51,6 +64,8 @@ interface UserRow {
   password_hash: string | null;
   role: string;
   status: string;
+  /** #95 — JSON of UserDefaultModels; NULL on pre-feature rows. */
+  default_models: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -69,6 +84,8 @@ interface SettingsRow {
   id: number;
   allow_registration: number;
   image_retention_days: number;
+  api_tool_outbound: string | null;
+  api_tool_outbound_rules: string | null;
   updated_at: string;
 }
 interface CredentialRow {
@@ -130,6 +147,9 @@ const mapUser = (r: UserRow): User => ({
   passwordHash: r.password_hash,
   role: r.role as Role,
   status: r.status as User['status'],
+  ...(r.default_models
+    ? { defaultModels: JSON.parse(r.default_models) as User['defaultModels'] }
+    : {}),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -242,15 +262,16 @@ export function sqliteUserRepository(db: Database): UserRepository {
     },
     async save(user) {
       db.prepare(
-        `INSERT INTO users (id, username, email, password_hash, role, status, created_at, updated_at)
-         VALUES (@id, @username, @email, @password_hash, @role, @status, @created_at, @updated_at)
+        `INSERT INTO users (id, username, email, password_hash, role, status, default_models, created_at, updated_at)
+         VALUES (@id, @username, @email, @password_hash, @role, @status, @default_models, @created_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
-           username      = excluded.username,
-           email         = excluded.email,
-           password_hash = excluded.password_hash,
-           role          = excluded.role,
-           status        = excluded.status,
-           updated_at    = excluded.updated_at`,
+           username        = excluded.username,
+           email           = excluded.email,
+           password_hash   = excluded.password_hash,
+           role            = excluded.role,
+           status          = excluded.status,
+           default_models  = excluded.default_models,
+           updated_at      = excluded.updated_at`,
       ).run({
         id: user.id,
         username: user.username,
@@ -258,6 +279,7 @@ export function sqliteUserRepository(db: Database): UserRepository {
         password_hash: user.passwordHash,
         role: user.role,
         status: user.status,
+        default_models: user.defaultModels ? JSON.stringify(user.defaultModels) : null,
         created_at: user.createdAt,
         updated_at: user.updatedAt,
       });
@@ -333,9 +355,15 @@ export function sqliteSettingsRepository(db: Database): SystemSettingsRepository
     if (existing) return existing;
     const now = new Date().toISOString();
     db.prepare(
-      `INSERT INTO system_settings (id, allow_registration, image_retention_days, updated_at)
-       VALUES (1, ?, ?, ?)`,
-    ).run(DEFAULTS.allowRegistration ? 1 : 0, DEFAULTS.imageRetentionDays, now);
+      `INSERT INTO system_settings (id, allow_registration, image_retention_days, api_tool_outbound, api_tool_outbound_rules, updated_at)
+       VALUES (1, ?, ?, ?, ?, ?)`,
+    ).run(
+      DEFAULTS.allowRegistration ? 1 : 0,
+      DEFAULTS.imageRetentionDays,
+      DEFAULTS.apiToolOutbound,
+      JSON.stringify(DEFAULTS.apiToolOutboundRules),
+      now,
+    );
     return db.prepare('SELECT * FROM system_settings WHERE id = 1').get() as SettingsRow;
   };
 
@@ -345,6 +373,12 @@ export function sqliteSettingsRepository(db: Database): SystemSettingsRepository
       return {
         allowRegistration: row.allow_registration === 1,
         imageRetentionDays: row.image_retention_days,
+        // #85 — pre-v28 rows (and any null) read as the allow default.
+        apiToolOutbound: row.api_tool_outbound === 'deny' ? 'deny' : 'allow',
+        apiToolOutboundRules:
+          row.api_tool_outbound_rules === null || row.api_tool_outbound_rules === '{}'
+            ? { external: [], internal: [] }
+            : (JSON.parse(row.api_tool_outbound_rules) as SystemSettings['apiToolOutboundRules']),
         updatedAt: row.updated_at,
       };
     },
@@ -353,12 +387,20 @@ export function sqliteSettingsRepository(db: Database): SystemSettingsRepository
       const now = settings.updatedAt;
       db.prepare(
         `UPDATE system_settings
-         SET allow_registration = ?, image_retention_days = ?, updated_at = ?
+         SET allow_registration = ?, image_retention_days = ?, api_tool_outbound = ?, api_tool_outbound_rules = ?, updated_at = ?
          WHERE id = 1`,
-      ).run(settings.allowRegistration ? 1 : 0, settings.imageRetentionDays, now);
+      ).run(
+        settings.allowRegistration ? 1 : 0,
+        settings.imageRetentionDays,
+        settings.apiToolOutbound ?? 'allow',
+        JSON.stringify(settings.apiToolOutboundRules ?? { external: [], internal: [] }),
+        now,
+      );
       return {
         allowRegistration: settings.allowRegistration,
         imageRetentionDays: settings.imageRetentionDays,
+        apiToolOutbound: settings.apiToolOutbound ?? 'allow',
+        apiToolOutboundRules: settings.apiToolOutboundRules ?? { external: [], internal: [] },
         updatedAt: now,
       };
     },
@@ -670,6 +712,8 @@ interface MachineRow {
   chat_prewarm: string | null;
   /** Issue #49 — JSON per-target default-mode map, NULL on pre-feature rows. */
   chat_default_mode: string | null;
+  /** Issue #92 — JSON delegated-approvals config, NULL on pre-feature rows. */
+  chat_approvals: string | null;
   enrollment_pat_id: string;
   enrolled_at: string;
   last_seen_at: string | null;
@@ -711,9 +755,29 @@ function parseMachineDefaultMode(raw: string | null): Machine['chatDefaultMode']
   return undefined;
 }
 
+/** JSON column ↔ domain; invalid/legacy JSON null-normalizes (manual default). */
+function parseMachineApprovals(raw: string | null): Machine['chatApprovals'] | undefined {
+  if (raw === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      (typeof (parsed as Record<string, unknown>)['responder'] === 'string' ||
+        typeof (parsed as Record<string, unknown>)['providerId'] === 'string')
+    ) {
+      return parsed as Machine['chatApprovals'];
+    }
+  } catch {
+    // fall through
+  }
+  return undefined;
+}
+
 function mapMachine(row: MachineRow): Machine {
   const chatPrewarm = parseMachinePrewarm(row.chat_prewarm);
   const chatDefaultMode = parseMachineDefaultMode(row.chat_default_mode);
+  const chatApprovals = parseMachineApprovals(row.chat_approvals);
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -727,6 +791,7 @@ function mapMachine(row: MachineRow): Machine {
     baseWorkspace: row.base_workspace,
     ...(chatPrewarm !== undefined ? { chatPrewarm } : {}),
     ...(chatDefaultMode !== undefined ? { chatDefaultMode } : {}),
+    ...(chatApprovals !== undefined ? { chatApprovals } : {}),
     enrollmentPatId: row.enrollment_pat_id,
     enrolledAt: row.enrolled_at,
     lastSeenAt: row.last_seen_at,
@@ -763,10 +828,10 @@ export function sqliteMachineRepository(db: Database): MachineRepository {
         `INSERT INTO machines
            (id, owner_id, name, hostname, os, arch, daemon_version, capabilities,
             remote_chat_enabled, base_workspace, chat_prewarm, chat_default_mode,
-            enrollment_pat_id, enrolled_at, last_seen_at)
+            chat_approvals, enrollment_pat_id, enrolled_at, last_seen_at)
          VALUES (@id, @owner_id, @name, @hostname, @os, @arch, @daemon_version, @capabilities,
                  @remote_chat_enabled, @base_workspace, @chat_prewarm, @chat_default_mode,
-                 @enrollment_pat_id, @enrolled_at, @last_seen_at)
+                 @chat_approvals, @enrollment_pat_id, @enrolled_at, @last_seen_at)
          ON CONFLICT(id) DO UPDATE SET
            name                = excluded.name,
            hostname            = excluded.hostname,
@@ -778,6 +843,7 @@ export function sqliteMachineRepository(db: Database): MachineRepository {
            base_workspace      = excluded.base_workspace,
            chat_prewarm        = excluded.chat_prewarm,
            chat_default_mode   = excluded.chat_default_mode,
+           chat_approvals      = excluded.chat_approvals,
            last_seen_at        = excluded.last_seen_at`,
       ).run({
         id: machine.id,
@@ -794,6 +860,8 @@ export function sqliteMachineRepository(db: Database): MachineRepository {
           machine.chatPrewarm === undefined ? null : JSON.stringify(machine.chatPrewarm),
         chat_default_mode:
           machine.chatDefaultMode === undefined ? null : JSON.stringify(machine.chatDefaultMode),
+        chat_approvals:
+          machine.chatApprovals === undefined ? null : JSON.stringify(machine.chatApprovals),
         enrollment_pat_id: machine.enrollmentPatId,
         enrolled_at: machine.enrolledAt,
         last_seen_at: machine.lastSeenAt,
@@ -1133,7 +1201,8 @@ export function sqliteRuntimeConfigRepository(db: Database): RuntimeConfigReposi
 interface LlmProviderRow {
   id: string;
   name: string;
-  api: string;
+  /** #95 — JSON of ProviderApiEndpoint[] (was the single `api` TEXT pre-v32). */
+  apis: string;
   base_url: string | null;
   credential_name: string;
   scope: string;
@@ -1147,7 +1216,7 @@ interface LlmProviderRow {
 const mapLlmProvider = (r: LlmProviderRow): LlmProvider => ({
   id: r.id,
   name: r.name,
-  api: r.api as LlmProvider['api'],
+  apis: JSON.parse(r.apis) as LlmProvider['apis'],
   baseUrl: r.base_url,
   credentialName: r.credential_name,
   scope: r.scope as LlmProvider['scope'],
@@ -1192,11 +1261,11 @@ export function sqliteLlmProviderRepository(db: Database): LlmProviderRepository
     async save(provider) {
       db.prepare(
         `INSERT INTO llm_providers
-           (id, name, api, base_url, credential_name, scope, owner_id, models, created_at, updated_at)
-         VALUES (@id, @name, @api, @base_url, @credential_name, @scope, @owner_id, @models, @created_at, @updated_at)
+           (id, name, apis, base_url, credential_name, scope, owner_id, models, created_at, updated_at)
+         VALUES (@id, @name, @apis, @base_url, @credential_name, @scope, @owner_id, @models, @created_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            name            = excluded.name,
-           api             = excluded.api,
+           apis            = excluded.apis,
            base_url        = excluded.base_url,
            credential_name = excluded.credential_name,
            models          = excluded.models,
@@ -1204,7 +1273,7 @@ export function sqliteLlmProviderRepository(db: Database): LlmProviderRepository
       ).run({
         id: provider.id,
         name: provider.name,
-        api: provider.api,
+        apis: JSON.stringify(provider.apis),
         base_url: provider.baseUrl,
         credential_name: provider.credentialName,
         scope: provider.scope,
@@ -1231,6 +1300,8 @@ interface AssistantConfigRow {
   provider_id: string;
   default_model: string;
   system_prompt_override: string | null;
+  permission_mode: string;
+  api_tool_service_ids: string | null;
   enabled_tool_groups: string;
   mcp_server_ids: string | null;
   skill_resource_ids: string | null;
@@ -1248,6 +1319,8 @@ interface AssistantSessionRow {
   created_at: string;
   updated_at: string;
   last_message_at: string | null;
+  /** #79 — NULL on pre-v27 rows (the config default applies at open). */
+  permission_mode: string | null;
 }
 
 interface AssistantMessageRow_ {
@@ -1278,6 +1351,14 @@ function mapAssistantConfig(r: AssistantConfigRow): AssistantConfig {
     ...(r.system_prompt_override !== null
       ? { systemPromptOverride: r.system_prompt_override }
       : {}),
+    permissionMode:
+      r.permission_mode === 'autoWrite'
+        ? 'autoWrite'
+        : r.permission_mode === 'delegated'
+          ? 'delegated'
+          : 'prompt',
+    apiToolServiceIds:
+      r.api_tool_service_ids === null ? [] : (JSON.parse(r.api_tool_service_ids) as string[]),
     enabledToolGroups: JSON.parse(r.enabled_tool_groups) as AssistantConfig['enabledToolGroups'],
     mcpServerIds: r.mcp_server_ids === null ? [] : (JSON.parse(r.mcp_server_ids) as string[]),
     skillResourceIds:
@@ -1289,6 +1370,97 @@ function mapAssistantConfig(r: AssistantConfigRow): AssistantConfig {
   };
 }
 
+interface ApiToolRow {
+  id: string;
+  scope: string;
+  owner_id: string | null;
+  name: string;
+  bundle: string;
+  deleted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapApiToolService(r: ApiToolRow): ApiToolService {
+  const bundle = JSON.parse(r.bundle) as Omit<
+    ApiToolService,
+    'id' | 'scope' | 'ownerId' | 'createdAt' | 'updatedAt' | 'deletedAt'
+  >;
+  return {
+    id: r.id,
+    scope: r.scope === 'global' ? 'global' : 'personal',
+    ownerId: r.owner_id,
+    ...bundle,
+    ...(r.deleted_at !== null ? { deletedAt: r.deleted_at } : {}),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+export function sqliteApiToolRepository(db: Database): ApiToolRepository {
+  const repo: ApiToolRepository = {
+    async findById(id) {
+      const row = db.prepare('SELECT * FROM api_tool_services WHERE id = ?').get(id) as
+        ApiToolRow | undefined;
+      return row ? mapApiToolService(row) : null;
+    },
+    async list(filter) {
+      const conds: string[] = [];
+      const args: (string | null)[] = [];
+      if (filter?.includeDeleted !== true) conds.push('deleted_at IS NULL');
+      if (filter?.scope !== undefined) {
+        conds.push('scope = ?');
+        args.push(filter.scope);
+      }
+      if (filter?.ownerId !== undefined) {
+        conds.push('owner_id = ?');
+        args.push(filter.ownerId);
+      }
+      const where = conds.length > 0 ? 'WHERE ' + conds.join(' AND ') : '';
+      const rows = db
+        .prepare('SELECT * FROM api_tool_services ' + where + ' ORDER BY created_at')
+        .all(...args) as ApiToolRow[];
+      return rows.map(mapApiToolService);
+    },
+    async save(service) {
+      const bundle = JSON.stringify({
+        name: service.name,
+        ...(service.description !== undefined ? { description: service.description } : {}),
+        baseUrl: service.baseUrl,
+        headers: service.headers,
+        ...(service.auth !== undefined ? { auth: service.auth } : {}),
+        tools: service.tools,
+      });
+      db.prepare(
+        `INSERT INTO api_tool_services
+         (id, scope, owner_id, name, bundle, deleted_at, created_at, updated_at)
+         VALUES (@id, @scope, @owner_id, @name, @bundle, @deleted_at, @created_at, @updated_at)
+         ON CONFLICT(id) DO UPDATE SET
+           scope = excluded.scope,
+           owner_id = excluded.owner_id,
+           name = excluded.name,
+           bundle = excluded.bundle,
+           deleted_at = excluded.deleted_at,
+           updated_at = excluded.updated_at`,
+      ).run({
+        id: service.id,
+        scope: service.scope,
+        owner_id: service.ownerId,
+        name: service.name,
+        bundle,
+        deleted_at: service.deletedAt ?? null,
+        created_at: service.createdAt,
+        updated_at: service.updatedAt,
+      });
+      return service;
+    },
+    async delete(id) {
+      db.prepare('DELETE FROM api_tool_services WHERE id = ?').run(id);
+    },
+  };
+  return repo;
+}
+
 function mapAssistantSession(r: AssistantSessionRow): AssistantSession {
   return {
     id: r.id,
@@ -1298,6 +1470,14 @@ function mapAssistantSession(r: AssistantSessionRow): AssistantSession {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     lastMessageAt: r.last_message_at,
+    permissionMode:
+      r.permission_mode === 'prompt'
+        ? 'prompt'
+        : r.permission_mode === 'autoWrite'
+          ? 'autoWrite'
+          : r.permission_mode === 'delegated'
+            ? 'delegated'
+            : undefined,
   };
 }
 
@@ -1328,10 +1508,10 @@ export function sqliteAssistantRepository(db: Database): AssistantRepository {
       db.prepare(
         `INSERT INTO assistant_configs
            (id, owner_id, name, description, provider_id, default_model,
-            system_prompt_override, enabled_tool_groups, mcp_server_ids, skill_resource_ids,
+            system_prompt_override, permission_mode, api_tool_service_ids, enabled_tool_groups, mcp_server_ids, skill_resource_ids,
             daily_token_budget, deleted_at, created_at, updated_at)
          VALUES (@id, @owner_id, @name, @description, @provider_id, @default_model,
-                 @system_prompt_override, @enabled_tool_groups, @mcp_server_ids, @skill_resource_ids,
+                 @system_prompt_override, @permission_mode, @api_tool_service_ids, @enabled_tool_groups, @mcp_server_ids, @skill_resource_ids,
                  @daily_token_budget, @deleted_at, @created_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            name                   = excluded.name,
@@ -1339,6 +1519,8 @@ export function sqliteAssistantRepository(db: Database): AssistantRepository {
            provider_id            = excluded.provider_id,
            default_model          = excluded.default_model,
            system_prompt_override = excluded.system_prompt_override,
+           permission_mode        = excluded.permission_mode,
+           api_tool_service_ids   = excluded.api_tool_service_ids,
            enabled_tool_groups    = excluded.enabled_tool_groups,
            mcp_server_ids         = excluded.mcp_server_ids,
            skill_resource_ids     = excluded.skill_resource_ids,
@@ -1353,6 +1535,8 @@ export function sqliteAssistantRepository(db: Database): AssistantRepository {
         provider_id: config.providerId,
         default_model: config.defaultModel,
         system_prompt_override: config.systemPromptOverride ?? null,
+        permission_mode: config.permissionMode ?? 'prompt',
+        api_tool_service_ids: JSON.stringify(config.apiToolServiceIds ?? []),
         enabled_tool_groups: JSON.stringify(config.enabledToolGroups),
         mcp_server_ids: JSON.stringify(config.mcpServerIds ?? []),
         skill_resource_ids: JSON.stringify(config.skillResourceIds ?? []),
@@ -1393,12 +1577,15 @@ export function sqliteAssistantRepository(db: Database): AssistantRepository {
     async saveSession(session) {
       db.prepare(
         `INSERT INTO assistant_sessions
-           (id, owner_id, assistant_id, title, created_at, updated_at, last_message_at)
-         VALUES (@id, @owner_id, @assistant_id, @title, @created_at, @updated_at, @last_message_at)
+           (id, owner_id, assistant_id, title, created_at, updated_at, last_message_at,
+            permission_mode)
+         VALUES (@id, @owner_id, @assistant_id, @title, @created_at, @updated_at,
+                 @last_message_at, @permission_mode)
          ON CONFLICT(id) DO UPDATE SET
            title           = excluded.title,
            updated_at      = excluded.updated_at,
-           last_message_at = excluded.last_message_at`,
+           last_message_at = excluded.last_message_at,
+           permission_mode = excluded.permission_mode`,
       ).run({
         id: session.id,
         owner_id: session.ownerId,
@@ -1407,6 +1594,7 @@ export function sqliteAssistantRepository(db: Database): AssistantRepository {
         created_at: session.createdAt,
         updated_at: session.updatedAt,
         last_message_at: session.lastMessageAt,
+        permission_mode: session.permissionMode ?? null,
       });
       return session;
     },
@@ -1467,4 +1655,502 @@ export function sqliteAssistantRepository(db: Database): AssistantRepository {
       }));
     },
   };
+}
+
+// ---- #88 — notes -----------------------------------------------------------------
+
+interface NoteRow {
+  id: string;
+  owner_id: string;
+  title: string;
+  summary: string | null;
+  content_md: string;
+  content_version: number;
+  category_id: string | null;
+  tags: string;
+  status: string;
+  visibility: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapNote(r: NoteRow): Note {
+  return {
+    id: r.id,
+    ownerId: r.owner_id,
+    title: r.title,
+    summary: r.summary,
+    contentMd: r.content_md,
+    contentVersion: r.content_version,
+    categoryId: r.category_id,
+    tags: JSON.parse(r.tags) as string[],
+    status: r.status as Note['status'],
+    visibility: r.visibility as Note['visibility'],
+    source: JSON.parse(r.source) as Note['source'],
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+export function sqliteNoteRepository(db: Database): NoteRepository {
+  const repo: NoteRepository = {
+    async findById(id) {
+      const row = db.prepare('SELECT * FROM notes WHERE id = ?').get(id) as NoteRow | undefined;
+      return row ? mapNote(row) : null;
+    },
+    async list(filter) {
+      const conds: string[] = [];
+      const args: (string | number | null)[] = [];
+      if (filter?.ownerId !== undefined) {
+        conds.push('owner_id = ?');
+        args.push(filter.ownerId);
+      }
+      if (filter?.categoryId !== undefined) {
+        conds.push('category_id = ?');
+        args.push(filter.categoryId);
+      }
+      if (filter?.status !== undefined) {
+        conds.push('status = ?');
+        args.push(filter.status);
+      }
+      if (filter?.visibility !== undefined) {
+        conds.push('visibility = ?');
+        args.push(filter.visibility);
+      }
+      if (filter?.tag !== undefined) {
+        conds.push('EXISTS (SELECT 1 FROM json_each(notes.tags) je WHERE je.value = ?)');
+        args.push(filter.tag);
+      }
+      if (filter?.search !== undefined) {
+        const like = `%${filter.search.toLowerCase()}%`;
+        conds.push(
+          "(LOWER(title) LIKE ? OR LOWER(COALESCE(summary, '')) LIKE ? OR LOWER(content_md) LIKE ?)",
+        );
+        args.push(like, like, like);
+      }
+      const where = conds.length > 0 ? 'WHERE ' + conds.join(' AND ') : '';
+      const limit = filter?.limit ?? -1;
+      const offset = filter?.offset ?? 0;
+      const rows = db
+        .prepare(
+          'SELECT * FROM notes ' + where + ' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+        )
+        .all(...args, limit, offset) as NoteRow[];
+      return rows.map(mapNote);
+    },
+    async listPublic(filter) {
+      const conds = ['visibility = ?'];
+      const args: (string | number)[] = ['public'];
+      if (filter?.tag !== undefined) {
+        conds.push('EXISTS (SELECT 1 FROM json_each(notes.tags) je WHERE je.value = ?)');
+        args.push(filter.tag);
+      }
+      if (filter?.search !== undefined) {
+        const like = `%${filter.search.toLowerCase()}%`;
+        conds.push(
+          "(LOWER(title) LIKE ? OR LOWER(COALESCE(summary, '')) LIKE ? OR LOWER(content_md) LIKE ?)",
+        );
+        args.push(like, like, like);
+      }
+      const limit = filter?.limit ?? -1;
+      const offset = filter?.offset ?? 0;
+      const rows = db
+        .prepare(
+          'SELECT * FROM notes WHERE ' +
+            conds.join(' AND ') +
+            ' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+        )
+        .all(...args, limit, offset) as NoteRow[];
+      return rows.map(mapNote);
+    },
+    async save(note) {
+      db.prepare(
+        `INSERT INTO notes
+         (id, owner_id, title, summary, content_md, content_version, category_id, tags,
+          status, visibility, source, created_at, updated_at)
+         VALUES (@id, @owner_id, @title, @summary, @content_md, @content_version, @category_id,
+                 @tags, @status, @visibility, @source, @created_at, @updated_at)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           summary = excluded.summary,
+           content_md = excluded.content_md,
+           content_version = excluded.content_version,
+           category_id = excluded.category_id,
+           tags = excluded.tags,
+           status = excluded.status,
+           visibility = excluded.visibility,
+           source = excluded.source,
+           updated_at = excluded.updated_at`,
+      ).run({
+        id: note.id,
+        owner_id: note.ownerId,
+        title: note.title,
+        summary: note.summary,
+        content_md: note.contentMd,
+        content_version: note.contentVersion,
+        category_id: note.categoryId,
+        tags: JSON.stringify(note.tags),
+        status: note.status,
+        visibility: note.visibility,
+        source: JSON.stringify(note.source),
+        created_at: note.createdAt,
+        updated_at: note.updatedAt,
+      });
+      return note;
+    },
+    async saveVersion(version: NoteVersion) {
+      db.prepare(
+        `INSERT INTO note_versions (note_id, version, content_md, created_at)
+         VALUES (@note_id, @version, @content_md, @created_at)
+         ON CONFLICT(note_id, version) DO NOTHING`,
+      ).run({
+        note_id: version.noteId,
+        version: version.version,
+        content_md: version.contentMd,
+        created_at: version.createdAt,
+      });
+    },
+    async findVersion(noteId, version) {
+      const row = db
+        .prepare('SELECT * FROM note_versions WHERE note_id = ? AND version = ?')
+        .get(noteId, version) as
+        { note_id: string; version: number; content_md: string; created_at: string } | undefined;
+      return row
+        ? {
+            noteId: row.note_id,
+            version: row.version,
+            contentMd: row.content_md,
+            createdAt: row.created_at,
+          }
+        : null;
+    },
+    async delete(id) {
+      db.prepare('DELETE FROM notes WHERE id = ?').run(id);
+    },
+  };
+  return repo;
+}
+
+interface NoteAnnotationRow {
+  id: string;
+  note_id: string;
+  note_version: number;
+  quote: string;
+  context_prefix: string;
+  context_suffix: string;
+  comment: string;
+  state: string;
+  author_id: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+function mapNoteAnnotation(r: NoteAnnotationRow): NoteAnnotation {
+  return {
+    id: r.id,
+    noteId: r.note_id,
+    noteVersion: r.note_version,
+    quote: r.quote,
+    contextPrefix: r.context_prefix,
+    contextSuffix: r.context_suffix,
+    comment: r.comment,
+    state: r.state === 'done' ? 'done' : 'open',
+    authorId: r.author_id,
+    createdAt: r.created_at,
+    resolvedAt: r.resolved_at,
+  };
+}
+
+export function sqliteNoteAnnotationRepository(db: Database): NoteAnnotationRepository {
+  const repo: NoteAnnotationRepository = {
+    async findById(id) {
+      const row = db.prepare('SELECT * FROM note_annotations WHERE id = ?').get(id) as
+        NoteAnnotationRow | undefined;
+      return row ? mapNoteAnnotation(row) : null;
+    },
+    async listByNote(noteId) {
+      const rows = db
+        .prepare('SELECT * FROM note_annotations WHERE note_id = ? ORDER BY created_at, id')
+        .all(noteId) as NoteAnnotationRow[];
+      return rows.map(mapNoteAnnotation);
+    },
+    async countsByOwner(ownerId) {
+      const rows = db
+        .prepare(
+          `SELECT note_id AS noteId, COUNT(*) AS total,
+                  SUM(CASE WHEN state = 'open' THEN 1 ELSE 0 END) AS open
+           FROM note_annotations WHERE author_id = ? GROUP BY note_id`,
+        )
+        .all(ownerId) as { noteId: string; total: number; open: number | null }[];
+      const counts: Record<string, { total: number; open: number }> = {};
+      for (const r of rows) counts[r.noteId] = { total: r.total, open: r.open ?? 0 };
+      return counts;
+    },
+    async save(annotation) {
+      db.prepare(
+        `INSERT INTO note_annotations
+         (id, note_id, note_version, quote, context_prefix, context_suffix, comment, state,
+          author_id, created_at, resolved_at)
+         VALUES (@id, @note_id, @note_version, @quote, @context_prefix, @context_suffix,
+                 @comment, @state, @author_id, @created_at, @resolved_at)
+         ON CONFLICT(id) DO UPDATE SET
+           quote = excluded.quote,
+           context_prefix = excluded.context_prefix,
+           context_suffix = excluded.context_suffix,
+           comment = excluded.comment,
+           state = excluded.state,
+           resolved_at = excluded.resolved_at`,
+      ).run({
+        id: annotation.id,
+        note_id: annotation.noteId,
+        note_version: annotation.noteVersion,
+        quote: annotation.quote,
+        context_prefix: annotation.contextPrefix,
+        context_suffix: annotation.contextSuffix,
+        comment: annotation.comment,
+        state: annotation.state,
+        author_id: annotation.authorId,
+        created_at: annotation.createdAt,
+        resolved_at: annotation.resolvedAt,
+      });
+      return annotation;
+    },
+    async delete(id) {
+      db.prepare('DELETE FROM note_annotations WHERE id = ?').run(id);
+    },
+  };
+  return repo;
+}
+
+interface NoteCategoryRow {
+  id: string;
+  owner_id: string;
+  parent_id: string | null;
+  name: string;
+  created_at: string;
+}
+
+function mapNoteCategory(r: NoteCategoryRow): NoteCategory {
+  return {
+    id: r.id,
+    ownerId: r.owner_id,
+    parentId: r.parent_id,
+    name: r.name,
+    createdAt: r.created_at,
+  };
+}
+
+export function sqliteNoteCategoryRepository(db: Database): NoteCategoryRepository {
+  const repo: NoteCategoryRepository = {
+    async findById(id) {
+      const row = db.prepare('SELECT * FROM note_categories WHERE id = ?').get(id) as
+        NoteCategoryRow | undefined;
+      return row ? mapNoteCategory(row) : null;
+    },
+    async listByOwner(ownerId) {
+      const rows = db
+        .prepare('SELECT * FROM note_categories WHERE owner_id = ? ORDER BY created_at, id')
+        .all(ownerId) as NoteCategoryRow[];
+      return rows.map(mapNoteCategory);
+    },
+    async findByParentAndName(ownerId, parentId, name) {
+      const row = db
+        .prepare('SELECT * FROM note_categories WHERE owner_id = ? AND parent_id IS ? AND name = ?')
+        .get(ownerId, parentId, name) as NoteCategoryRow | undefined;
+      return row ? mapNoteCategory(row) : null;
+    },
+    async save(category) {
+      db.prepare(
+        `INSERT INTO note_categories (id, owner_id, parent_id, name, created_at)
+         VALUES (@id, @owner_id, @parent_id, @name, @created_at)
+         ON CONFLICT(id) DO UPDATE SET
+           parent_id = excluded.parent_id,
+           name = excluded.name`,
+      ).run({
+        id: category.id,
+        owner_id: category.ownerId,
+        parent_id: category.parentId,
+        name: category.name,
+        created_at: category.createdAt,
+      });
+      return category;
+    },
+    async delete(id) {
+      // Port contract: children fall to the deleted node's parent, its notes
+      // fall to uncategorized — one transaction, no orphans.
+      const node = db.prepare('SELECT * FROM note_categories WHERE id = ?').get(id) as
+        NoteCategoryRow | undefined;
+      if (!node) return;
+      db.transaction(() => {
+        db.prepare('UPDATE note_categories SET parent_id = ? WHERE parent_id = ?').run(
+          node.parent_id,
+          id,
+        );
+        db.prepare('UPDATE notes SET category_id = NULL WHERE category_id = ?').run(id);
+        db.prepare('DELETE FROM note_categories WHERE id = ?').run(id);
+      })();
+    },
+  };
+  return repo;
+}
+
+// ---- #97 — delegated-decision audit ----------------------------------------------
+
+interface DecisionRecordRow {
+  id: string;
+  owner_id: string;
+  created_at: string;
+  axis: string;
+  machine_id: string | null;
+  session_id: string | null;
+  request_id: string | null;
+  target: string | null;
+  tool_title: string;
+  tool_kind: string | null;
+  tool_input_preview: string | null;
+  outcome: string;
+  decided_by: string;
+  severity: number | null;
+  intent: number | null;
+  why: string | null;
+  sev_confidence: number | null;
+  intent_confidence: number | null;
+  provider_name: string | null;
+  model_id: string | null;
+  latency_ms: number | null;
+  denial_reason: string | null;
+  human_response: string | null;
+}
+
+function decisionRecordOf(r: DecisionRecordRow): DecisionRecord {
+  return {
+    id: r.id,
+    ownerId: r.owner_id,
+    createdAt: r.created_at,
+    axis: r.axis as DecisionRecord['axis'],
+    ...(r.machine_id !== null ? { machineId: r.machine_id } : {}),
+    ...(r.session_id !== null ? { sessionId: r.session_id } : {}),
+    ...(r.request_id !== null ? { requestId: r.request_id } : {}),
+    ...(r.target !== null ? { target: r.target } : {}),
+    toolTitle: r.tool_title,
+    ...(r.tool_kind !== null ? { toolKind: r.tool_kind } : {}),
+    ...(r.tool_input_preview !== null ? { toolInputPreview: r.tool_input_preview } : {}),
+    outcome: r.outcome as DecisionRecord['outcome'],
+    decidedBy: r.decided_by as DecisionRecord['decidedBy'],
+    ...(r.severity !== null ? { severity: r.severity } : {}),
+    ...(r.intent !== null ? { intent: r.intent } : {}),
+    ...(r.why !== null ? { why: r.why as NonNullable<DecisionRecord['why']> } : {}),
+    ...(r.sev_confidence !== null ? { sevConfidence: r.sev_confidence } : {}),
+    ...(r.intent_confidence !== null ? { intentConfidence: r.intent_confidence } : {}),
+    ...(r.provider_name !== null ? { providerName: r.provider_name } : {}),
+    ...(r.model_id !== null ? { modelId: r.model_id } : {}),
+    ...(r.latency_ms !== null ? { latencyMs: r.latency_ms } : {}),
+    ...(r.denial_reason !== null
+      ? { denialReason: r.denial_reason as NonNullable<DecisionRecord['denialReason']> }
+      : {}),
+    ...(r.human_response !== null
+      ? { humanResponse: r.human_response as NonNullable<DecisionRecord['humanResponse']> }
+      : {}),
+  };
+}
+
+export function sqliteDecisionRecordRepository(db: Database): DecisionRecordRepository {
+  const insert = db.prepare(`
+    INSERT INTO decision_records (
+      id, owner_id, created_at, axis, machine_id, session_id, request_id, target,
+      tool_title, tool_kind, tool_input_preview, outcome, decided_by,
+      severity, intent, why, sev_confidence, intent_confidence,
+      provider_name, model_id, latency_ms, denial_reason, human_response
+    ) VALUES (
+      @id, @owner_id, @created_at, @axis, @machine_id, @session_id, @request_id, @target,
+      @tool_title, @tool_kind, @tool_input_preview, @outcome, @decided_by,
+      @severity, @intent, @why, @sev_confidence, @intent_confidence,
+      @provider_name, @model_id, @latency_ms, @denial_reason, @human_response
+    )`);
+  const countFor = db.prepare('SELECT COUNT(*) AS n FROM decision_records WHERE owner_id = ?');
+  const pruneTo = db.prepare(`
+    DELETE FROM decision_records WHERE owner_id = ? AND id NOT IN (
+      SELECT id FROM decision_records WHERE owner_id = ?
+      ORDER BY created_at DESC, rowid DESC LIMIT ?
+    )`);
+
+  const repo: DecisionRecordRepository = {
+    async append(record) {
+      // Insert + on-write prune share one transaction: the cap is a hard
+      // ceiling, never cap-plus-slack (a sweeper's softness), and the
+      // whole check is an indexed count + (usually empty) delete —
+      // sub-millisecond even before it leaves the settle hot path.
+      db.transaction(() => {
+        insert.run({
+          id: record.id,
+          owner_id: record.ownerId,
+          created_at: record.createdAt,
+          axis: record.axis,
+          machine_id: record.machineId ?? null,
+          session_id: record.sessionId ?? null,
+          request_id: record.requestId ?? null,
+          target: record.target ?? null,
+          tool_title: record.toolTitle,
+          tool_kind: record.toolKind ?? null,
+          tool_input_preview: record.toolInputPreview ?? null,
+          outcome: record.outcome,
+          decided_by: record.decidedBy,
+          severity: record.severity ?? null,
+          intent: record.intent ?? null,
+          why: record.why ?? null,
+          sev_confidence: record.sevConfidence ?? null,
+          intent_confidence: record.intentConfidence ?? null,
+          provider_name: record.providerName ?? null,
+          model_id: record.modelId ?? null,
+          latency_ms: record.latencyMs ?? null,
+          denial_reason: record.denialReason ?? null,
+          human_response: record.humanResponse ?? null,
+        });
+        const { n } = countFor.get(record.ownerId) as { n: number };
+        if (n > DECISION_RECORDS_CAP) {
+          pruneTo.run(record.ownerId, record.ownerId, DECISION_RECORDS_CAP);
+        }
+      })();
+    },
+    async list(filter: DecisionRecordListFilter) {
+      const clauses = ['owner_id = @ownerId'];
+      const params: Record<string, string | number> = { ownerId: filter.ownerId };
+      if (filter.sessionId !== undefined) {
+        clauses.push('session_id = @sessionId');
+        params.sessionId = filter.sessionId;
+      }
+      if (filter.machineId !== undefined) {
+        clauses.push('machine_id = @machineId');
+        params.machineId = filter.machineId;
+      }
+      if (filter.outcome !== undefined) {
+        clauses.push('outcome = @outcome');
+        params.outcome = filter.outcome;
+      }
+      if (filter.before !== undefined) {
+        clauses.push('created_at < @before');
+        params.before = filter.before;
+      }
+      const rows = db
+        .prepare(
+          `SELECT * FROM decision_records WHERE ${clauses.join(' AND ')}
+           ORDER BY created_at DESC, rowid DESC LIMIT @limit`,
+        )
+        .all({ ...params, limit: filter.limit ?? 50 }) as DecisionRecordRow[];
+      return rows.map(decisionRecordOf);
+    },
+    async markHumanResponse(ownerId, sessionId, requestId, response) {
+      // First answer wins (human_response IS NULL guard): a re-answered or
+      // watchdog-then-human card must not rewrite the recorded pair.
+      const res = db
+        .prepare(
+          `UPDATE decision_records SET human_response = ?
+           WHERE owner_id = ? AND session_id = ? AND request_id = ? AND human_response IS NULL`,
+        )
+        .run(response, ownerId, sessionId, requestId);
+      return res.changes > 0;
+    },
+  };
+  return repo;
 }

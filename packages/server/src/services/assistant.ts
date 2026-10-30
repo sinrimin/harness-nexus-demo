@@ -13,6 +13,8 @@ import {
   DEFAULT_ASSISTANT_TOOL_GROUPS,
   type AssistantConfigCreateInput,
   type AssistantConfigUpdateInput,
+  isChatApiKind,
+  type ProviderApiKind,
 } from '@harness-nexus/shared';
 import { generateId } from '../infra/crypto.js';
 import type { Principal, ServiceDeps } from './principal.js';
@@ -36,16 +38,25 @@ async function requireVisibleProvider(deps: ServiceDeps, principal: Principal, p
   if (!provider || (provider.scope === 'personal' && provider.ownerId !== principal.userId)) {
     throw new AppError('Provider not found', 404, 'PROVIDER_NOT_FOUND');
   }
+  // #92/#95 — the assistant runs on chat WIRES: a row qualifies iff it
+  // enables at least one of them (a systemone/embedding-only row never does).
+  if (!provider.apis.some((a) => isChatApiKind(a.kind))) {
+    throw new AppError(
+      'Assistant configs require a provider with a chat api enabled',
+      409,
+      'ASSISTANT_PROVIDER_NOT_CHAT',
+    );
+  }
   return provider;
 }
 
-/** The default model must be a configured `type:'chat'` entry on that provider. */
+/** The default model must be a configured chat-kind entry on that provider. */
 function assertModelOnProvider(
   defaultModel: string,
-  models: { id: string; type: 'chat' | 'embedding' }[],
+  models: { id: string; apiKind: ProviderApiKind }[],
 ) {
   const model = models.find((m) => m.id === defaultModel);
-  if (model === undefined || model.type !== 'chat') {
+  if (model === undefined || !isChatApiKind(model.apiKind)) {
     throw new AppError(
       `Model "${defaultModel}" is not a configured chat model on this provider`,
       409,
@@ -82,6 +93,7 @@ export async function createAssistant(
     ...(input.systemPromptOverride !== undefined && input.systemPromptOverride !== ''
       ? { systemPromptOverride: input.systemPromptOverride }
       : {}),
+    permissionMode: input.permissionMode ?? 'prompt',
     // Route-parsed input always carries the zod default; direct callers
     // (tests, future in-process doors) may omit it — same default applies.
     enabledToolGroups: (input.enabledToolGroups as AssistantToolGroup[] | undefined) ?? [
@@ -89,6 +101,11 @@ export async function createAssistant(
     ],
     mcpServerIds: await visibleMcpServerIds(deps, principal, input.mcpServerIds ?? []),
     skillResourceIds: await readableSkillResourceIds(deps, principal, input.skillResourceIds ?? []),
+    apiToolServiceIds: await visibleApiToolServiceIds(
+      deps,
+      principal,
+      input.apiToolServiceIds ?? [],
+    ),
     ...(input.dailyTokenBudget !== undefined && input.dailyTokenBudget !== null
       ? { dailyTokenBudget: input.dailyTokenBudget }
       : {}),
@@ -162,15 +179,42 @@ export async function updateAssistant(
             input.systemPromptOverride === null ? undefined : input.systemPromptOverride,
         }
       : {}),
+    ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
     ...(input.enabledToolGroups !== undefined
       ? { enabledToolGroups: input.enabledToolGroups as AssistantToolGroup[] }
       : {}),
+    // Dead references self-heal here: an id ALREADY stored on the config
+    // whose target has since been deleted/invisible PRUNES instead of 404ing
+    // (otherwise a save can never succeed — the edit form round-trips the
+    // stored ids it got, dangling ones included). A NEW foreign id still 404s.
     ...(input.mcpServerIds !== undefined
-      ? { mcpServerIds: await visibleMcpServerIds(deps, principal, input.mcpServerIds) }
+      ? {
+          mcpServerIds: await visibleMcpServerIds(
+            deps,
+            principal,
+            input.mcpServerIds,
+            existing.mcpServerIds ?? [],
+          ),
+        }
       : {}),
     ...(input.skillResourceIds !== undefined
       ? {
-          skillResourceIds: await readableSkillResourceIds(deps, principal, input.skillResourceIds),
+          skillResourceIds: await readableSkillResourceIds(
+            deps,
+            principal,
+            input.skillResourceIds,
+            existing.skillResourceIds ?? [],
+          ),
+        }
+      : {}),
+    ...(input.apiToolServiceIds !== undefined
+      ? {
+          apiToolServiceIds: await visibleApiToolServiceIds(
+            deps,
+            principal,
+            input.apiToolServiceIds,
+            existing.apiToolServiceIds ?? [],
+          ),
         }
       : {}),
     ...(input.dailyTokenBudget !== undefined
@@ -191,10 +235,34 @@ export async function updateAssistant(
  * row notes honestly in the prompt (the picker greys stored-dialSite 'client'
  * rows, 'auto' resolves per its credentials).
  */
+/** #80 — every configured id must exist and be visible (global or own). */
+async function visibleApiToolServiceIds(
+  deps: ServiceDeps,
+  principal: Principal,
+  ids: string[],
+  existing: readonly string[] = [],
+): Promise<string[]> {
+  const out: string[] = [];
+  for (const id of ids) {
+    const service = await deps.uow.apiTools.findById(id);
+    if (
+      !service ||
+      service.deletedAt !== undefined ||
+      (service.scope === 'personal' && service.ownerId !== principal.userId)
+    ) {
+      if (existing.includes(id)) continue; // dead reference self-heals (see MCP)
+      throw new AppError(`API tool service ${id} not found`, 404, 'API_TOOL_NOT_FOUND');
+    }
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 async function visibleMcpServerIds(
   deps: ServiceDeps,
   principal: Principal,
   ids: string[],
+  existing: readonly string[] = [],
 ): Promise<string[]> {
   const out: string[] = [];
   for (const id of ids) {
@@ -204,6 +272,11 @@ async function visibleMcpServerIds(
       server.deletedAt !== undefined ||
       (server.scope === 'personal' && server.ownerId !== principal.userId)
     ) {
+      // A reference that died AFTER the config saved prunes — the config
+      // must stay savable (bug report: delete an MCP, the assistant edit
+      // could never save again). Anything not already stored is a foreign
+      // ADD and still fails honestly.
+      if (existing.includes(id)) continue;
       throw new AppError(`MCP server ${id} not found`, 404, 'MCP_SERVER_NOT_FOUND');
     }
     if (!out.includes(id)) out.push(id);
@@ -220,6 +293,7 @@ async function readableSkillResourceIds(
   deps: ServiceDeps,
   principal: Principal,
   ids: string[],
+  existing: readonly string[] = [],
 ): Promise<string[]> {
   const out: string[] = [];
   for (const id of ids) {
@@ -229,6 +303,7 @@ async function readableSkillResourceIds(
       resource.deletedAt !== undefined ||
       (resource.scope === 'personal' && resource.ownerId !== principal.userId)
     ) {
+      if (existing.includes(id)) continue; // dead reference self-heals (see MCP)
       throw new AppError(`Skill resource ${id} not found`, 404, 'RESOURCE_NOT_FOUND');
     }
     if (resource.kind !== 'skill') {

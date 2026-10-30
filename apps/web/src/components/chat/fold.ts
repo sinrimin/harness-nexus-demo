@@ -115,6 +115,34 @@ export interface PermissionCardState {
   toolCall: ChatToolCallView;
   options: { optionId: string; name: string; kind: string }[];
   settled: boolean;
+  /**
+   * #92 — the gate escalated to the human and attached its lean: advisory
+   * ONLY (clearly marked on the card; never a decision). Absent = no gate
+   * or nothing to say. v2: the severity (1..7) and intent (0..1) verdict
+   * inputs ride along when the model produced them.
+   */
+  advisory?: {
+    lean: 'allow' | 'reject';
+    confidence: number;
+    reason?: string;
+    severity?: number;
+    intent?: number;
+  };
+  /**
+   * #104 — delegation was on but could not conclude; the card is the
+   * human's to answer. Rendered as one muted reason line (never an error:
+   * the fallback is safe, it was just silent before).
+   */
+  escalation?: { reason: 'no-model' | 'timeout' | 'http' | 'shape' };
+  /** #92 — how it settled (`undefined` on pre-#92 events = a human did). */
+  resolution?: {
+    responder: 'human' | 'delegated';
+    decidedBy?: 'floor' | 'model';
+    providerName?: string;
+    modelId?: string;
+    confidence?: number;
+    denialReason?: string;
+  };
 }
 
 /** 9 W14.1 — an open agent question (ACP elicitation, form mode). */
@@ -144,6 +172,8 @@ export interface FoldState {
     currentModeId?: string;
     availableModes?: SessionMode[];
     configOptions?: SessionConfigOption[];
+    /** #92 — the delegated-approvals slice (present = machine has a provider). */
+    approvals?: { responder: 'manual' | 'delegated'; providerName?: string; modelId?: string };
   };
   /**
    * 9 W14 — the agent's todo/task plan (ACP `plan` snapshots, FULL replace:
@@ -492,11 +522,65 @@ function applyEvent(state: FoldState, event: ChatStreamEvent): FoldState {
           },
         ],
       };
+    case 'permission_advisory':
+      // #92 — attach (or update) the gate's advisory on the pending card.
+      return {
+        ...state,
+        permissions: state.permissions.map((p) =>
+          p.requestId === event.requestId
+            ? {
+                ...p,
+                advisory: {
+                  lean: event.lean,
+                  confidence: event.confidence,
+                  ...(event.reason !== undefined ? { reason: event.reason } : {}),
+                  ...(event.severity !== undefined ? { severity: event.severity } : {}),
+                  ...(event.intent !== undefined ? { intent: event.intent } : {}),
+                },
+              }
+            : p,
+        ),
+      };
+    case 'permission_escalated':
+      // #104 — name the failed delegation on the still-pending card.
+      return {
+        ...state,
+        permissions: state.permissions.map((p) =>
+          p.requestId === event.requestId
+            ? { ...p, escalation: { reason: event.reason } }
+            : p,
+        ),
+      };
     case 'permission_resolved':
       return {
         ...state,
         permissions: state.permissions.map((p) =>
-          p.requestId === event.requestId ? { ...p, settled: true } : p,
+          p.requestId === event.requestId
+            ? {
+                ...p,
+                settled: true,
+                ...(event.responder !== undefined || event.delegated !== undefined
+                  ? {
+                      resolution: {
+                        responder: event.responder ?? 'human',
+                        ...(event.decidedBy !== undefined ? { decidedBy: event.decidedBy } : {}),
+                        ...(event.delegated !== undefined
+                          ? {
+                              providerName: event.delegated.providerName,
+                              modelId: event.delegated.modelId,
+                              ...(event.delegated.confidence !== undefined
+                                ? { confidence: event.delegated.confidence }
+                                : {}),
+                              ...(event.delegated.denial !== undefined
+                                ? { denialReason: event.delegated.denial.reason }
+                                : {}),
+                            }
+                          : {}),
+                      },
+                    }
+                  : {}),
+              }
+            : p,
         ),
       };
     case 'elicitation_request':
@@ -580,6 +664,7 @@ function applyEvent(state: FoldState, event: ChatStreamEvent): FoldState {
             ? { availableModes: event.modes.availableModes }
             : {}),
           ...(event.configOptions !== undefined ? { configOptions: event.configOptions } : {}),
+          ...(event.approvals !== undefined ? { approvals: event.approvals } : {}),
         },
       };
     case 'plan':
@@ -630,10 +715,16 @@ export function fold(state: FoldState, action: FoldAction): FoldState {
       return applyEvent(state, action.event);
 
     case 'history': {
-      // 9 W7 — (re)build from a transcript batch. Idempotent by construction:
-      // a resync re-ingest starts from a FRESH state, so every viewer ends up
-      // with the same rows regardless of what they saw before.
-      let next = createFoldState();
+      // 9 W7 — (re)build the ROWS from a transcript batch. Idempotent by
+      // construction: a resync re-ingest starts from a FRESH row state, so
+      // every viewer ends up with the same rows regardless of what they saw
+      // before. The session CONFIG is not transcript state: a pre-#92 daemon
+      // re-emits modes/options but never approvals, and the server's
+      // approvals push is not in the daemon's history ring — carrying it
+      // across the rebuild keeps the sender's switch from vanishing on the
+      // resync that follows every open. The batch's own session_config
+      // snapshots still merge on top.
+      let next = { ...createFoldState(), config: state.config };
       for (const item of action.items) {
         if (item.type === 'user') {
           // A user item is a turn BOUNDARY (#8): close whatever step is open

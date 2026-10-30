@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+import type { ApiToolOutboundRules } from './api-tool.js';
+
 /**
  * System-wide settings — a single-row aggregate persisted in `system_settings`.
  * Phase 1 uses `allowRegistration`; later fields append here without a new table.
@@ -15,15 +17,26 @@ export interface SystemSettings {
    * never already-stamped objects.
    */
   imageRetentionDays: number;
+  /**
+   * #85 — the outbound DEFAULT action for API tool dials. `allow` (the
+   * default): everything dials except the rule lists (they are BLACKLISTS).
+   * `deny`: nothing dials except the rule lists (WHITELISTS). The lists are
+   * split by network side; cloud-metadata/link-local ranges stay hard-denied
+   * in every mode (that guard is not a policy).
+   */
+  apiToolOutbound: 'allow' | 'deny';
+  apiToolOutboundRules: ApiToolOutboundRules;
   updatedAt: string;
 }
 
 export const DEFAULT_SYSTEM_SETTINGS: Pick<
   SystemSettings,
-  'allowRegistration' | 'imageRetentionDays'
+  'allowRegistration' | 'imageRetentionDays' | 'apiToolOutbound' | 'apiToolOutboundRules'
 > = {
   allowRegistration: true,
   imageRetentionDays: 30,
+  apiToolOutbound: 'allow',
+  apiToolOutboundRules: { external: [], internal: [] },
 };
 
 /** Bounds for the retention setting (days). */

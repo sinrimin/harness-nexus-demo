@@ -327,14 +327,14 @@ describe('#67 assistant dispatch', () => {
 
 describe('#67 dispatch tool surface', () => {
   it('the agent-dispatch group builds both tools against the dispatch dep, and dispatch is write-gated', async () => {
-    const { buildAssistantTools, WRITE_TOOLS } = await import('../src/assistant/tools.js');
+    const { buildAssistantTools } = await import('../src/assistant/tools.js');
     const { createMemoryUnitOfWork } = await import('../src/infra/storage/memory/index.js');
     const uow = createMemoryUnitOfWork();
     const stub = {
       dispatch: async () => ({ ok: false as const, code: 'TEST' }),
       poll: async () => ({ ok: false as const, code: 'DISPATCH_NOT_FOUND' }),
     };
-    const tools = buildAssistantTools(
+    const { tools, classOf } = buildAssistantTools(
       {
         uow,
         skills: { search: null as never, catalog: null as never, allowlist: [] },
@@ -344,8 +344,8 @@ describe('#67 dispatch tool surface', () => {
       ['agent-dispatch'],
     );
     expect(tools.map((t) => t.name).sort()).toEqual(['agent_dispatch', 'agent_dispatch_poll']);
-    expect(WRITE_TOOLS.has('agent_dispatch')).toBe(true);
-    expect(WRITE_TOOLS.has('agent_dispatch_poll')).toBe(false);
+    expect(classOf.get('agent_dispatch')).toBe('write');
+    expect(classOf.get('agent_dispatch_poll')).toBe('read');
   });
 });
 
@@ -587,5 +587,140 @@ describe('#68 dispatch backflow', () => {
     const done = await app.realtime.assistantDispatch.poll(userId, channelId, 5000);
     expect(done.ok === true && done.status === 'done').toBe(true);
     expect(app.realtime.assistantDispatch.briefFor(sid)).toBe('');
+  }, 15000);
+});
+
+describe('#103 per-dispatch approvals stance', () => {
+  it('forced delegated without a resolvable model refuses BEFORE open (no spawn)', async () => {
+    // No provider / no user default seeded yet — delegation cannot engage.
+    const d = daemon!;
+    let started = false;
+    const onStart = () => {
+      started = true;
+    };
+    d.on('chat:session.start', onStart);
+    const res = await app.realtime.assistantDispatch.dispatch(userId, {
+      agentInstanceId: agentId,
+      prompt: 'unattended run',
+      approvals: 'delegated',
+    });
+    expect(res).toEqual({ ok: false, code: 'DISPATCH_APPROVALS_UNAVAILABLE' });
+    await new Promise((r) => setTimeout(r, 250));
+    expect(started).toBe(false);
+    d.off('chat:session.start', onStart);
+  }, 10000);
+
+  it('forced delegated engages BEFORE the prompt and the run completes', async () => {
+    // Seed the user's default decision slot — the #95 resolver chain.
+    const now = new Date().toISOString();
+    await app.uow.llmProviders.save({
+      id: 'p1',
+      ownerId: userId,
+      name: 'sys',
+      apis: [{ kind: 'systemone', path: null }],
+      baseUrl: 'https://sys.example',
+      credentialName: null,
+      scope: 'personal',
+      models: [{ id: 'd1', apiKind: 'systemone', type: 'decision' }],
+      createdAt: now,
+      updatedAt: now,
+    });
+    const user = (await app.uow.users.findById(userId))!;
+    await app.uow.users.save({
+      ...user,
+      defaultModels: { decision: { providerId: 'p1', modelId: 'd1' } },
+    });
+
+    const d = daemon!;
+    const order: string[] = [];
+    const onApprovals = () => order.push('approvals');
+    const onSend = () => order.push('prompt');
+    d.on('chat:approvals.set', onApprovals);
+    d.on('chat:message.send', onSend);
+    const startP = once(d, 'chat:session.start');
+    const res = await app.realtime.assistantDispatch.dispatch(userId, {
+      agentInstanceId: agentId,
+      prompt: 'unattended run',
+      approvals: 'delegated',
+    });
+    expect(res.ok).toBe(true);
+    const start = (await startP) as { sessionId: string };
+    readyWithTurn(d, start, { nativeSessionId: 'fx-stance-1', text: 'unattended done' });
+    const poll = await app.realtime.assistantDispatch.poll(userId, res.channelId, 5000);
+    expect(poll).toMatchObject({ status: 'done', text: 'unattended done' });
+    // The stance switch landed before the prompt went out.
+    expect(order.length).toBeGreaterThanOrEqual(2);
+    expect(order.indexOf('approvals')).toBeLessThan(order.lastIndexOf('prompt'));
+    d.off('chat:approvals.set', onApprovals);
+    d.off('chat:message.send', onSend);
+  }, 15000);
+
+  it('forced manual overrides a delegated machine default', async () => {
+    await app.uow.machines.save({
+      ...(await app.uow.machines.findById(machineId))!,
+      chatApprovals: { responder: 'delegated', providerId: 'p1', modelId: 'd1' },
+    });
+    const d = daemon!;
+    const approvalsP = once(d, 'chat:approvals.set');
+    const startP = once(d, 'chat:session.start');
+    const res = await app.realtime.assistantDispatch.dispatch(userId, {
+      agentInstanceId: agentId,
+      prompt: 'watch this one closely',
+      approvals: 'manual',
+    });
+    expect(res.ok).toBe(true);
+    const start = (await startP) as { sessionId: string };
+    // The switch rides the ready tap — emit ready, THEN await the ctl.
+    readyWithTurn(d, start, { text: 'manual run done' });
+    const view = (await approvalsP) as { approvals: { responder: string } };
+    expect(view.approvals.responder).toBe('manual');
+    const poll = await app.realtime.assistantDispatch.poll(userId, res.channelId, 5000);
+    expect(poll).toMatchObject({ status: 'done', text: 'manual run done' });
+  }, 15000);
+
+  it('a degraded decision breaker refuses forced delegated up front', async () => {
+    // 3 consecutive failures = the #100 breaker opens.
+    app.modelCapabilities.record(userId, false, 'test');
+    app.modelCapabilities.record(userId, false, 'test');
+    app.modelCapabilities.record(userId, false, 'test');
+    const res = await app.realtime.assistantDispatch.dispatch(userId, {
+      agentInstanceId: agentId,
+      prompt: 'unattended run',
+      approvals: 'delegated',
+    });
+    expect(res).toEqual({ ok: false, code: 'DISPATCH_APPROVALS_UNAVAILABLE' });
+    app.modelCapabilities.record(userId, true);
+  }, 10000);
+
+  it('a ready-tap race (provider deleted after dispatch) fails the run and closes the channel', async () => {
+    const d = daemon!;
+    const startP = once(d, 'chat:session.start');
+    // Earlier tests' fire-and-forget closes can land late — collect and wait
+    // for THIS channel's close instead of trusting the next event.
+    const closes: { sessionId: string; reason?: string }[] = [];
+    const onClose = (p: unknown) => closes.push(p as { sessionId: string; reason?: string });
+    d.on('chat:session.close', onClose);
+    const res = await app.realtime.assistantDispatch.dispatch(userId, {
+      agentInstanceId: agentId,
+      prompt: 'unattended run',
+      approvals: 'delegated',
+    });
+    expect(res.ok).toBe(true);
+    // The world moved between the entry probe and ready.
+    await app.uow.llmProviders.delete('p1');
+    const start = (await startP) as { sessionId: string };
+    void d.emit('chat:session.ready', {
+      sessionId: start.sessionId,
+      agentName: 'fixture-agent',
+      agentVersion: '0.1.0',
+    });
+    const poll = await app.realtime.assistantDispatch.poll(userId, res.channelId, 5000);
+    expect(poll.ok === true && poll.status === 'failed').toBe(true);
+    if (poll.ok) {
+      expect(poll.error).toContain('approvals stance delegated unavailable');
+    }
+    await waitFor(() => closes.some((c) => c.sessionId === res.channelId));
+    d.off('chat:session.close', onClose);
+    expect(closes.find((c) => c.sessionId === res.channelId)?.reason).toBe('dispatch');
   }, 15000);
 });

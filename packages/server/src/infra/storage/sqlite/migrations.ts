@@ -479,6 +479,196 @@ CREATE INDEX IF NOT EXISTS idx_file_objects_expires ON file_objects (expires_at)
 ALTER TABLE system_settings ADD COLUMN image_retention_days INTEGER NOT NULL DEFAULT 30;
     `,
   },
+  {
+    version: 24,
+    description: 'issue #79 — assistant write-tool policy (prompt | autoWrite)',
+    sql: `
+ALTER TABLE assistant_configs ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'prompt';
+    `,
+  },
+  {
+    version: 25,
+    description: 'issue #80 — API tool services (JSON bundle rows)',
+    sql: `
+CREATE TABLE IF NOT EXISTS api_tool_services (
+  id         TEXT PRIMARY KEY,
+  scope      TEXT NOT NULL,
+  owner_id   TEXT,
+  name       TEXT NOT NULL,
+  bundle     TEXT NOT NULL,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_tools_owner ON api_tool_services(owner_id);
+    `,
+  },
+  {
+    version: 26,
+    description:
+      'issue #80 — API tool runtime: allowlist setting + assistant config apiToolServiceIds',
+    sql: `
+ALTER TABLE system_settings ADD COLUMN api_tool_allowlist TEXT;
+ALTER TABLE assistant_configs ADD COLUMN api_tool_service_ids TEXT NOT NULL DEFAULT '[]';
+    `,
+  },
+  {
+    version: 27,
+    description:
+      'issue #79 — per-session write policy (sender switch): assistant_sessions.permission_mode',
+    sql: `
+ALTER TABLE assistant_sessions ADD COLUMN permission_mode TEXT;
+    `,
+  },
+  {
+    version: 28,
+    description:
+      'issue #85 — API tool outbound policy switch: system_settings.api_tool_outbound (open | restricted, default open)',
+    sql: `
+ALTER TABLE system_settings ADD COLUMN api_tool_outbound TEXT NOT NULL DEFAULT 'open';
+    `,
+  },
+  {
+    version: 29,
+    description:
+      'issue #85 (revision) — outbound policy as default action + split rule lists: api_tool_outbound becomes allow|deny, api_tool_outbound_rules {external,internal} (host/wildcard/IP/CIDR) replaces api_tool_allowlist (entries split by their internal flag)',
+    sql: `
+ALTER TABLE system_settings ADD COLUMN api_tool_outbound_rules TEXT;
+UPDATE system_settings AS t SET api_tool_outbound_rules = COALESCE((
+  SELECT json_object(
+    'external', COALESCE(json_group_array(json_extract(j.value, '$.host')) FILTER (WHERE COALESCE(json_extract(j.value, '$.internal'), 0) = 0), json('[]')),
+    'internal', COALESCE(json_group_array(json_extract(j.value, '$.host')) FILTER (WHERE json_extract(j.value, '$.internal') = 1), json('[]'))
+  ) FROM json_each(COALESCE(t.api_tool_allowlist, '[]')) j
+), '{}');
+UPDATE system_settings SET api_tool_outbound = CASE WHEN api_tool_outbound = 'restricted' THEN 'deny' ELSE 'allow' END;
+ALTER TABLE system_settings DROP COLUMN api_tool_allowlist;
+    `,
+  },
+  {
+    version: 30,
+    description: 'issue #88 — notes: notes / note_versions / note_annotations / note_categories',
+    sql: `
+CREATE TABLE IF NOT EXISTS note_categories (
+  id         TEXT PRIMARY KEY,
+  owner_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  parent_id  TEXT REFERENCES note_categories(id),
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_note_categories_owner ON note_categories(owner_id);
+
+CREATE TABLE IF NOT EXISTS notes (
+  id              TEXT PRIMARY KEY,
+  owner_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title           TEXT NOT NULL,
+  summary         TEXT,
+  content_md      TEXT NOT NULL,
+  content_version INTEGER NOT NULL DEFAULT 1,
+  category_id     TEXT REFERENCES note_categories(id) ON DELETE SET NULL,
+  tags            TEXT NOT NULL DEFAULT '[]',
+  status          TEXT NOT NULL DEFAULT 'inbox',
+  visibility      TEXT NOT NULL DEFAULT 'private',
+  source          TEXT NOT NULL DEFAULT '{}',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_owner ON notes(owner_id);
+CREATE INDEX IF NOT EXISTS idx_notes_owner_status ON notes(owner_id, status);
+CREATE INDEX IF NOT EXISTS idx_notes_visibility ON notes(visibility);
+
+CREATE TABLE IF NOT EXISTS note_versions (
+  note_id    TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+  version    INTEGER NOT NULL,
+  content_md TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (note_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS note_annotations (
+  id             TEXT PRIMARY KEY,
+  note_id        TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+  note_version   INTEGER NOT NULL,
+  quote          TEXT NOT NULL,
+  context_prefix TEXT NOT NULL,
+  context_suffix TEXT NOT NULL,
+  comment        TEXT NOT NULL,
+  state          TEXT NOT NULL DEFAULT 'open',
+  author_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at     TEXT NOT NULL,
+  resolved_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_note_annotations_note ON note_annotations(note_id);
+    `,
+  },
+  {
+    version: 31,
+    description:
+      'issue #92 — delegated approvals: machine-scoped chat_approvals JSON (responder/providerId/modelId/threshold/neverAllow/denyNote); NULL on rows written before the feature (manual default)',
+    sql: `
+ALTER TABLE machines ADD COLUMN chat_approvals TEXT;
+    `,
+  },
+  {
+    version: 32,
+    description:
+      "issue #95 — providers speak several wires: api TEXT → apis JSON [{kind,path}] (a row with embedding models gains the openai-embedding kind); model type → per-model apiKind (chat → the row's old api, embedding → openai-embedding, decision → systemone); users: default_models JSON (user-level default model slots)",
+    sql: `
+ALTER TABLE llm_providers ADD COLUMN apis TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN default_models TEXT;
+
+UPDATE llm_providers SET
+  models = COALESCE((
+    SELECT json_group_array(
+      json_set(json_remove(j.value, '$.type'), '$.apiKind',
+        CASE json_extract(j.value, '$.type')
+          WHEN 'embedding' THEN 'openai-embedding'
+          WHEN 'decision'  THEN 'systemone'
+          ELSE llm_providers.api END))
+    FROM json_each(COALESCE(llm_providers.models, '[]')) j
+  ), '[]'),
+  apis = CASE
+    WHEN COALESCE(models, '[]') LIKE '%"type":"embedding"%' AND api <> 'openai-embedding'
+      THEN json_array(json_object('kind', api, 'path', NULL), json_object('kind', 'openai-embedding', 'path', NULL))
+    ELSE json_array(json_object('kind', api, 'path', NULL))
+  END;
+
+ALTER TABLE llm_providers DROP COLUMN api;
+    `,
+  },
+  {
+    version: 33,
+    description:
+      'issue #97 — delegated-decision audit rows (append-only, owner-capped on write): one row per gate verdict on either axis; request_id is the humanResponse backfill key, created_at walks pages',
+    sql: `
+CREATE TABLE decision_records (
+  id                 TEXT PRIMARY KEY,
+  owner_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at         TEXT NOT NULL,
+  axis               TEXT NOT NULL,
+  machine_id         TEXT,
+  session_id         TEXT,
+  request_id         TEXT,
+  target             TEXT,
+  tool_title         TEXT NOT NULL,
+  tool_kind          TEXT,
+  tool_input_preview TEXT,
+  outcome            TEXT NOT NULL,
+  decided_by         TEXT NOT NULL,
+  severity           REAL,
+  intent             REAL,
+  why                TEXT,
+  sev_confidence     REAL,
+  intent_confidence  REAL,
+  provider_name      TEXT,
+  model_id           TEXT,
+  latency_ms         INTEGER,
+  denial_reason      TEXT,
+  human_response     TEXT
+);
+CREATE INDEX idx_decision_records_owner_created ON decision_records(owner_id, created_at);
+CREATE INDEX idx_decision_records_session_req ON decision_records(session_id, request_id);
+    `,
+  },
 ] as const;
 
 /**

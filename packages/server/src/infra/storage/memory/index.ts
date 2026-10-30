@@ -10,11 +10,13 @@ import type {
   SystemSettings,
   Credential,
   McpServer,
+  ApiToolService,
   Profile,
   Resource,
   AssistantConfig,
   AssistantMessageRow,
   AssistantRepository,
+  ApiToolRepository,
   AssistantSession,
   AssistantToolCallAudit,
   Machine,
@@ -38,8 +40,19 @@ import type {
   LlmProviderRepository,
   FileBlobRepository,
   FileObject,
+  Note,
+  NoteAnnotation,
+  NoteAnnotationRepository,
+  NoteCategory,
+  NoteCategoryRepository,
+  NoteRepository,
+  NoteVersion,
+  DecisionHumanResponse,
+  DecisionRecord,
+  DecisionRecordListFilter,
+  DecisionRecordRepository,
 } from '@harness-nexus/core';
-import { DEFAULT_SYSTEM_SETTINGS } from '@harness-nexus/core';
+import { DEFAULT_SYSTEM_SETTINGS, DECISION_RECORDS_CAP } from '@harness-nexus/core';
 
 /**
  * In-memory storage driver — used by tests and `STORAGE_DRIVER=memory`.
@@ -53,6 +66,12 @@ export function createMemoryUnitOfWork(): UnitOfWork {
   const tokensByHash = new Map<string, string>(); // hash -> id
   const credentials = new Map<string, Credential>();
   const mcpServers = new Map<string, McpServer>();
+  const apiTools = new Map<string, ApiToolService>();
+  const notes = new Map<string, Note>();
+  // key: `${noteId}\u0000${version}` — immutable content snapshots.
+  const noteVersions = new Map<string, NoteVersion>();
+  const noteAnnotations = new Map<string, NoteAnnotation>();
+  const noteCategories = new Map<string, NoteCategory>();
   const profiles = new Map<string, Profile>();
   const resources = new Map<string, Resource>();
   const machines = new Map<string, Machine>();
@@ -71,6 +90,11 @@ export function createMemoryUnitOfWork(): UnitOfWork {
   let settings: SystemSettings = {
     allowRegistration: DEFAULT_SYSTEM_SETTINGS.allowRegistration,
     imageRetentionDays: DEFAULT_SYSTEM_SETTINGS.imageRetentionDays,
+    apiToolOutbound: DEFAULT_SYSTEM_SETTINGS.apiToolOutbound,
+    apiToolOutboundRules: {
+      external: [...DEFAULT_SYSTEM_SETTINGS.apiToolOutboundRules.external],
+      internal: [...DEFAULT_SYSTEM_SETTINGS.apiToolOutboundRules.internal],
+    },
     updatedAt: new Date(0).toISOString(),
   };
 
@@ -509,6 +533,206 @@ export function createMemoryUnitOfWork(): UnitOfWork {
     },
   };
 
+  const apiToolRepo: ApiToolRepository = {
+    async findById(id) {
+      return apiTools.get(id) ?? null;
+    },
+    async list(filter) {
+      return [...apiTools.values()]
+        .filter(
+          (s) =>
+            (filter?.includeDeleted !== true ? s.deletedAt === undefined : true) &&
+            (filter?.scope === undefined || s.scope === filter.scope) &&
+            (filter?.ownerId === undefined || s.ownerId === filter.ownerId),
+        )
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    },
+    async save(service) {
+      apiTools.set(service.id, service);
+      return service;
+    },
+    async delete(id) {
+      apiTools.delete(id);
+    },
+  };
+
+  const noteRepo: NoteRepository = {
+    async findById(id) {
+      return notes.get(id) ?? null;
+    },
+    async list(filter) {
+      let rows = [...notes.values()];
+      if (filter?.ownerId !== undefined) rows = rows.filter((n) => n.ownerId === filter.ownerId);
+      if (filter?.categoryId !== undefined)
+        rows = rows.filter((n) => n.categoryId === filter.categoryId);
+      if (filter?.status !== undefined) rows = rows.filter((n) => n.status === filter.status);
+      if (filter?.visibility !== undefined)
+        rows = rows.filter((n) => n.visibility === filter.visibility);
+      if (filter?.tag !== undefined) rows = rows.filter((n) => n.tags.includes(filter.tag!));
+      if (filter?.search !== undefined) {
+        const q = filter.search.toLowerCase();
+        rows = rows.filter(
+          (n) =>
+            n.title.toLowerCase().includes(q) ||
+            (n.summary?.toLowerCase().includes(q) ?? false) ||
+            n.contentMd.toLowerCase().includes(q),
+        );
+      }
+      rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+      const offset = filter?.offset ?? 0;
+      const limit = filter?.limit ?? rows.length;
+      return rows.slice(offset, offset + limit);
+    },
+    async listPublic(filter) {
+      let rows = [...notes.values()].filter((n) => n.visibility === 'public');
+      if (filter?.tag !== undefined) rows = rows.filter((n) => n.tags.includes(filter.tag!));
+      if (filter?.search !== undefined) {
+        const q = filter.search.toLowerCase();
+        rows = rows.filter(
+          (n) =>
+            n.title.toLowerCase().includes(q) ||
+            (n.summary?.toLowerCase().includes(q) ?? false) ||
+            n.contentMd.toLowerCase().includes(q),
+        );
+      }
+      rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+      const offset = filter?.offset ?? 0;
+      const limit = filter?.limit ?? rows.length;
+      return rows.slice(offset, offset + limit);
+    },
+    async save(note) {
+      notes.set(note.id, note);
+      return note;
+    },
+    async saveVersion(version) {
+      noteVersions.set(`${version.noteId}\u0000${String(version.version)}`, version);
+    },
+    async findVersion(noteId, version) {
+      return noteVersions.get(`${noteId}\u0000${String(version)}`) ?? null;
+    },
+    async delete(id) {
+      notes.delete(id);
+      for (const key of [...noteVersions.keys()]) {
+        if (key.split('\u0000')[0] === id) noteVersions.delete(key);
+      }
+      for (const [aid, a] of [...noteAnnotations.entries()]) {
+        if (a.noteId === id) noteAnnotations.delete(aid);
+      }
+    },
+  };
+
+  const noteAnnotationRepo: NoteAnnotationRepository = {
+    async findById(id) {
+      return noteAnnotations.get(id) ?? null;
+    },
+    async listByNote(noteId) {
+      return [...noteAnnotations.values()]
+        .filter((a) => a.noteId === noteId)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    },
+    async countsByOwner(ownerId) {
+      const counts: Record<string, { total: number; open: number }> = {};
+      for (const a of noteAnnotations.values()) {
+        if (a.authorId !== ownerId) continue;
+        const c = (counts[a.noteId] ??= { total: 0, open: 0 });
+        c.total += 1;
+        if (a.state === 'open') c.open += 1;
+      }
+      return counts;
+    },
+    async save(annotation) {
+      noteAnnotations.set(annotation.id, annotation);
+      return annotation;
+    },
+    async delete(id) {
+      noteAnnotations.delete(id);
+    },
+  };
+
+  const noteCategoryRepo: NoteCategoryRepository = {
+    async findById(id) {
+      return noteCategories.get(id) ?? null;
+    },
+    async listByOwner(ownerId) {
+      return [...noteCategories.values()]
+        .filter((c) => c.ownerId === ownerId)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    },
+    async findByParentAndName(ownerId, parentId, name) {
+      return (
+        [...noteCategories.values()].find(
+          (c) => c.ownerId === ownerId && c.parentId === parentId && c.name === name,
+        ) ?? null
+      );
+    },
+    async save(category) {
+      noteCategories.set(category.id, category);
+      return category;
+    },
+    async delete(id) {
+      // Port contract: children fall to the deleted node's parent, its notes
+      // fall to uncategorized.
+      const node = noteCategories.get(id);
+      if (!node) return;
+      for (const [cid, c] of [...noteCategories.entries()]) {
+        if (c.parentId === id) noteCategories.set(cid, { ...c, parentId: node.parentId });
+      }
+      for (const [nid, n] of [...notes.entries()]) {
+        if (n.categoryId === id) notes.set(nid, { ...n, categoryId: null });
+      }
+      noteCategories.delete(id);
+    },
+  };
+
+  // #97 — delegated-decision audit: newest-last array; prune on write.
+  const decisionRecords: DecisionRecord[] = [];
+  const decisionRecordRepo: DecisionRecordRepository = {
+    async append(record) {
+      decisionRecords.push(record);
+      const owned = decisionRecords.filter((r) => r.ownerId === record.ownerId);
+      if (owned.length > DECISION_RECORDS_CAP) {
+        const keep = new Set(
+          owned
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+            .slice(0, DECISION_RECORDS_CAP),
+        );
+        for (let i = decisionRecords.length - 1; i >= 0; i--) {
+          if (!keep.has(decisionRecords[i]!)) decisionRecords.splice(i, 1);
+        }
+      }
+    },
+    async list(filter: DecisionRecordListFilter) {
+      return decisionRecords
+        .filter(
+          (r) =>
+            r.ownerId === filter.ownerId &&
+            (filter.sessionId === undefined || r.sessionId === filter.sessionId) &&
+            (filter.machineId === undefined || r.machineId === filter.machineId) &&
+            (filter.outcome === undefined || r.outcome === filter.outcome) &&
+            (filter.before === undefined || r.createdAt < filter.before),
+        )
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+        .slice(0, filter.limit ?? 50);
+    },
+    async markHumanResponse(
+      ownerId: string,
+      sessionId: string,
+      requestId: string,
+      response: DecisionHumanResponse,
+    ) {
+      const row = decisionRecords.find(
+        (r) =>
+          r.ownerId === ownerId &&
+          r.sessionId === sessionId &&
+          r.requestId === requestId &&
+          r.humanResponse === undefined,
+      );
+      if (row === undefined) return false;
+      row.humanResponse = response;
+      return true;
+    },
+  };
+
   return {
     users: userRepo,
     tokens: tokenRepo,
@@ -525,5 +749,10 @@ export function createMemoryUnitOfWork(): UnitOfWork {
     llmProviders: llmProviderRepo,
     assistants: assistantRepo,
     fileBlobs: fileBlobRepo,
+    apiTools: apiToolRepo,
+    notes: noteRepo,
+    noteAnnotations: noteAnnotationRepo,
+    noteCategories: noteCategoryRepo,
+    decisionRecords: decisionRecordRepo,
   };
 }

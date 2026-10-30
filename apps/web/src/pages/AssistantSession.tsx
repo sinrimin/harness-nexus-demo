@@ -5,12 +5,20 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
-import { BotIcon, ListIcon, PencilIcon, PlusIcon, RefreshCwIcon, XIcon } from 'lucide-react';
+import {
+  BotIcon,
+  ListIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  ScrollTextIcon,
+  XIcon,
+} from 'lucide-react';
 import { api } from '@/api';
 import { useAuth, withAuthGuard } from '@/auth';
 import { useI18n, dateLocale } from '@/i18n';
 import { StateSignal } from '@/components/state-signal';
-import { ConfirmDialog, DataText, EmptyState } from '@/components/kit';
+import { ConfirmDialog, EmptyState } from '@/components/kit';
 import {
   appSocket,
   emitWithAck,
@@ -28,12 +36,14 @@ import {
   type LlmProviderView,
 } from '@harness-nexus/sdk';
 import { Button } from '@/components/ui/button';
-import { cn } from '@/lib/utils';
 import { Dialog as DialogPrimitive } from 'radix-ui';
 import { ChatStream } from '@/components/chat/chat-stream.js';
+import { CaptureNoteDialog } from '@/pages/notes/CaptureNoteDialog';
 import { WelcomePane, type WelcomeCard } from '@/components/chat/welcome-pane.js';
 import { ChannelTabs } from '@/components/chat/channel-tabs.js';
 import { SessionRow } from '@/components/chat/session-row.js';
+import { RailSessionRow } from '@/components/chat/rail-session-row.js';
+import { DecisionRecordsDialog } from '@/components/decision-records-dialog';
 import { useChatChannels } from '@/components/chat/use-chat-channels.js';
 import { useAssistantSessions } from '@/components/chat/use-assistant-sessions.js';
 import { Composer, type ComposerConfig } from '@/components/chat/composer.js';
@@ -100,9 +110,13 @@ export function AssistantSessionPage() {
   const [assistants, setAssistants] = useState<AssistantConfigView[] | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [sessionId, setSessionId] = useState('');
+  /** #104 — the session-scoped delegated-records dialog (header action). */
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const [phase, setPhase] = useState<Phase>('idle');
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
+  // #88 — the step markdown awaiting 保存为笔记 (null = dialog closed).
+  const [capture, setCapture] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
   /** #58-3 — the model registry (vision flags gate the composer's images). */
   const [providers, setProviders] = useState<LlmProviderView[] | null>(null);
@@ -285,7 +299,10 @@ export function AssistantSessionPage() {
     };
     const onClosed = (push: AssistantClosedPush): void => {
       if (push.sessionId !== sessionId) return;
-      if (push.reason === 'user') {
+      // 'session-deleted' (#75): the server closed the idle channel as part
+      // of a delete — reset the pane like an explicit disconnect; the rail
+      // refreshes via the sessions push.
+      if (push.reason === 'user' || push.reason === 'session-deleted') {
         setSessionId('');
         return;
       }
@@ -320,6 +337,7 @@ export function AssistantSessionPage() {
     if (searchParams.get('a') !== null) setSearchParams({}, { replace: true });
     const ack = await emitWithAck<{
       sessionId?: string;
+      assistantId?: string;
       assistantName?: string;
       error?: string;
     }>('assistant:session.open', {
@@ -328,13 +346,24 @@ export function AssistantSessionPage() {
     });
     if (ack.error !== undefined || ack.sessionId === undefined) {
       setError(
-        ack.error === 'ASSISTANT_NOT_FOUND' || ack.error === 'ASSISTANT_DELETED'
+        ack.error === 'ASSISTANT_NOT_FOUND' || ack.error === 'ASSISTANTS_DELETED'
           ? t('assistants.errNoAssistant')
           : (ack.error ?? t('assistants.errUnknown')),
       );
       return;
     }
     setSessionId(ack.sessionId);
+    // An EXISTING session always belongs to its own assistant (the server
+    // resolves it from the row); a ?s= hand-off may have opened it under a
+    // stale selection — follow the row so the composer, rail filter, and
+    // config snapshot all read the right config.
+    if (
+      rejoinId !== undefined &&
+      ack.assistantId !== undefined &&
+      ack.assistantId !== assistantId
+    ) {
+      setSearchParams({ a: ack.assistantId }, { replace: true });
+    }
   }
 
   /**
@@ -455,7 +484,13 @@ export function AssistantSessionPage() {
       value: set.value,
     });
     if (ack.error !== undefined) {
-      toast.error(t('chat.configSetFailed', { error: ack.error }));
+      // #95 follow-up — delegation without a resolvable decision model is a
+      // configuration state, not a protocol failure: point at the fix.
+      toast.error(
+        ack.error === 'ASSISTANT_APPROVALS_NO_PROVIDER'
+          ? t('assistants.permNoModel')
+          : t('chat.configSetFailed', { error: ack.error }),
+      );
       return;
     }
     if (set.configId === 'agent') {
@@ -494,7 +529,10 @@ export function AssistantSessionPage() {
 
   usePageTitle(assistant !== null ? assistant.name : t('assistants.endAssistant'));
 
-  const sortedSessions = useMemo(() => [...sessions].reverse(), [sessions]);
+  // Server order IS the display order — newest activity first (the storage
+  // contract; the welcome cards below rely on the same array). #94: this rail
+  // used to .reverse() it into oldest-first.
+  const sortedSessions = sessions;
 
   /** #54 — the welcome's recent cards: this config's conversations, newest
    *  first (the sessions push arrives newest-first from the server). */
@@ -517,7 +555,10 @@ export function AssistantSessionPage() {
   // only the drawer's picks carry the ?rail hand-off.
   const rail = (inDrawer: boolean) => (
     <>
-      <div className="flex items-center gap-1 border-b px-2 py-2.5">
+      {/* Same contract as the machine rail's band: h-12 pinned to the stream
+      header so both columns' borders align in every skin (a hugging height
+      rides --control-h-sm: 52px Signal / 45px BAY vs the fixed 48px band). */}
+      <div className="flex h-12 items-center gap-1 border-b px-2">
         <EndSwitcher current="assistant" fromDrawer={inDrawer} />
         <span className="min-w-0 flex-1" />
         <Button
@@ -541,9 +582,9 @@ export function AssistantSessionPage() {
           {t('assistants.newAssistantSession')}
         </Button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         {sortedSessions.length === 0 ? (
-          <p className="text-muted-foreground px-2 py-4 text-xs">{t('assistants.noSessions')}</p>
+          <p className="text-muted-foreground px-3 py-4 text-xs">{t('assistants.noSessions')}</p>
         ) : (
           sortedSessions.map((s) => {
             const active = s.id === sessionId;
@@ -560,38 +601,21 @@ export function AssistantSessionPage() {
                     : undefined
                 }
               >
-                <button
-                  type="button"
+                {/* #99 — the flat assistant rail: the SAME row device as the
+                    machine rail (edge + tint, 32px hanging indent, status
+                    word) with no folder header and no group lines. There is
+                    no per-row attached concept here, so the only word is
+                    `running`; the current row shows none when idle. */}
+                <RailSessionRow
+                  title={s.title || t('chat.untitled')}
+                  meta={`${relativeTime(s.lastMessageAt ?? s.updatedAt, dateLocale(lang))} · ${s.id.slice(0, 8)}`}
+                  active={active}
+                  word={s.busy ? ('running' as const) : null}
+                  titleAttr={s.title || t('chat.untitled')}
                   onClick={() => {
                     if (!active) void openSession(s.id);
                   }}
-                  className={cn(
-                    'flex w-full items-start gap-2 border-b px-3 py-2 text-left last:border-b-0',
-                    active ? 'bg-tray' : 'hover:bg-tray/60',
-                  )}
-                  title={s.title || t('chat.untitled')}
-                >
-                  <span className="mt-1 flex w-2 shrink-0 justify-center">
-                    <StateSignal
-                      state={s.busy ? 'busy' : active ? 'live' : 'idle'}
-                      className="size-1.5"
-                    />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span
-                      className={cn(
-                        'block truncate text-xs',
-                        active && 'text-foreground font-semibold',
-                      )}
-                    >
-                      {s.title || t('chat.untitled')}
-                    </span>
-                    <DataText size="sm" tone="dim" className="mt-0.5 block truncate">
-                      {relativeTime(s.lastMessageAt ?? s.updatedAt, dateLocale(lang))} ·{' '}
-                      {s.id.slice(0, 8)}
-                    </DataText>
-                  </span>
-                </button>
+                />
               </SessionRow>
             );
           })
@@ -671,6 +695,19 @@ export function AssistantSessionPage() {
                 </span>
               ) : null}
               <span className="min-w-0 flex-1" />
+              {/* #104 — the stable entry to this session's delegated audit. */}
+              {sessionId !== '' ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={() => setRecordsOpen(true)}
+                  title={t('decisions.openHint')}
+                >
+                  <ScrollTextIcon className="size-3.5" />
+                  <span className="hidden sm:inline">{t('decisions.openLabel')}</span>
+                </Button>
+              ) : null}
               {phase === 'ready' ? (
                 <Button
                   variant="outline"
@@ -683,6 +720,13 @@ export function AssistantSessionPage() {
                 </Button>
               ) : null}
             </div>
+            {sessionId !== '' ? (
+              <DecisionRecordsDialog
+                open={recordsOpen}
+                onClose={() => setRecordsOpen(false)}
+                sessionId={sessionId}
+              />
+            ) : null}
 
             {noAssistants ? (
               <div className="flex min-h-0 flex-1 items-center justify-center p-6">
@@ -708,6 +752,13 @@ export function AssistantSessionPage() {
               />
             ) : (
               <>
+                {capture !== null ? (
+                  <CaptureNoteDialog
+                    markdown={capture}
+                    sourceRef={`${assistant?.name ?? 'assistant'} · ${sessionId.slice(0, 8)}`}
+                    onClose={() => setCapture(null)}
+                  />
+                ) : null}
                 {error !== null && phase !== 'closed' ? (
                   <p className="text-destructive border-destructive/30 bg-destructive/5 border-b px-4 py-2 text-xs">
                     {error}
@@ -717,6 +768,7 @@ export function AssistantSessionPage() {
                 <ChatStream
                   state={conversation}
                   cwd={undefined}
+                  onCaptureStep={setCapture}
                   onPermissionRespond={(requestId, optionId) => {
                     void emitWithAck('assistant:permission.respond', {
                       sessionId,

@@ -4,14 +4,17 @@
 
 import type { FastifyInstance } from 'fastify';
 import {
+  updateApiToolOutboundSchema,
   updateImageRetentionSchema,
   updateRegistrationSchema,
+  type UpdateApiToolOutboundInput,
   type UpdateImageRetentionInput,
   type UpdateRegistrationInput,
 } from '@harness-nexus/shared';
 import { principalOf } from './principal.js';
 import {
   getSystemSettings,
+  updateApiToolOutbound,
   updateImageRetentionSettings,
   updateRegistrationSettings,
 } from '../services/settings.js';
@@ -40,5 +43,21 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
     const input = updateImageRetentionSchema.parse(req.body) as UpdateImageRetentionInput;
     const settings = await updateImageRetentionSettings({ uow: app.uow }, principalOf(req), input);
     return { imageRetentionDays: settings.imageRetentionDays };
+  });
+
+  // #85 — the API tool outbound policy (default action + split rule lists),
+  // admin-only both ways; one PUT sets mode and lists atomically.
+  app.get('/api/settings/api-tool-outbound', { preHandler: [app.requireAdmin] }, async () => {
+    const settings = await getSystemSettings({ uow: app.uow });
+    return {
+      mode: settings.apiToolOutbound ?? 'allow',
+      rules: settings.apiToolOutboundRules ?? { external: [], internal: [] },
+    };
+  });
+
+  app.put('/api/settings/api-tool-outbound', { preHandler: [app.requireAdmin] }, async (req) => {
+    const input = updateApiToolOutboundSchema.parse(req.body) as UpdateApiToolOutboundInput;
+    const settings = await updateApiToolOutbound({ uow: app.uow }, principalOf(req), input);
+    return { mode: settings.apiToolOutbound, rules: settings.apiToolOutboundRules };
   });
 }

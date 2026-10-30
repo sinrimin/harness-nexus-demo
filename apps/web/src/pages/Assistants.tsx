@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
 import {
   ChevronDownIcon,
@@ -12,11 +13,11 @@ import {
   TrashIcon,
   Wand2Icon,
 } from 'lucide-react';
-import { DEFAULT_ASSISTANT_SYSTEM_PROMPT } from '@harness-nexus/sdk';
+import { DEFAULT_ASSISTANT_SYSTEM_PROMPT, isChatApiKind } from '@harness-nexus/sdk';
 import { api } from '@/api';
 import { useAuth, withAuthGuard } from '@/auth';
 import { useI18n } from '@/i18n';
-import { DataTable, Note, PageIntro, Well } from '@/components/kit';
+import { DataTable, PageIntro, Well } from '@/components/kit';
 import { tableState } from '@/components/kit/table.js';
 import { Field } from '@/components/kit/field.js';
 import { ConfirmDialog } from '@/components/kit/confirm-dialog.js';
@@ -60,8 +61,10 @@ const ASSISTANT_TOOL_GROUPS = [
   'profiles',
   'mcp',
   'skills-hub',
+  'notes',
   'machines',
   'agent-dispatch',
+  'api-tools',
   'system',
 ] as const;
 import { Checkbox } from '@/components/ui/checkbox';
@@ -79,8 +82,10 @@ interface Draft {
   providerId: string;
   defaultModel: string;
   systemPromptOverride: string;
+  permissionMode: 'prompt' | 'autoWrite' | 'delegated';
   enabledToolGroups: string[];
   mcpServerIds: string[];
+  apiToolServiceIds: string[];
   skillResourceIds: string[];
   /** '' = unlimited (null on the wire). */
   dailyTokenBudget: string;
@@ -92,8 +97,10 @@ const EMPTY_DRAFT: Draft = {
   providerId: '',
   defaultModel: '',
   systemPromptOverride: '',
+  permissionMode: 'prompt',
   enabledToolGroups: [...ASSISTANT_TOOL_GROUPS],
   mcpServerIds: [],
+  apiToolServiceIds: [],
   skillResourceIds: [],
   dailyTokenBudget: '',
 };
@@ -140,6 +147,7 @@ export function AssistantsPage() {
   const { t } = useI18n();
   const [items, setItems] = useState<AssistantConfigView[] | null>(null);
   const [providers, setProviders] = useState<LlmProviderView[]>([]);
+  const [apiServices, setApiServices] = useState<{ id: string; bundle: { name: string } }[]>([]);
   const [mcpServers, setMcpServers] = useState<{ id: string; name: string; dialSite: string }[]>(
     [],
   );
@@ -155,17 +163,19 @@ export function AssistantsPage() {
 
   async function refresh() {
     try {
-      const [list, provs, servers, skills] = await Promise.all([
+      const [list, provs, servers, apiTools, skills] = await Promise.all([
         withAuthGuard(() => api.listAssistants(), logout),
         withAuthGuard(() => api.listLlmProviders(), logout),
         // Picker sources — failures degrade to empty lists (the dialog stays
         // usable; the sections say 暂无可用项).
         withAuthGuard(() => api.listMcpServers(), logout).catch(() => []),
+        withAuthGuard(() => api.listApiToolServices(), logout).catch(() => ({ services: [] })),
         withAuthGuard(() => api.listResources({ kind: 'skill' }), logout).catch(() => []),
       ]);
       setItems(list);
       setProviders(provs);
       setMcpServers(servers);
+      setApiServices(apiTools.services);
       setSkillResources(skills);
       setError(null);
     } catch (e) {
@@ -180,7 +190,8 @@ export function AssistantsPage() {
   const providerById = useMemo(() => new Map(providers.map((p) => [p.id, p])), [providers]);
   /** The draft provider's chat models (the #51 registry — pick only). */
   const draftModels = useMemo(
-    () => (providerById.get(draft.providerId)?.models ?? []).filter((m) => m.type === 'chat'),
+    () =>
+      (providerById.get(draft.providerId)?.models ?? []).filter((m) => isChatApiKind(m.apiKind)),
     [providerById, draft.providerId],
   );
 
@@ -189,7 +200,7 @@ export function AssistantsPage() {
     setDraft({
       ...EMPTY_DRAFT,
       providerId: first?.id ?? '',
-      defaultModel: first?.models.find((m) => m.type === 'chat')?.id ?? '',
+      defaultModel: first?.models.find((m) => isChatApiKind(m.apiKind))?.id ?? '',
     });
     setEditing(null);
     setCreating(true);
@@ -202,8 +213,10 @@ export function AssistantsPage() {
       providerId: a.providerId,
       defaultModel: a.defaultModel,
       systemPromptOverride: a.systemPromptOverride ?? '',
+      permissionMode: a.permissionMode ?? 'prompt',
       enabledToolGroups: [...a.enabledToolGroups],
       mcpServerIds: [...(a.mcpServerIds ?? [])],
+      apiToolServiceIds: [...(a.apiToolServiceIds ?? [])],
       skillResourceIds: [...(a.skillResourceIds ?? [])],
       dailyTokenBudget: a.dailyTokenBudget !== null ? String(a.dailyTokenBudget) : '',
     });
@@ -223,8 +236,10 @@ export function AssistantsPage() {
         ...(draft.systemPromptOverride.trim() !== ''
           ? { systemPromptOverride: draft.systemPromptOverride }
           : {}),
+        permissionMode: draft.permissionMode,
         enabledToolGroups: draft.enabledToolGroups as (typeof ASSISTANT_TOOL_GROUPS)[number][],
         mcpServerIds: draft.mcpServerIds,
+        apiToolServiceIds: draft.apiToolServiceIds,
         skillResourceIds: draft.skillResourceIds,
         ...(draft.dailyTokenBudget.trim() !== ''
           ? { dailyTokenBudget: Number(draft.dailyTokenBudget) }
@@ -274,11 +289,7 @@ export function AssistantsPage() {
     }
   }
 
-  const canSave =
-    draft.name.trim() !== '' &&
-    draft.providerId !== '' &&
-    draft.defaultModel !== '' &&
-    draft.enabledToolGroups.length > 0;
+  const canSave = draft.name.trim() !== '' && draft.providerId !== '' && draft.defaultModel !== '';
 
   return (
     <>
@@ -292,12 +303,8 @@ export function AssistantsPage() {
 
       <PageIntro sub={t('assistants.subtitle')} />
 
-      {providers.length === 0 && items !== null ? (
-        <Note tone="warn">{t('llmProviders.empty')}</Note>
-      ) : null}
-
       <DataTable
-        columns={4}
+        columns={5}
         label={t('assistants.listTitle')}
         icon={<Wand2Icon />}
         state={tableState({
@@ -307,23 +314,38 @@ export function AssistantsPage() {
         })}
         error={error}
         onRetry={() => void refresh()}
-        empty={{
-          title: t('assistants.empty'),
-          hint: t('assistants.emptyHint'),
-          action:
-            providers.length > 0 ? (
-              <Button onClick={openCreate} className="gap-1.5">
-                <PlusIcon className="size-4" />
-                {t('assistants.createButton')}
-              </Button>
-            ) : undefined,
-        }}
+        empty={
+          providers.length === 0
+            ? {
+                // #78 — no providers means the create button is a dead end;
+                // the empty state itself carries the way out (the 403
+                // pattern) instead of a warn strip above it.
+                title: t('assistants.emptyNoProviderTitle'),
+                hint: t('assistants.emptyNoProviderHint'),
+                action: (
+                  <Button asChild variant="outline" size="sm">
+                    <Link to="/llm-providers">{t('assistants.goProviders')}</Link>
+                  </Button>
+                ),
+              }
+            : {
+                title: t('assistants.empty'),
+                hint: t('assistants.emptyHint'),
+                action: (
+                  <Button onClick={openCreate} className="gap-1.5">
+                    <PlusIcon className="size-4" />
+                    {t('assistants.createButton')}
+                  </Button>
+                ),
+              }
+        }
       >
         <TableHeader>
           <TableRow>
             <TableHead>{t('common.name')}</TableHead>
             <TableHead>{t('assistants.colModel')}</TableHead>
             <TableHead>{t('assistants.colGroups')}</TableHead>
+            <TableHead>{t('assistants.colMode')}</TableHead>
             <TableHead className="text-right">{t('common.actions')}</TableHead>
           </TableRow>
         </TableHeader>
@@ -349,11 +371,14 @@ export function AssistantsPage() {
                 <TableCell>
                   <div className="flex flex-wrap gap-1">
                     {a.enabledToolGroups.map((g) => (
-                      <Badge key={g} variant="secondary" className="font-mono text-[10px]">
+                      <Badge key={g} variant="secondary" className="role-data-sm">
                         {g}
                       </Badge>
                     ))}
                   </div>
+                </TableCell>
+                <TableCell>
+                  <span className="font-mono text-xs">{a.permissionMode ?? 'prompt'}</span>
                 </TableCell>
                 <TableCell className="text-right">
                   <DropdownMenu>
@@ -428,7 +453,7 @@ export function AssistantsPage() {
                   setDraft((d) => ({
                     ...d,
                     providerId: v,
-                    defaultModel: prov?.models.find((m) => m.type === 'chat')?.id ?? '',
+                    defaultModel: prov?.models.find((m) => isChatApiKind(m.apiKind))?.id ?? '',
                   }));
                 }}
               >
@@ -474,7 +499,7 @@ export function AssistantsPage() {
               </Select>
             </div>
           </Field>
-          <Field label={t('assistants.groupsLabel')}>
+          <Field label={t('assistants.groupsLabel')} hint={t('assistants.groupsHint')}>
             <div className="grid grid-cols-2 gap-1.5">
               {ASSISTANT_TOOL_GROUPS.map((g) => (
                 <label key={g} className="flex items-center gap-2 text-sm">
@@ -494,6 +519,27 @@ export function AssistantsPage() {
                 </label>
               ))}
             </div>
+          </Field>
+          <Field label={t('assistants.permLabel')} hint={t('assistants.permHint')}>
+            <Select
+              value={draft.permissionMode}
+              onValueChange={(v) =>
+                setDraft((d) => ({
+                  ...d,
+                  permissionMode:
+                    v === 'autoWrite' ? 'autoWrite' : v === 'delegated' ? 'delegated' : 'prompt',
+                }))
+              }
+            >
+              <SelectTrigger aria-label={t('assistants.permLabel')} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="prompt">{t('assistants.permPrompt')}</SelectItem>
+                <SelectItem value="autoWrite">{t('assistants.permAutoWrite')}</SelectItem>
+                <SelectItem value="delegated">{t('assistants.permDelegated')}</SelectItem>
+              </SelectContent>
+            </Select>
           </Field>
           <Field label={t('assistants.mcpLabel')} hint={t('assistants.mcpHint')}>
             {mcpServers.length === 0 ? (
@@ -520,6 +566,11 @@ export function AssistantsPage() {
                               checked === true
                                 ? [...d.mcpServerIds, s.id]
                                 : d.mcpServerIds.filter((x) => x !== s.id),
+                            // Attaching a server is intent to use — turn the
+                            // group on too (it gates whether the tools join).
+                            ...(checked === true && !d.enabledToolGroups.includes('mcp')
+                              ? { enabledToolGroups: [...d.enabledToolGroups, 'mcp'] }
+                              : {}),
                           }))
                         }
                       />
@@ -534,6 +585,48 @@ export function AssistantsPage() {
                 })}
               </div>
             )}
+            {draft.mcpServerIds.length > 0 && !draft.enabledToolGroups.includes('mcp') ? (
+              <p className="text-state-warn-ink mt-1.5 text-[11px] leading-relaxed">
+                {t('assistants.mcpGroupOff')}
+              </p>
+            ) : null}
+          </Field>
+          <Field label={t('apiTools.servicesLabel')} hint={t('apiTools.servicesHint')}>
+            {apiServices.length === 0 ? (
+              <span className="text-muted-foreground text-xs">{t('assistants.noneAvailable')}</span>
+            ) : (
+              <div className="grid grid-cols-2 gap-1.5">
+                {apiServices.map((svc) => (
+                  <label key={svc.id} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={draft.apiToolServiceIds.includes(svc.id)}
+                      onCheckedChange={(checked) =>
+                        setDraft((d) => ({
+                          ...d,
+                          apiToolServiceIds:
+                            checked === true
+                              ? [...d.apiToolServiceIds, svc.id]
+                              : d.apiToolServiceIds.filter((x) => x !== svc.id),
+                          // Attaching a service is intent to use it — the
+                          // api-tools group is opt-in (#80) and its runner
+                          // gate ignores attached services while it is off.
+                          ...(checked === true && !d.enabledToolGroups.includes('api-tools')
+                            ? { enabledToolGroups: [...d.enabledToolGroups, 'api-tools'] }
+                            : {}),
+                        }))
+                      }
+                    />
+                    <span className="truncate font-mono text-xs">{svc.bundle.name}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {draft.apiToolServiceIds.length > 0 &&
+            !draft.enabledToolGroups.includes('api-tools') ? (
+              <p className="text-state-warn-ink mt-1.5 text-[11px] leading-relaxed">
+                {t('assistants.apiToolsGroupOff')}
+              </p>
+            ) : null}
           </Field>
           <Field label={t('assistants.skillsLabel')} hint={t('assistants.skillsHint')}>
             {skillResources.length === 0 ? (

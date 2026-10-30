@@ -8,18 +8,20 @@ import { toast } from 'sonner';
 import {
   ListIcon,
   BotIcon,
-  ChevronRightIcon,
   ClockIcon,
+  FolderIcon,
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
+  HistoryIcon,
+  ScrollTextIcon,
   XIcon,
 } from 'lucide-react';
 import { api } from '@/api';
 import { useAuth, withAuthGuard } from '@/auth';
 import { useI18n, dateLocale } from '@/i18n';
 import { StateSignal } from '@/components/state-signal';
-import { DataText, LabelText, Well, ConfirmDialog } from '@/components/kit';
+import { ConfirmDialog } from '@/components/kit';
 import {
   appSocket,
   emitWithAck,
@@ -27,6 +29,8 @@ import {
   type ChatChannelView,
   type ChatEventEnvelope,
   type ChatHistoryEvent,
+  type ChatHistoryPageEvent,
+  type HistoryItem,
   type ChatSessionClosedPush,
   type ChatSessionFailedPush,
   type ChatSessionReadyPush,
@@ -42,10 +46,14 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { Dialog as DialogPrimitive } from 'radix-ui';
 import { ChatStream } from '@/components/chat/chat-stream.js';
+import { CaptureNoteDialog } from '@/pages/notes/CaptureNoteDialog';
 import { WelcomePane, type WelcomeCard } from '@/components/chat/welcome-pane.js';
 import { ChannelTabs } from '@/components/chat/channel-tabs.js';
 import { EndSwitcher } from '@/components/chat/end-switcher.js';
 import { SessionRow } from '@/components/chat/session-row.js';
+import { RailSessionRow } from '@/components/chat/rail-session-row.js';
+import { DecisionRecordsDialog } from '@/components/decision-records-dialog';
+import { cwdBasename, cwdParent } from '@/lib/cwd.js';
 import { useChatChannels } from '@/components/chat/use-chat-channels.js';
 import { useAssistantSessions } from '@/components/chat/use-assistant-sessions.js';
 import {
@@ -95,6 +103,13 @@ interface SwitchRaceBuffer {
   failed?: ChatSessionFailedPush;
   closed?: ChatSessionClosedPush;
   history?: ChatHistoryEvent['items'];
+  /**
+   * #92/#95 — `session_config` patches (approvals / modes / configOptions)
+   * pushed during the open ack, before the keyed listener attaches. An
+   * ARRAY: a patch carries only its own fields, so replaying just the latest
+   * would drop an earlier modes/configOptions slice.
+   */
+  configs?: ChatEventEnvelope['event'][];
 }
 
 /** Rail data: the daemon-routed listing or the gate that blocked it. */
@@ -129,12 +144,6 @@ function groupSessions(sessions: NativeSessionView[]): SessionGroup[] {
   }
   groups.sort((a, b) => b.newest - a.newest);
   return groups;
-}
-
-function cwdBasename(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, '');
-  const last = trimmed.split('/').pop();
-  return last === undefined || last === '' ? cwd : last;
 }
 
 function relativeTime(iso: string | null | undefined, locale: string): string {
@@ -261,7 +270,11 @@ function SessionRail({
   const { t, lang } = useI18n();
   return (
     <>
-      <div className="flex items-center gap-1 border-b px-2 py-2.5">
+      {/* The rail's header band pins to the stream header's h-12 so the two
+      columns' bottom borders read as one line — a hugging height rides the
+      skin-scaled control tokens (52px Signal / 45px BAY) and misaligns per
+      skin against the fixed 48px stream band. */}
+      <div className="flex h-12 items-center gap-1 border-b px-2">
         {end !== undefined && end !== null ? (
           <EndSwitcher current={end} fromDrawer={endInDrawer} />
         ) : null}
@@ -286,79 +299,74 @@ function SessionRail({
           <PlusIcon className="size-4" />
           {t('chat.newSession')}
         </Button>
-        <p className="text-muted-foreground mt-1.5 text-center text-[11px]">
-          {t('chat.disconnectHint')}
-        </p>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         {rail.state === 'loading' ? (
-          <p className="text-muted-foreground px-2 py-4 text-xs">{t('common.loading')}</p>
+          <p className="text-muted-foreground px-3 py-4 text-xs">{t('common.loading')}</p>
         ) : rail.state === 'offline' ? (
-          <p className="text-muted-foreground px-2 py-4 text-xs">{t('chat.sessionsOffline')}</p>
+          <p className="text-muted-foreground px-3 py-4 text-xs">{t('chat.sessionsOffline')}</p>
         ) : rail.state === 'daemon-old' ? (
-          <p className="text-muted-foreground px-2 py-4 text-xs">{t('chat.sessionsDaemonOld')}</p>
+          <p className="text-muted-foreground px-3 py-4 text-xs">{t('chat.sessionsDaemonOld')}</p>
         ) : rail.state === 'error' ? (
-          <p className="text-muted-foreground px-2 py-4 text-xs">{rail.message}</p>
+          <p className="text-muted-foreground px-3 py-4 text-xs">{rail.message}</p>
         ) : !rail.supported && rail.sessions.length === 0 ? (
-          <p className="text-muted-foreground px-2 py-4 text-xs">{t('chat.sessionsUnsupported')}</p>
+          <p className="text-muted-foreground px-3 py-4 text-xs">{t('chat.sessionsUnsupported')}</p>
         ) : (
           <>
             {/* 9 W13 — even where the agent keeps no listable native
                       history (opencode), live channels are real, rejoinable
                       rows: render them instead of hiding the rail. */}
             {!rail.supported ? (
-              <p className="text-muted-foreground px-2 pt-2 text-[11px]">
+              <p className="text-muted-foreground px-3 pt-2 text-[11px]">
                 {t('chat.sessionsUnsupportedPartial')}
               </p>
             ) : null}
             {groups.length === 0 ? (
-              <p className="text-muted-foreground px-2 py-4 text-xs">{t('chat.noSessions')}</p>
+              <p className="text-muted-foreground px-3 py-4 text-xs">{t('chat.noSessions')}</p>
             ) : (
               groups.map((group) => {
                 // #13 — folders COLLAPSE (ZCode-style); per-cwd state,
                 // default open.
                 const collapsed = collapsedCwds.has(group.cwd);
                 return (
-                  <div key={group.cwd} className="border-b last:border-b-0">
-                    {/* The group header is the comp's `.sgroup-h`: a tray strip
-                            carrying the label AND the directory itself as a
-                            Well. It used to print a basename and keep the path
-                            in a tooltip — a rail that cannot tell two projects
-                            apart, and hand-rolled chrome on a page whose every
-                            other band is a designed device ("会话列表的样式感觉
-                            游离于设计之外", #23). Click the strip to collapse;
-                            hover reveals the new-session-in-this-cwd button. */}
-                    <div className="bg-tray group/folder border-b px-3 py-2">
-                      <div className="text-muted-foreground flex items-center gap-1">
-                        <button
-                          type="button"
-                          className="hover:text-foreground flex min-w-0 flex-1 items-center gap-1.5 text-left"
-                          title={group.cwd}
-                          aria-label={`${t('chat.workingDirectory')} ${group.cwd}`}
-                          aria-expanded={!collapsed}
-                          onClick={() => onToggleCwd(group.cwd)}
-                        >
-                          <ChevronRightIcon
-                            className={cn(
-                              'size-3 shrink-0 transition-transform',
-                              !collapsed && 'rotate-90',
-                            )}
-                          />
-                          <LabelText size="sm">{t('chat.workingDirectory')}</LabelText>
-                        </button>
-                        <button
-                          type="button"
-                          className="hover:text-foreground shrink-0 opacity-0 group-hover/folder:opacity-100"
-                          title={t('chat.newSessionHere', { dir: cwdBasename(group.cwd) })}
-                          aria-label={t('chat.newSessionHere', { dir: group.cwd })}
-                          onClick={() => void onOpenChannel(undefined, group.cwd)}
-                        >
-                          <PlusIcon className="size-3.5" />
-                        </button>
-                      </div>
-                      <Well variant="chip" copy={group.cwd} className="mt-1.5 max-w-full">
-                        {group.cwd}
-                      </Well>
+                  <div key={group.cwd} className="border-t first:border-t-0">
+                    {/* #99 D3 — the folder header: the icon + name + parent
+                            path line is the collapse control (the 14px icon
+                            alone is too small a target), the `+` is a SIBLING
+                            button so it creates without collapsing. Rows hang
+                            at the name's left edge; groups, not rows, carry
+                            the separators. */}
+                    <div className="bg-tray group/folder relative flex items-center border-b px-3 py-2 max-md:min-h-11 max-md:py-3 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:py-3">
+                      <button
+                        type="button"
+                        className="hover:text-foreground flex min-w-0 flex-1 items-baseline gap-1.5 text-left max-md:pr-8 [@media(hover:none)]:pr-8"
+                        title={group.cwd}
+                        aria-label={`${t('chat.workingDirectory')}: ${group.cwd}`}
+                        aria-expanded={!collapsed}
+                        onClick={() => onToggleCwd(group.cwd)}
+                      >
+                        <FolderIcon
+                          className="text-muted-foreground size-3.5 shrink-0 self-center"
+                          aria-hidden="true"
+                        />
+                        <span className="text-foreground min-w-0 truncate text-[13px] leading-[19px] font-semibold">
+                          {cwdBasename(group.cwd)}
+                        </span>
+                        {cwdParent(group.cwd) !== null ? (
+                          <span className="text-muted-foreground ml-auto max-w-[132px] shrink-0 truncate font-mono text-[10.5px] leading-[15px] transition-opacity group-hover/folder:opacity-0 max-md:max-w-[100px] max-md:opacity-100 [@media(hover:none)]:max-w-[100px] [@media(hover:none)]:opacity-100">
+                            {cwdParent(group.cwd)}
+                          </span>
+                        ) : null}
+                      </button>
+                      <button
+                        type="button"
+                        className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2.5 -translate-y-1/2 p-1 opacity-0 transition-opacity group-hover/folder:opacity-100 focus-visible:opacity-100 max-md:right-2 max-md:p-1.5 max-md:opacity-100 [@media(pointer:coarse)]:p-1.5 [@media(hover:none)]:opacity-100"
+                        title={t('chat.newSessionHere', { dir: cwdBasename(group.cwd) })}
+                        aria-label={t('chat.newSessionHere', { dir: group.cwd })}
+                        onClick={() => void onOpenChannel(undefined, group.cwd)}
+                      >
+                        <PlusIcon className="size-3" />
+                      </button>
                     </div>
                     {!collapsed
                       ? group.sessions.map((s) => {
@@ -373,9 +381,15 @@ function SessionRail({
                           // The channel map IS the open state.
                           const attached = channelByNative.get(s.sessionId);
                           // #12 — RUNNING is the attached channel's live busy
-                          // flag: a green dot, never gated on the row merely
-                          // being viewed.
+                          // flag, shown even on the row being viewed; #99 —
+                          // `open` is a WORD now and only on non-current rows
+                          // (the edge + tint already mark the current one).
                           const running = attached?.busy === true;
+                          const word = running
+                            ? ('running' as const)
+                            : attached !== undefined && !active
+                              ? ('open' as const)
+                              : null;
                           return (
                             <SessionRow
                               key={s.sessionId}
@@ -387,9 +401,24 @@ function SessionRail({
                                   : undefined
                               }
                             >
-                              <button
-                                type="button"
+                              <RailSessionRow
+                                title={
+                                  s.title ??
+                                  (s.sessionId === nativeSessionId ? firstPromptText : undefined) ??
+                                  t('chat.untitled')
+                                }
+                                meta={`${relativeTime(s.updatedAt, dateLocale(lang))} · ${s.sessionId.slice(0, 8)}`}
+                                active={active}
+                                word={word}
+                                faded={stale}
                                 disabled={stale && !active}
+                                titleAttr={
+                                  stale
+                                    ? t('chat.staleModel', { model: s.model ?? '?' })
+                                    : attached !== undefined && !active
+                                      ? t('chat.channelOpenHint')
+                                      : (s.title ?? s.cwd)
+                                }
                                 onClick={() => {
                                   if (active || stale) return;
                                   // With a live channel this is a REJOIN;
@@ -412,58 +441,7 @@ function SessionRail({
                                     });
                                   }
                                 }}
-                                className={cn(
-                                  'flex w-full items-start gap-2 border-b px-3 py-2 text-left last:border-b-0',
-                                  active
-                                    ? 'bg-tray'
-                                    : stale
-                                      ? 'cursor-default'
-                                      : 'hover:bg-tray/60',
-                                  stale && !active && 'opacity-50',
-                                )}
-                                title={
-                                  stale
-                                    ? t('chat.staleModel', { model: s.model ?? '?' })
-                                    : attached !== undefined && !active
-                                      ? t('chat.channelOpenHint')
-                                      : (s.title ?? s.cwd)
-                                }
-                              >
-                                {/* The status gutter: green running, blue
-                                      opened, empty otherwise (#12/#13). Top-
-                                      aligned, the way the comp's `.sess` lamp
-                                      sits beside a two-line row. */}
-                                <span className="mt-1 flex w-2 shrink-0 justify-center">
-                                  <StateSignal
-                                    state={
-                                      running ? 'busy' : attached !== undefined ? 'live' : 'idle'
-                                    }
-                                    className="size-1.5"
-                                  />
-                                </span>
-                                <span className="min-w-0 flex-1">
-                                  <span
-                                    className={cn(
-                                      'block truncate text-xs',
-                                      active && 'text-foreground font-semibold',
-                                    )}
-                                  >
-                                    {s.title ??
-                                      (s.sessionId === nativeSessionId
-                                        ? firstPromptText
-                                        : undefined) ??
-                                      t('chat.untitled')}
-                                  </span>
-                                  {/* When + WHICH: the comp prints the age and the
-                                    short id, and the id is what a session can
-                                    be resumed by. Data role, so the column of
-                                    times stays tabular. */}
-                                  <DataText size="sm" tone="dim" className="mt-0.5 block truncate">
-                                    {relativeTime(s.updatedAt, dateLocale(lang))} ·{' '}
-                                    {s.sessionId.slice(0, 8)}
-                                  </DataText>
-                                </span>
-                              </button>
+                              />
                             </SessionRow>
                           );
                         })
@@ -486,6 +464,8 @@ export function AgentSessionPage() {
   const { logout } = useAuth();
   const { t, lang } = useI18n();
   const [agent, setAgent] = useState<AgentInstanceView | null>(null);
+  // #88 — the step markdown awaiting 保存为笔记 (null = dialog closed).
+  const [capture, setCapture] = useState<string | null>(null);
   const [machine, setMachine] = useState<AgentInstanceMachineView | null>(null);
   // Phone-only drawer holding the same rail (P5) — the rail is `hidden md:flex`
   // and used to have no narrow-screen alternative at all.
@@ -493,6 +473,8 @@ export function AgentSessionPage() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [rail, setRail] = useState<RailState>({ state: 'loading' });
   const [sessionId, setSessionId] = useState('');
+  /** #104 — the session-scoped delegated-records dialog (header action). */
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const [nativeSessionId, setNativeSessionId] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -515,6 +497,22 @@ export function AgentSessionPage() {
   /** From the ready push's promptCapabilities — gates image attach. */
   const [imageSupported, setImageSupported] = useState(false);
   const [conversation, dispatch] = useReducer(fold, undefined, createFoldState);
+  /**
+   * History paging — the fold's item base (initial window + prepended pages
+   * + live events since), the hasMore cursor, and the prepend key (bumps on
+   * each applied prepend so the scroller can hold the viewport position).
+   * The daemon's ring is compacted (one item per message/tool call), so a
+   * heavy day fits — but beyond the sync window the pane pages older content
+   * on scroll-to-top, and the load-all control beside 断开 fetches the rest.
+   */
+  const historyItemsRef = useRef<HistoryItem[]>([]);
+  const historyHasMoreRef = useRef(false);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const historyFetchingRef = useRef(false);
+  const pendingPrependRef = useRef<HistoryItem[] | null>(null);
+  const [prependKey, setPrependKey] = useState(0);
+  const conversationRef = useRef(conversation);
+  conversationRef.current = conversation;
   /** 9 W11 B — the tab strip's live-channel truth (snapshot pushes). */
   const channels = useChatChannels();
   /** #52 M3 — the user's busy assistant turns, as tabs ahead of the channels. */
@@ -564,15 +562,27 @@ export function AgentSessionPage() {
     const onHistory = (push: ChatHistoryEvent): void => {
       entry(push.sessionId).history = push.items;
     };
+    // #95 — the SERVER's approvals `session_config` (and any daemon config
+    // patch) can land inside the open ack, before the keyed listener exists.
+    // Buffer the patches, not just the latest: each carries its own fields.
+    const onEvent = (envelope: ChatEventEnvelope): void => {
+      if (envelope.event.kind !== 'session_config') return;
+      const e = entry(envelope.sessionId);
+      e.configs ??= [];
+      e.configs.push(envelope.event);
+      if (e.configs.length > 8) e.configs.shift();
+    };
     socket.on('chat:session.ready', onReady);
     socket.on('chat:session.failed', onFailed);
     socket.on('chat:session.closed', onClosed);
     socket.on('chat:history', onHistory);
+    socket.on('chat:event', onEvent);
     return () => {
       socket.off('chat:session.ready', onReady);
       socket.off('chat:session.failed', onFailed);
       socket.off('chat:session.closed', onClosed);
       socket.off('chat:history', onHistory);
+      socket.off('chat:event', onEvent);
     };
   }, []);
 
@@ -685,6 +695,11 @@ export function AgentSessionPage() {
     if (buffered === undefined) return;
     switchBufferRef.current.delete(sessionId);
     if (buffered.history !== undefined) dispatch({ type: 'history', items: buffered.history });
+    // #95 — replay the config patches caught before the keyed listener
+    // attached (the server's approvals push is the first one on every open).
+    if (buffered.configs !== undefined) {
+      for (const event of buffered.configs) dispatch({ type: 'event', event });
+    }
     if (buffered.ready !== undefined) {
       setPhase('ready');
       if (buffered.ready.nativeSessionId !== undefined) {
@@ -722,13 +737,54 @@ export function AgentSessionPage() {
   useEffect(() => {
     if (sessionId === '') return;
     const socket = appSocket();
+    // Paging bookkeeping resets with the channel (the refs ride the session).
+    historyItemsRef.current = [];
+    historyHasMoreRef.current = false;
+    setHistoryHasMore(false);
+    historyFetchingRef.current = false;
+    pendingPrependRef.current = null;
+    /** Rebuild from the item base; mid-turn prepends wait for the turn end
+     *  (the history rebuild force-closes running rows). */
+    const applyItems = (items: HistoryItem[]): void => {
+      if (conversationRef.current.turnActive) {
+        pendingPrependRef.current = items;
+        return;
+      }
+      historyItemsRef.current = items;
+      dispatch({ type: 'history', items });
+      setPrependKey((k) => k + 1);
+    };
     const onEvent = (envelope: ChatEventEnvelope): void => {
       if (envelope.sessionId !== sessionId) return;
       dispatch({ type: 'event', event: envelope.event });
+      // Keep the item base complete — live events join it so a later prepend
+      // rebuild replays the whole transcript, not just the ring window.
+      historyItemsRef.current.push({ type: 'event', event: envelope.event });
+      // A parked prepend applies at the turn's end.
+      if (
+        pendingPrependRef.current !== null &&
+        (envelope.event.kind === 'turn_result' ||
+          (envelope.event.kind === 'session_status' && envelope.event.state === 'idle'))
+      ) {
+        const items = pendingPrependRef.current;
+        pendingPrependRef.current = null;
+        applyItems(items);
+      }
     };
     const onHistory = (push: ChatHistoryEvent): void => {
       if (push.sessionId !== sessionId) return;
+      historyHasMoreRef.current = push.hasMore === true;
+      setHistoryHasMore(push.hasMore === true);
+      pendingPrependRef.current = null;
+      historyItemsRef.current = push.items.slice();
       dispatch({ type: 'history', items: push.items });
+    };
+    const onHistoryPage = (push: ChatHistoryPageEvent): void => {
+      if (push.sessionId !== sessionId) return;
+      historyFetchingRef.current = false;
+      historyHasMoreRef.current = push.hasMore === true;
+      setHistoryHasMore(push.hasMore === true);
+      applyItems([...push.items, ...historyItemsRef.current]);
     };
     const onReady = (push: ChatSessionReadyPush): void => {
       if (push.sessionId !== sessionId) return;
@@ -765,17 +821,44 @@ export function AgentSessionPage() {
     };
     socket.on('chat:event', onEvent);
     socket.on('chat:history', onHistory);
+    socket.on('chat:history.page', onHistoryPage);
     socket.on('chat:session.ready', onReady);
     socket.on('chat:session.failed', onFailed);
     socket.on('chat:session.closed', onClosed);
     return () => {
       socket.off('chat:event', onEvent);
       socket.off('chat:history', onHistory);
+      socket.off('chat:history.page', onHistoryPage);
       socket.off('chat:session.ready', onReady);
       socket.off('chat:session.failed', onFailed);
       socket.off('chat:session.closed', onClosed);
     };
   }, [sessionId, refreshSessions]);
+
+  /**
+   * Page older history: asked by scroll-to-top (default page) and by the
+   * load-all control (huge limit — one round-trip). The response arrives as
+   * `chat:history.page` (prepended above); the fetching flag doubles as the
+   * in-flight guard and self-clears so a lost page doesn't wedge the button.
+   */
+  const fetchOlderHistory = useCallback(
+    (limit?: number) => {
+      if (sessionId === '' || historyFetchingRef.current || !historyHasMoreRef.current) return;
+      const first = historyItemsRef.current[0];
+      const beforeSeq = first?.seq;
+      if (beforeSeq === undefined) return;
+      historyFetchingRef.current = true;
+      appSocket().emit(
+        'chat:history.fetch',
+        { sessionId, beforeSeq, ...(limit !== undefined ? { limit } : {}) },
+        () => {},
+      );
+      window.setTimeout(() => {
+        historyFetchingRef.current = false;
+      }, 8000);
+    },
+    [sessionId],
+  );
 
   async function openChannel(
     rejoinId?: string,
@@ -912,6 +995,19 @@ export function AgentSessionPage() {
     });
     if (ack.error !== undefined) {
       toast.error(t('chat.configSetFailed', { error: ack.error }));
+    }
+  }
+
+  /** #92 — switch the approvals responder; the session_config approvals
+   *  slice settles the sender's switch (no browser-side optimism). */
+  async function approvalsSet(responder: 'manual' | 'delegated'): Promise<void> {
+    if (sessionId === '') return;
+    const ack = await emitWithAck<{ accepted?: boolean; error?: string }>('chat:approvals.set', {
+      sessionId,
+      responder,
+    });
+    if (ack.error !== undefined) {
+      toast.error(t('chat.approvalsSetFailed', { error: ack.error }));
     }
   }
 
@@ -1246,7 +1342,7 @@ export function AgentSessionPage() {
               <BotIcon className="text-muted-foreground size-4 shrink-0" />
               <span className="truncate text-sm font-medium">{agent?.name ?? t('chat.title')}</span>
               {agent !== null ? (
-                <Badge variant="secondary" className="font-mono text-[10px]">
+                <Badge variant="secondary" className="role-data-sm">
                   {agent.target}
                 </Badge>
               ) : null}
@@ -1265,18 +1361,55 @@ export function AgentSessionPage() {
                 </span>
               ) : null}
               <span className="min-w-0 flex-1" />
-              {phase === 'ready' || phase === 'connecting' ? (
+              {/* #104 — the stable entry to this session's delegated audit.
+                  The in-stream entry only exists in a fold that saw a
+                  delegated settle, so long sessions lost the door. */}
+              {sessionId !== '' ? (
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => void disconnectChannel()}
-                  title={t('chat.disconnectHint')}
+                  className="gap-1.5"
+                  onClick={() => setRecordsOpen(true)}
+                  title={t('decisions.openHint')}
                 >
-                  <XIcon className="size-3.5" />
-                  <span className="hidden sm:inline">{t('chat.disconnect')}</span>
+                  <ScrollTextIcon className="size-3.5" />
+                  <span className="hidden sm:inline">{t('decisions.openLabel')}</span>
                 </Button>
               ) : null}
+              {phase === 'ready' || phase === 'connecting' ? (
+                <>
+                  {/* History paging — pull the WHOLE ring in (search-ready),
+                  versus the scroll-to-top one-page fetches. */}
+                  {historyHasMore ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => fetchOlderHistory(20_000)}
+                      title={t('chat.historyLoadAllHint')}
+                    >
+                      <HistoryIcon className="size-3.5" />
+                      <span className="hidden sm:inline">{t('chat.historyLoadAll')}</span>
+                    </Button>
+                  ) : null}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void disconnectChannel()}
+                    title={t('chat.disconnectHint')}
+                  >
+                    <XIcon className="size-3.5" />
+                    <span className="hidden sm:inline">{t('chat.disconnect')}</span>
+                  </Button>
+                </>
+              ) : null}
             </div>
+            {sessionId !== '' ? (
+              <DecisionRecordsDialog
+                open={recordsOpen}
+                onClose={() => setRecordsOpen(false)}
+                sessionId={sessionId}
+              />
+            ) : null}
 
             {error !== null && phase !== 'closed' ? (
               <p className="text-destructive border-destructive/30 bg-destructive/5 border-b px-4 py-2 text-xs">
@@ -1297,9 +1430,20 @@ export function AgentSessionPage() {
               />
             ) : (
               <>
+                {capture !== null ? (
+                  <CaptureNoteDialog
+                    markdown={capture}
+                    sourceRef={`${agent?.name ?? 'agent'} · ${nativeSessionId?.slice(0, 8) ?? 'session'}`}
+                    onClose={() => setCapture(null)}
+                  />
+                ) : null}
                 <ChatStream
                   state={conversation}
                   cwd={currentCwd}
+                  sessionId={sessionId === '' ? undefined : sessionId}
+                  prependKey={prependKey}
+                  onTopReached={() => fetchOlderHistory()}
+                  onCaptureStep={setCapture}
                   onPermissionRespond={(requestId, optionId) =>
                     void respondPermission(requestId, optionId)
                   }
@@ -1341,6 +1485,7 @@ export function AgentSessionPage() {
                       imageSupported={imageSupported}
                       config={conversation.config satisfies ComposerConfig}
                       onConfigSet={(set) => void configSet(set)}
+                      onApprovalsSet={(responder) => void approvalsSet(responder)}
                       commands={conversation.commands}
                     />
                   </div>

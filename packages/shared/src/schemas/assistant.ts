@@ -24,9 +24,13 @@ export const ASSISTANT_TOOL_GROUPS = [
   'profiles',
   'mcp',
   'skills-hub',
+  // #88 — the owner's notes library (read tools + per-turn context injection).
+  'notes',
   'machines',
   // #67 — client-agent dispatch; deliberately NOT in the defaults (opt-in).
   'agent-dispatch',
+  // #80 — the user's configured API tool services (opt-in, like dispatch).
+  'api-tools',
   'system',
 ] as const;
 
@@ -39,6 +43,7 @@ export const DEFAULT_ASSISTANT_TOOL_GROUPS: readonly AssistantToolGroup[] = [
   'profiles',
   'mcp',
   'skills-hub',
+  'notes',
   'machines',
   'system',
 ];
@@ -52,6 +57,8 @@ export const assistantConfigCreateSchema = z.object({
   /** Must be a `type:'chat'` entry on that provider's registry (service-validated). */
   defaultModel: z.string().min(1).max(128),
   systemPromptOverride: z.string().max(32_000).optional(),
+  /** #79 — write-tool policy (read is always silent, meta always prompts). */
+  permissionMode: z.enum(['prompt', 'autoWrite', 'delegated']).default('prompt'),
   enabledToolGroups: z
     .array(assistantToolGroupSchema)
     .max(16)
@@ -59,6 +66,8 @@ export const assistantConfigCreateSchema = z.object({
   /** M2 — full replace; visibility validated in the service. */
   mcpServerIds: z.array(z.string().min(1).max(64)).max(32).default([]),
   skillResourceIds: z.array(z.string().min(1).max(64)).max(64).default([]),
+  /** #80 — visible ApiToolService ids whose tools join the turn (validated in the service). */
+  apiToolServiceIds: z.array(z.string().min(1).max(64)).max(16).default([]),
   /** M3 — null/unset = unlimited. */
   dailyTokenBudget: z.number().int().positive().max(2_000_000_000).nullable().optional(),
 });
@@ -72,9 +81,11 @@ export const assistantConfigUpdateSchema = z
     providerId: z.string().min(1).max(64).optional(),
     defaultModel: z.string().min(1).max(128).optional(),
     systemPromptOverride: z.string().max(32_000).nullable().optional(),
+    permissionMode: z.enum(['prompt', 'autoWrite', 'delegated']).optional(),
     enabledToolGroups: z.array(assistantToolGroupSchema).max(16).optional(),
     mcpServerIds: z.array(z.string().min(1).max(64)).max(32).optional(),
     skillResourceIds: z.array(z.string().min(1).max(64)).max(64).optional(),
+    apiToolServiceIds: z.array(z.string().min(1).max(64)).max(16).optional(),
     /** M3 — `null` clears back to unlimited. */
     dailyTokenBudget: z.number().int().positive().max(2_000_000_000).nullable().optional(),
   })
@@ -89,9 +100,11 @@ export const assistantConfigViewSchema = z.object({
   providerId: z.string().min(1),
   defaultModel: z.string().min(1).max(128),
   systemPromptOverride: z.string().max(32_000).optional(),
+  permissionMode: z.enum(['prompt', 'autoWrite', 'delegated']),
   enabledToolGroups: z.array(assistantToolGroupSchema),
   mcpServerIds: z.array(z.string()),
   skillResourceIds: z.array(z.string()),
+  apiToolServiceIds: z.array(z.string()),
   dailyTokenBudget: z.number().int().positive().nullable(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
@@ -206,15 +219,19 @@ export const assistantQueueCancelRequestSchema = z.object({
 });
 
 /**
- * browser → server: switch the assistant config (`agent`) or the model
- * (`model`) for the NEXT turn. OPAQUE values — `agent` is an assistant config
- * id, `model` a registry model id on the session's provider; the server
- * validates both at apply time, never trusts the browser's labels.
+ * browser → server: switch the assistant config (`agent`), the model
+ * (`model`), or the conversation's write-policy (`permissionMode`, #79 — the
+ * sender-level switch; the config's value is only the default stamped at
+ * open) for the NEXT turn. OPAQUE values — `agent` is an assistant config id,
+ * `model` a registry model id on the session's provider; the server validates
+ * both at apply time, never trusts the browser's labels. `permissionMode` is
+ * one of the declared #79/#95 modes (`delegated` is refused when the owner
+ * has no resolvable default decision model).
  */
 export const assistantConfigSetRequestSchema = z.object({
   sessionId: z.string().min(1).max(64),
   kind: z.literal('option'),
-  configId: z.enum(['agent', 'model']),
+  configId: z.enum(['agent', 'model', 'permissionMode']),
   value: z.string().min(1).max(128),
 });
 

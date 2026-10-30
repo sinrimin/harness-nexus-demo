@@ -661,6 +661,76 @@ function runPrompt(id, text, deferred = false) {
     return;
   }
 
+  // #104 rig modes — a ONE-SHOT allow option (the delegated gate never
+  // answers a persistent allow) and a PAIR of cards surfacing together (the
+  // two-delegations race). 'slow' titles one card for a timeout probe.
+  if (text.includes('ask-permission-once') || text.includes('ask-permission-pair')) {
+    const pair = text.includes('ask-permission-pair');
+    const slow = text.includes('slow');
+    const count = pair ? 2 : 1;
+    let remaining = count;
+    const finishOne = () => {
+      remaining -= 1;
+      if (remaining > 0) return;
+      notify('session/update', {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          contentBlock: { type: 'text', text: 'permission set settled' },
+        },
+      });
+      finish('end_turn');
+    };
+    for (let i = 0; i < count; i += 1) {
+      const permId = nextId++;
+      const toolCallId = `tool-${randomUUID().slice(0, 8)}`;
+      const slowOne = slow && (pair ? i === 1 : true);
+      send({
+        jsonrpc: '2.0',
+        id: permId,
+        method: 'session/request_permission',
+        params: {
+          sessionId,
+          toolCall: {
+            toolCallId,
+            title: slowOne ? 'fixture: slow' : `fixture: echo ${i + 1}`,
+            kind: 'execute',
+            // A pipe defeats the metadata pre-filter, so the card reaches the
+            // decision model (the delegated path this rig mode exercises).
+            rawInput: { command: slowOne ? 'sleep 1' : `echo ${i + 1} | cat` },
+          },
+          options: [
+            { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+          ],
+        },
+      });
+      permissionWaiters.set(permId, (outcome) => {
+        permissionWaiters.delete(permId);
+        const allowed =
+          outcome?.outcome === 'selected' && String(outcome.optionId).startsWith('allow');
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallUpdate: {
+                toolCallId,
+                title: slowOne ? 'fixture: slow' : `fixture: echo ${i + 1}`,
+                kind: 'execute',
+                status: allowed ? 'completed' : 'failed',
+              },
+            },
+          },
+        });
+        finishOne();
+      });
+    }
+    return;
+  }
+
   if (text.includes('ask-permission')) {
     // 'ask-permission string-id' → a UUID request id (codex-acp's dialect).
     // The daemon must echo it VERBATIM: a Number() coercion sends id:null and
@@ -792,13 +862,28 @@ function runPrompt(id, text, deferred = false) {
       contentBlock: { type: 'text', text: 'thinking about it' },
     },
   });
-  notify('session/update', {
-    sessionId,
-    update: {
-      sessionUpdate: 'agent_message_chunk',
-      contentBlock: { type: 'text', text: `echo: ${text}` },
-    },
-  });
+  // 'chunked:<s>' — stream <s> as ONE message chunk PER CHARACTER (the ring
+  // compaction tests need bursts of consecutive deltas).
+  const chunked = /^chunked:(.*)$/s.exec(text);
+  if (chunked) {
+    for (const ch of chunked[1]) {
+      notify('session/update', {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          contentBlock: { type: 'text', text: ch },
+        },
+      });
+    }
+  } else {
+    notify('session/update', {
+      sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        contentBlock: { type: 'text', text: `echo: ${text}` },
+      },
+    });
+  }
   update(sessionId, 'usage_update');
   finish('end_turn');
 }
@@ -1053,6 +1138,32 @@ function handleRequest(msg) {
       respond(id, {});
       return;
     case 'session/set_config_option':
+      // configId 'degenerate': emulate the claude wrapper's external-switch
+      // rebuild gone wrong — a list with whole CATEGORIES missing (no model
+      // row). The daemon must drop it, not let it wipe the sender's selects.
+      if (params?.configId === 'degenerate') {
+        notify('session/update', {
+          sessionId: params?.sessionId ?? 'fx-session',
+          update: {
+            sessionUpdate: 'config_option_update',
+            configOptions: [
+              {
+                id: 'mode',
+                name: 'Mode',
+                category: 'mode',
+                type: 'select',
+                currentValue: 'default',
+                options: [
+                  { value: 'default', name: 'Manual' },
+                  { value: 'auto', name: 'Auto' },
+                ],
+              },
+            ],
+          },
+        });
+        respond(id, {});
+        return;
+      }
       notify('session/update', {
         sessionId: params?.sessionId ?? 'fx-session',
         update: {

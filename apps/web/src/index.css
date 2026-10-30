@@ -66,6 +66,10 @@
 
   /* Semantic status — the one place color carries meaning. */
   --signal: oklch(0.55 0.11 230); /* cyan-700 */
+  /* The accent AS TYPE (#99): --signal on the 8% active tint is 4.01:1, under
+   * AA for the 10px status word. Same split as --lamp-* vs --state-*-ink —
+   * edges and lamps are lit objects, a word is type. */
+  --signal-ink: oklch(0.5 0.11 230);
   --signal-foreground: oklch(0.98 0.004 250);
   /* Brand palette (hexagonal-ribbon logo): the mark carries its own blues,
    * deliberately separate from the UI's single --signal accent. */
@@ -253,6 +257,7 @@
   --ring: oklch(0.7 0.12 230);
 
   --signal: oklch(0.72 0.13 200); /* brighter cyan in dark */
+  --signal-ink: var(--signal); /* 7.11 on the active tint — no deepening needed */
   --signal-foreground: oklch(0.18 0.02 260);
   --brand-bright: #2e9dfd;
   --brand-mid: #2776dd;
@@ -332,6 +337,7 @@
   --color-ring: var(--ring);
 
   --color-signal: var(--signal);
+  --color-signal-ink: var(--signal-ink);
   --color-signal-foreground: var(--signal-foreground);
   --color-scrim: var(--scrim);
   --color-tray: var(--tray);
@@ -571,6 +577,14 @@
 .markdown-body ol {
   margin: 0.5em 0;
   padding-left: 1.4em;
+}
+/* Tailwind preflight resets list-style to none — bring the markers back
+ * (chat stream and notes body both render through .markdown-body). */
+.markdown-body ul {
+  list-style: disc;
+}
+.markdown-body ol {
+  list-style: decimal;
 }
 .markdown-body li {
   margin: 0.15em 0;
@@ -816,12 +830,18 @@
      compact control's square (25px in BAY), because the reference row — and
      this Sender's whole point — is that four controls plus Send fit one line.
      A 2.5rem BOX would put the toolbar back to a two-row block, so the
-     fingertip is an overlay. */
-  [data-slot='composer-tools'] :is([data-slot='select-trigger'], [data-slot='meter-trigger']) {
+     fingertip is an overlay. `data-tool='attach'` is the "+" square, which
+     rides the same control height as the selects since the icon row. */
+  [data-slot='composer-tools']
+    :is([data-slot='select-trigger'], [data-slot='meter-trigger'], [data-tool='attach']) {
     position: relative;
   }
   [data-slot='composer-tools']
-    :is([data-slot='select-trigger'], [data-slot='meter-trigger'])::after {
+    :is(
+      [data-slot='select-trigger'],
+      [data-slot='meter-trigger'],
+      [data-tool='attach']
+    )::after {
     content: '';
     position: absolute;
     inset: 50%;
@@ -877,5 +897,30 @@
   background: color-mix(in oklab, var(--tray) 60%, var(--card));
 }
 
+/* A phone table's horizontal scrollbar is a 15px strip inside the table
+   container; on a page whose content nearly fills the frame that strip is
+   what tips it into a vertical scrollbar (a 15px scroll for a scrollbar's
+   sake — reported from a phone). Below the shell's 900px plate boundary the
+   strip hides: swiping is the gesture, the pinned actions column and its
+   hairline are the affordance, and overlay-scrollbar phones never drew the
+   strip anyway. Desktop keeps the scrollbar. */
+@media (max-width: 899px) {
+  [data-slot='table-container'] {
+    scrollbar-width: none;
+  }
+  [data-slot='table-container']::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 /* The copies that are still `ui/table` outside the kit (unchanged pages) keep
  * their own look; nothing here reaches them. */
+
+/* #93 — mermaid parks its hover-tooltip div on <body> at ~100vh; inside the
+ * SPA it survives route changes and overflows the document (a global
+ * vertical scrollbar on every page). Diagrams are figures — the tooltip
+ * never shows. (The component also prunes the node.) */
+.mermaidTooltip,
+#mermaidTooltip {
+  display: none;
+}

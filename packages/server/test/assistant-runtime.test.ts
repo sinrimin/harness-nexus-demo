@@ -59,7 +59,7 @@ async function setup(): Promise<Harness> {
   await uow.llmProviders.save({
     id: 'prov-1',
     name: 'Gateway',
-    api: 'openai-chat',
+    apis: [{ kind: 'openai-chat', path: null }],
     baseUrl: 'https://gw.example.com/v1',
     credentialName: 'gw-key',
     scope: 'personal',
@@ -67,7 +67,7 @@ async function setup(): Promise<Harness> {
     models: [
       {
         id: 'gw-large',
-        type: 'chat',
+        apiKind: 'openai-chat',
         displayName: 'Gateway Large',
         contextWindow: 64_000,
         maxOutputTokens: 4_000,
@@ -246,9 +246,12 @@ describe('#52 assistant runtime (faux provider)', () => {
     expect(res.ok).toBe(true);
     const sessionId = res.ok ? res.sessionId : '';
 
+    // An existing session is gated by SESSION OWNERSHIP first (the caller's
+    // assistant selection is irrelevant to it — ?s= hand-offs), so another
+    // user gets the session-shaped 404-hide, not the assistant-shaped one.
     expect(await h.svc.open(other.userId, id, sessionId, 'sock-2')).toEqual({
       ok: false,
-      code: 'ASSISTANT_NOT_FOUND',
+      code: 'SESSION_NOT_FOUND',
     });
     expect(await h.svc.onMessageSend(other.userId, sessionId, 'hi')).toEqual({
       ok: false,
@@ -261,13 +264,16 @@ describe('#52 assistant runtime (faux provider)', () => {
     const res = await h.svc.open(owner.userId, await opsId(h), undefined, 'sock-1');
     const sessionId = res.ok ? res.sessionId : '';
 
+    // #82 — this session is still LAZY (no row until the first message): the
+    // rebind succeeds WITHOUT a transcript note (sqlite would reject the
+    // append via the assistant_messages FK) and re-stamps the pending row.
     const set = await h.svc.onConfigSet(owner.userId, sessionId, {
       configId: 'agent',
       value: await secondId(h),
     });
     expect(set.ok).toBe(true);
     const rows = await h.uow.assistants.listMessages(sessionId);
-    expect(rows.some((r) => r.type === 'note' && r.text.includes('"Second"'))).toBe(true);
+    expect(rows.some((r) => r.type === 'note')).toBe(false);
 
     // The LAST session_config snapshot is the post-rebind truth (open also
     // pushed one before the switch).
@@ -287,6 +293,28 @@ describe('#52 assistant runtime (faux provider)', () => {
     ).toEqual({ ok: false, code: 'ASSISTANT_MODEL_NOT_ON_PROVIDER' });
   });
 
+  it('opening an existing session resolves its OWN assistant (stale selection, ?s= hand-off)', async () => {
+    const h = await setup();
+    const ops = await opsId(h);
+    const res = await h.svc.open(owner.userId, ops, undefined, 'sock-1');
+    const sessionId = res.ok ? res.sessionId : '';
+    h.faux.setResponses([piAi.fauxAssistantMessage([piAi.fauxText('one')])]);
+    await h.svc.onMessageSend(owner.userId, sessionId, 'one');
+    await busySettled(h, sessionId);
+
+    // The caller's selection is stale (a busy-tab hand-off landed with a
+    // different assistant pinned): the ROW's assistant wins, and the ack
+    // names it so the page can sync its selection.
+    const reopened = await h.svc.open(owner.userId, await secondId(h), sessionId, 'sock-2');
+    expect(reopened.ok).toBe(true);
+    if (reopened.ok) {
+      expect(reopened.assistantId).toBe(ops);
+      expect(reopened.sessionId).toBe(sessionId);
+    }
+    const row = await h.uow.assistants.findSessionById(sessionId);
+    expect(row?.assistantId).toBe(ops);
+  });
+
   it('#58-4 model select spans visible providers (grouped) and re-points the turn', async () => {
     const h = await setup();
     // A second, GLOBAL provider exposing the SAME model name — the exact case
@@ -294,12 +322,12 @@ describe('#52 assistant runtime (faux provider)', () => {
     await h.uow.llmProviders.save({
       id: 'prov-2',
       name: 'Second Gateway',
-      api: 'openai-chat',
+      apis: [{ kind: 'openai-chat', path: null }],
       baseUrl: 'https://gw2.example.com/v1',
       credentialName: 'gw-key',
       scope: 'global',
       ownerId: null,
-      models: [{ id: 'gw-large', type: 'chat', displayName: 'Gw2 Large' }],
+      models: [{ id: 'gw-large', apiKind: 'openai-chat', displayName: 'Gw2 Large' }],
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     });
@@ -307,12 +335,12 @@ describe('#52 assistant runtime (faux provider)', () => {
     await h.uow.llmProviders.save({
       id: 'prov-other',
       name: 'Stranger',
-      api: 'openai-chat',
+      apis: [{ kind: 'openai-chat', path: null }],
       baseUrl: 'https://stranger.example.com/v1',
       credentialName: 'gw-key',
       scope: 'personal',
       ownerId: other.userId,
-      models: [{ id: 'sneaky', type: 'chat' }],
+      models: [{ id: 'sneaky', apiKind: 'openai-chat' }],
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     });

@@ -52,6 +52,19 @@ export function appSocket(): Socket {
   return socket;
 }
 
+/**
+ * #77 — the auth identity changed (logout, or a login as a different
+ * user): the singleton's EXISTING connection still speaks for the old
+ * identity — the auth callback only runs at connect time, so a live
+ * socket never re-authenticates. Freshly mounted pages would sync the
+ * PREVIOUS user's rooms over it. Drop it; the next `appSocket()` builds
+ * a fresh connection with the then-stored token.
+ */
+export function dropAppSocket(): void {
+  socket?.disconnect();
+  socket = null;
+}
+
 // ---- chat (Phase 8 C5) — mirrors shared/realtime.ts ----
 
 /** One semantic chat event (`chat:event` → `{ sessionId, event }`). */
@@ -81,6 +94,32 @@ export type ChatStreamEvent =
       requestId: string;
       outcome: 'selected' | 'cancelled' | 'timeout';
       optionId?: string;
+      /** #92 — absent on every pre-#92 emit = a human (or watchdog) settled it. */
+      responder?: 'human' | 'delegated';
+      decidedBy?: 'floor' | 'model';
+      delegated?: {
+        providerName: string;
+        modelId: string;
+        confidence?: number;
+        denial?: { reason: string; note?: string };
+      };
+    }
+  | {
+      /** #92 — the gate escalated to the human; its lean rides as advisory. */
+      kind: 'permission_advisory';
+      requestId: string;
+      lean: 'allow' | 'reject';
+      confidence: number;
+      reason?: string;
+      /** v2 — the model's raw verdict inputs, context for the decision. */
+      severity?: number;
+      intent?: number;
+    }
+  | {
+      /** #104 — delegation was on but could not conclude; the card stays. */
+      kind: 'permission_escalated';
+      requestId: string;
+      reason: 'no-model' | 'timeout' | 'http' | 'shape';
     }
   | {
       /** 9 W14.1 — the agent asked a structured question (ACP elicitation). */
@@ -213,6 +252,8 @@ export interface SessionConfigOption {
 interface SessionConfigPatch {
   modes?: { currentModeId?: string; availableModes?: SessionMode[] };
   configOptions?: SessionConfigOption[];
+  /** #92 — the delegated-approvals slice (present = the machine has a provider). */
+  approvals?: { responder: 'manual' | 'delegated'; providerName?: string; modelId?: string };
 }
 
 /** 9 W9 A — the set payload (what the composer emits). */
@@ -323,11 +364,21 @@ export type PromptBlock =
 
 /** One item of a channel's history batch: a user turn, or an ordinary event. */
 export type HistoryItem =
-  { type: 'user'; blocks: PromptBlock[] } | { type: 'event'; event: ChatStreamEvent };
+  | { type: 'user'; blocks: PromptBlock[]; seq?: number }
+  | { type: 'event'; event: ChatStreamEvent; seq?: number };
 
 export interface ChatHistoryEvent {
   sessionId: string;
   items: HistoryItem[];
+  /** Older ring content exists beyond this batch — the pane can page up. */
+  hasMore?: boolean;
+}
+
+/** One older-than-loaded page (chat:history.page) — prepend-only. */
+export interface ChatHistoryPageEvent {
+  sessionId: string;
+  items: HistoryItem[];
+  hasMore?: boolean;
 }
 
 /** Emit with an ack callback; resolves the ack object (rejects on timeout). */

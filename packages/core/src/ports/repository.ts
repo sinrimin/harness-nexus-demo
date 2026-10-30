@@ -13,6 +13,9 @@
 
 import type {
   Credential,
+  DecisionHumanResponse,
+  DecisionRecord,
+  DecisionRecordListFilter,
   AgentInstance,
   AssistantConfig,
   AssistantMessageRow,
@@ -24,6 +27,13 @@ import type {
   Machine,
   MachineInventorySnapshot,
   McpServer,
+  ApiToolService,
+  Note,
+  NoteAnnotation,
+  NoteCategory,
+  NoteStatus,
+  NoteVersion,
+  NoteVisibility,
   PersonalAccessToken,
   Profile,
   Resource,
@@ -121,6 +131,18 @@ export interface McpServerRepository {
     includeDeleted?: boolean;
   }): Promise<McpServer[]>;
   save(server: McpServer): Promise<McpServer>;
+  delete(id: string): Promise<void>;
+}
+
+export interface ApiToolRepository {
+  findById(id: string): Promise<ApiToolService | null>;
+  /** Soft-deleted rows excluded unless includeDeleted (the 404-hiding mirror). */
+  list(filter?: {
+    scope?: 'global' | 'personal';
+    ownerId?: string;
+    includeDeleted?: boolean;
+  }): Promise<ApiToolService[]>;
+  save(service: ApiToolService): Promise<ApiToolService>;
   delete(id: string): Promise<void>;
 }
 
@@ -244,6 +266,101 @@ export interface AssistantRepository {
   listToolCallAudits(sessionId: string): Promise<AssistantToolCallAudit[]>;
 }
 
+/**
+ * #88 — notes. Owner-owned markdown content; `visibility: 'public'` widens
+ * READ to other users (the square) and nothing else. Drivers order `list`
+ * newest-first; `search` matches title/summary/body (FTS at the driver's
+ * discretion) — the port stays substring-semantic.
+ */
+export interface NoteRepository {
+  findById(id: string): Promise<Note | null>;
+  list(filter?: NoteListFilter): Promise<Note[]>;
+  /** Every user's public notes for the square — read-only surface, paginated. */
+  listPublic(filter?: {
+    tag?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<Note[]>;
+  save(note: Note): Promise<Note>;
+  /**
+   * Append the immutable snapshot for `note.contentVersion`. The caller bumps
+   * `contentVersion` and saves the row first; drivers write the snapshot as
+   * part of (or after) that save — never instead of it.
+   */
+  saveVersion(version: NoteVersion): Promise<void>;
+  findVersion(noteId: string, version: number): Promise<NoteVersion | null>;
+  delete(id: string): Promise<void>;
+}
+
+export interface NoteListFilter {
+  ownerId?: string;
+  /** `null` selects the uncategorized bucket explicitly. */
+  categoryId?: string | null;
+  status?: NoteStatus;
+  visibility?: NoteVisibility;
+  tag?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface NoteAnnotationRepository {
+  findById(id: string): Promise<NoteAnnotation | null>;
+  listByNote(noteId: string): Promise<NoteAnnotation[]>;
+  /**
+   * Per-note annotation counts for one owner (feed/board cards): note id →
+   * total and open. Notes without annotations are absent from the map.
+   */
+  countsByOwner(ownerId: string): Promise<Record<string, { total: number; open: number }>>;
+  save(annotation: NoteAnnotation): Promise<NoteAnnotation>;
+  delete(id: string): Promise<void>;
+}
+
+export interface NoteCategoryRepository {
+  findById(id: string): Promise<NoteCategory | null>;
+  /** The owner's full tree (parents before children is NOT guaranteed — build the tree at the caller). */
+  listByOwner(ownerId: string): Promise<NoteCategory[]>;
+  /**
+   * Name uniqueness is per (owner, parent) — the service enforces it
+   * read-then-write. `parentId: null` addresses root-level names.
+   */
+  findByParentAndName(
+    ownerId: string,
+    parentId: string | null,
+    name: string,
+  ): Promise<NoteCategory | null>;
+  save(category: NoteCategory): Promise<NoteCategory>;
+  /**
+   * Deleting a node: children fall to the deleted node's parent, its notes
+   * fall to uncategorized — the driver performs the cascade in one save.
+   */
+  delete(id: string): Promise<void>;
+}
+
+/**
+ * Issue #97 — delegated-decision audit rows. Personal-scope by construction
+ * (`ownerId` is a required filter on every read); `append` prunes the owner
+ * to `DECISION_RECORDS_CAP` newest rows on-write (no sweeper timer).
+ */
+export interface DecisionRecordRepository {
+  /** Append + on-write prune (both drivers own the cap equally). */
+  append(record: DecisionRecord): Promise<void>;
+  /** Newest-first, filtered; `limit` caps the page. */
+  list(filter: DecisionRecordListFilter): Promise<DecisionRecord[]>;
+  /**
+   * Backfill the human's answer on an escalated card — by (owner, session,
+   * request): the realtime settle path never holds row ids. False when no
+   * pending row matched (pruned away, or never escalated).
+   */
+  markHumanResponse(
+    ownerId: string,
+    sessionId: string,
+    requestId: string,
+    response: DecisionHumanResponse,
+  ): Promise<boolean>;
+}
+
 export interface UnitOfWork {
   resources: ResourceRepository;
   profiles: ProfileRepository;
@@ -260,4 +377,9 @@ export interface UnitOfWork {
   llmProviders: LlmProviderRepository;
   assistants: AssistantRepository;
   fileBlobs: FileBlobRepository;
+  apiTools: ApiToolRepository;
+  notes: NoteRepository;
+  noteAnnotations: NoteAnnotationRepository;
+  noteCategories: NoteCategoryRepository;
+  decisionRecords: DecisionRecordRepository;
 }

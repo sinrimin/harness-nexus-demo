@@ -27,6 +27,9 @@ import { machineDetailStrings } from './machineDetail.js';
 import { skillHubStrings } from './skillHub.js';
 import { chatStrings } from './chat.js';
 import { assistantsStrings } from './assistants.js';
+import { apiToolsStrings } from './apiTools.js';
+import { notesStrings } from './notes.js';
+import { decisionsStrings } from './decisions.js';
 import { kitStrings } from './kit.js';
 import { demoStrings } from './demo.js';
 
@@ -49,6 +52,9 @@ export const en = {
   skillHub: skillHubStrings.en,
   chat: chatStrings.en,
   assistants: assistantsStrings.en,
+  apiTools: apiToolsStrings.en,
+  notes: notesStrings.en,
+  decisions: decisionsStrings.en,
   kit: kitStrings.en,
   demo: demoStrings.en,
 };
@@ -72,6 +78,9 @@ export const zh: typeof en = {
   skillHub: skillHubStrings.zh,
   chat: chatStrings.zh,
   assistants: assistantsStrings.zh,
+  apiTools: apiToolsStrings.zh,
+  notes: notesStrings.zh,
+  decisions: decisionsStrings.zh,
   kit: kitStrings.zh,
   demo: demoStrings.zh,
 };

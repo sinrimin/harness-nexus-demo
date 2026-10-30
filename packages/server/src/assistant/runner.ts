@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: MIT
 
 import { Agent, type AgentMessage, type AgentToolResult } from '@earendil-works/pi-agent-core';
+import { Type, type TSchema } from '@earendil-works/pi-ai';
 import type { LlmProvider } from '@harness-nexus/core';
 import type {
   AssistantConfig,
   AssistantMessageRow,
+  AssistantPermissionMode,
   AssistantPromptBlock,
   AssistantSession,
 } from '@harness-nexus/core';
+import { isChatApiKind } from '@harness-nexus/shared';
 import type { ChatStreamEvent, ProviderModelConfig } from '@harness-nexus/shared';
 import { decryptSecret, generateId } from '../infra/crypto.js';
 import { findCredentialForOwner } from '../infra/credential-scope.js';
@@ -22,9 +25,11 @@ import {
   IMAGE_CONTEXT_TURNS,
   type ImageContextPolicy,
 } from './history.js';
-import { buildAssistantTools, WRITE_TOOLS, type AssistantToolDeps } from './tools.js';
+import { buildAssistantTools, tool, toolNeedsApproval, type AssistantToolDeps } from './tools.js';
+import { executeApiTool } from '../api-tools/runtime.js';
 import { buildTurnExtras, type AssistantMcpDeps } from './context.js';
 import { DEFAULT_ASSISTANT_SYSTEM_PROMPT } from './prompt.js';
+import { notesContextFor } from '../services/notes.js';
 
 /**
  * The assistant turn runner (#52 §2/§4). One call = one user prompt = one
@@ -62,14 +67,17 @@ export interface RunningTurn {
   done: Promise<void>;
 }
 
+/** What resolveTurnModel actually reads — in-process one-shot callers (#88) pass exactly this. */
+export type TurnModelDeps = Pick<AssistantRunnerDeps, 'uow' | 'credentialEncryptionKey'>;
+
 /** Resolve the provider row + registry entry the (possibly rebound) config points at. */
 export async function resolveTurnModel(
-  deps: AssistantRunnerDeps,
+  deps: TurnModelDeps,
   ownerId: string,
   provider: LlmProvider,
   modelId: string,
 ) {
-  const entry = provider.models.find((m) => m.id === modelId && m.type === 'chat');
+  const entry = provider.models.find((m) => m.id === modelId && isChatApiKind(m.apiKind));
   if (entry === undefined) {
     throw new TurnSetupError(
       `Model "${modelId}" is no longer configured on provider "${provider.name}"`,
@@ -82,8 +90,14 @@ export async function resolveTurnModel(
     );
   }
   const secret = decryptSecret(credential.secret, deps.credentialEncryptionKey);
+  // #92/#95 — a non-chat model cannot reach here (the config service refuses
+  // it), but the runtime holds the line too: the gateway is chat-only. The
+  // wire comes from the MODEL's apiKind — the row speaks several (#95).
+  if (!isChatApiKind(entry.apiKind)) {
+    throw new TurnSetupError(`Model "${modelId}" is not a chat model on "${provider.name}"`);
+  }
   return buildGatewayModel({
-    kind: provider.api,
+    kind: entry.apiKind,
     baseUrl: provider.baseUrl,
     providerLabel: provider.name,
     secret,
@@ -135,6 +149,12 @@ export function startAssistantTurn(
      */
     providerId?: string;
     modelId: string;
+    /**
+     * #79 — the conversation's write-policy (the sender switch). The config's
+     * `permissionMode` is only the default stamped at open; absent (tests
+     * calling the runner directly) falls back to it.
+     */
+    permissionMode?: AssistantPermissionMode;
     /** #59 — this turn's prompt blocks (image blocks are refs, already split at send). */
     prompt: readonly AssistantPromptBlock[];
     /** The transcript BEFORE this turn (rebuild context — prompt rides separately). */
@@ -147,13 +167,17 @@ export function startAssistantTurn(
     /**
      * M3 — the write-tool approval seam. Absent (tests, default) = writes run
      * ungated; the realtime layer supplies one that surfaces a
-     * `permission_request` card and resolves with the user's answer.
+     * `permission_request` card and resolves with the user's answer. #95
+     * follow-up — a delegated answer (decision model) may carry the denial
+     * reason the model should see; an empty answer keeps the human wording.
      */
     requestApproval?: (toolCall: {
       toolCallId: string;
       toolName: string;
       args: unknown;
-    }) => Promise<boolean>;
+      /** The tool's own description — the #92 decision-model view. */
+      description?: string | undefined;
+    }) => Promise<{ allowed: boolean; reason?: string }>;
   },
 ): RunningTurn {
   const { session, config, emit } = input;
@@ -234,9 +258,12 @@ export function startAssistantTurn(
     );
 
     // #68 — the dispatch tools carry the session id so the backflow (user-op
-    // notes, completion pushes) routes to THIS assistant session.
-    const tools = buildAssistantTools(deps, principal, config.enabledToolGroups, {
+    // notes, completion pushes) routes to THIS assistant session; #81 — the
+    // config id lets api_tools_save auto-attach new services to the calling
+    // config.
+    const { tools, classOf } = buildAssistantTools(deps, principal, config.enabledToolGroups, {
       sessionId: session.id,
+      configId: config.id,
     });
 
     // M2 — configured skills (prompt index + read_skill) and MCP servers
@@ -259,9 +286,90 @@ export function startAssistantTurn(
       ...(deps.mcp !== undefined ? { mcp: deps.mcp } : {}),
     });
     tools.push(...extras.tools);
+    // #79 — extras carry their own declarations; anything unclassified (none
+    // today) defaults to write — the conservative class for foreign tools.
+    for (const t of extras.tools) {
+      if (!classOf.has(t.name)) classOf.set(t.name, 'write');
+    }
+
+    // #88 — the per-turn <system_context>: top keyword-matched note summaries
+    // from the owner's library ride the system prompt when the notes group is
+    // on (summaries only; bodies stay behind the notes_get tool).
+    if (config.enabledToolGroups.includes('notes')) {
+      const promptText = input.prompt
+        .filter((b): b is Extract<AssistantPromptBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text)
+        .join(' ');
+      const notesContext = await notesContextFor(deps, principal, promptText);
+      if (notesContext !== '')
+        extras.promptAddendum = `${extras.promptAddendum}\n\n${notesContext}`.trim();
+    }
+
+    // #80 — the config's API tool services join as DYNAMIC tools
+    // (`api__<service>__<tool>`), class derived from the HTTP method (GET →
+    // read, others → write) per #79. Visibility re-checked at turn start —
+    // a deleted/unshared row simply doesn't join.
+    if (config.enabledToolGroups.includes('api-tools')) {
+      for (const id of config.apiToolServiceIds ?? []) {
+        const service = await deps.uow.apiTools.findById(id);
+        if (
+          service === null ||
+          service.deletedAt !== undefined ||
+          (service.scope === 'personal' && service.ownerId !== session.ownerId)
+        ) {
+          continue;
+        }
+        for (const def of service.tools) {
+          const name = `api__${service.name.replace(/[^a-zA-Z0-9]+/g, '_').toLowerCase()}__${def.name}`;
+          const properties: Record<string, TSchema> = {};
+          for (const p of def.params) {
+            const described =
+              p.description !== undefined ? { description: p.description } : undefined;
+            const typed =
+              p.type === 'number'
+                ? Type.Number(described)
+                : p.type === 'boolean'
+                  ? Type.Boolean(described)
+                  : Type.String(described);
+            properties[p.name] = p.required ? typed : Type.Optional(typed);
+          }
+          const cls = def.method === 'GET' ? 'read' : 'write';
+          tools.push(
+            tool({
+              name,
+              label: def.name,
+              description:
+                def.description ??
+                `${def.method} ${service.name}${def.path} (API tool; params: ${def.params
+                  .map((p) => `${p.name}(${p.in}:${p.type}${p.required ? '' : '?'})`)
+                  .join(', ')})`,
+              parameters: Type.Object(properties),
+              execute: async (_callId, args) => {
+                const result = await executeApiTool(
+                  deps,
+                  service,
+                  def.name,
+                  args as Record<string, unknown>,
+                );
+                return {
+                  content: [{ type: 'text', text: result.output }],
+                  details: {},
+                  ...(result.isError ? { isError: true } : {}),
+                };
+              },
+              class: cls,
+            }),
+          );
+          classOf.set(name, cls);
+        }
+      }
+    }
     // The gate is the turn's ACTUAL toolset (static groups + dynamic MCP
     // names + read_skill) — belt-and-braces against rebind races.
     const allowed = new Set(tools.map((t) => t.name));
+    // #92 — the decision-model view: each tool's own description (the same
+    // text the model sees), so an `api__x__y` name need not speak for itself.
+    const descriptionOf = new Map(tools.map((t) => [t.name, t.description]));
 
     // #69 — ground truth at turn start: which of this session's dispatch
     // handles are still live. Appended AFTER the extras addendum and to
@@ -295,18 +403,28 @@ export function startAssistantTurn(
             reason: `tool "${toolCall.name}" is not enabled on this assistant`,
           };
         }
-        // M3 — mutating tools need the user's explicit approval mid-turn; a
-        // denied or timed-out call blocks with a reason the model can read.
-        if (WRITE_TOOLS.has(toolCall.name) && input.requestApproval !== undefined) {
-          const okToRun = await input.requestApproval({
+        // #79 — the graduated gate: read runs; write prompts per call unless
+        // the session's sender switch (falling back to the config default)
+        // pre-authorized writes; meta ALWAYS prompts (boundary-changing ops,
+        // no silent tier). A denied or timed-out call blocks with a reason
+        // the model can read.
+        if (
+          toolNeedsApproval(
+            classOf.get(toolCall.name) ?? 'write',
+            input.permissionMode ?? config.permissionMode,
+          ) &&
+          input.requestApproval !== undefined
+        ) {
+          const decision = await input.requestApproval({
             toolCallId: toolCall.id,
             toolName: toolCall.name,
             args,
+            description: descriptionOf.get(toolCall.name),
           });
-          if (!okToRun) {
+          if (!decision.allowed) {
             return {
               block: true,
-              reason: 'the user declined this write operation',
+              reason: decision.reason ?? 'the user declined this write operation',
             };
           }
         }

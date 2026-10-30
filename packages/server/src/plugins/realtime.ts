@@ -30,12 +30,15 @@ import {
   chatChannelsCloseAllRequestSchema,
   chatChannelsSyncRequestSchema,
   chatHistoryEventSchema,
+  chatHistoryPageEventSchema,
+  chatHistoryFetchRequestSchema,
   chatAdapterPrewarmRequestSchema,
   chatMessageSendRequestSchema,
   chatQueueCancelRequestSchema,
   chatPermissionRespondRequestSchema,
   chatElicitationRespondRequestSchema,
   chatConfigSetRequestSchema,
+  chatApprovalsSetRequestSchema,
   chatSessionCloseRequestSchema,
   chatSessionClosedEventSchema,
   chatSessionOpenRequestSchema,
@@ -133,6 +136,12 @@ export async function registerRealtime(
     chatReconnectGraceMs: number;
     chatIdleTtlMs: number;
     chatViewerGraceMs: number;
+    chatApprovalsTimeoutMs: number;
+    /** #92 v2 — the delegated-gate verdict bands (ENV constants, not knobs). */
+    approvalsIntentThreshold: number;
+    approvalsAnswerConfidenceFloor: number;
+    approvalsPromptWindow: number;
+    approvalsPromptCharCap: number;
     sessionsListTimeoutMs: number;
     adaptersReportTimeoutMs: number;
   },
@@ -156,6 +165,20 @@ export async function registerRealtime(
     {
       uow: app.uow,
       isOnline: (machineId) => presence.isOnline(machineId),
+      // #92 — the delegated-approvals gate: credential decrypt + the
+      // decision-model budget, threaded app-decorated like every service dep.
+      capabilities: app.modelCapabilities,
+      approvals: {
+        credentialEncryptionKey: app.credentialEncryptionKey,
+        timeoutMs: opts.chatApprovalsTimeoutMs,
+        log: app.log,
+        bands: {
+          intentThreshold: opts.approvalsIntentThreshold,
+          answerConfidenceFloor: opts.approvalsAnswerConfidenceFloor,
+          promptWindow: opts.approvalsPromptWindow,
+          promptCharCap: opts.approvalsPromptCharCap,
+        },
+      },
       io: {
         toCtl: (machineId, event, payload) => {
           ctl.to(`machine:${machineId}`).emit(event, payload);
@@ -197,6 +220,20 @@ export async function registerRealtime(
         allowlist: app.marketplaceAllowlist,
       },
       dispatch: assistantDispatch,
+      // #95 follow-up — the assistant's `permissionMode:'delegated'` rides
+      // the same decision gate as the machine chat axis (the user default is
+      // the whole resolution chain here; there is no machine).
+      capabilities: app.modelCapabilities,
+      approvals: {
+        timeoutMs: opts.chatApprovalsTimeoutMs,
+        log: app.log,
+        bands: {
+          intentThreshold: opts.approvalsIntentThreshold,
+          answerConfidenceFloor: opts.approvalsAnswerConfidenceFloor,
+          promptWindow: opts.approvalsPromptWindow,
+          promptCharCap: opts.approvalsPromptCharCap,
+        },
+      },
     },
     {
       toChannel: (sessionId, event, payload) => {
@@ -595,6 +632,18 @@ export async function registerRealtime(
       ack?.(accepted.ok ? { accepted: true } : { error: 'unknown-session' });
     });
 
+    // One older-history page (the browser prepends it) — same relay shape as
+    // chat:history above.
+    socket.on('chat:history.page', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = chatHistoryPageEventSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      const accepted = realtime.chat.onHistoryPage(machineId, parsed.data);
+      ack?.(accepted.ok ? { accepted: true } : { error: 'unknown-session' });
+    });
+
     socket.on('chat:session.closed', (payload: unknown, ack?: (res: unknown) => void) => {
       const parsed = chatSessionClosedEventSchema.safeParse(payload);
       if (!parsed.success) {
@@ -761,6 +810,23 @@ export async function registerRealtime(
       ack?.(result.ok ? { accepted: true, queued: result.queued } : { error: result.code });
     });
 
+    // Older-history paging: relay the browser's request to the daemon; the
+    // page comes back as a daemon `chat:history.page` (relayed below on /ctl).
+    socket.on('chat:history.fetch', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = chatHistoryFetchRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      const result = realtime.chat.onHistoryFetch(
+        socket.data.userId as string,
+        parsed.data.sessionId,
+        parsed.data.beforeSeq,
+        parsed.data.limit,
+      );
+      ack?.(result.ok ? { accepted: true } : { error: result.code });
+    });
+
     // #10 — drop the parked send-queue entry (edit = cancel + re-draft).
     socket.on('chat:queue.cancel', (payload: unknown, ack?: (res: unknown) => void) => {
       const parsed = chatQueueCancelRequestSchema.safeParse(payload);
@@ -826,6 +892,20 @@ export async function registerRealtime(
         );
       }
       ack?.(result.ok ? { accepted: true } : { error: result.code });
+    });
+
+    // #92 — switch the live session's approvals responder (next-request
+    // effect; the server owns the truth, the daemon re-synthesizes the
+    // session_config slice for the viewers).
+    socket.on('chat:approvals.set', (payload: unknown, ack?: (res: unknown) => void) => {
+      const parsed = chatApprovalsSetRequestSchema.safeParse(payload);
+      if (!parsed.success) {
+        ack?.({ error: 'proto:invalid' });
+        return;
+      }
+      void realtime.chat
+        .setApprovals(socket.data.userId as string, parsed.data.sessionId, parsed.data.responder)
+        .then((result) => ack?.(result.ok ? { accepted: true } : { error: result.code }));
     });
 
     socket.on('chat:permission.respond', (payload: unknown, ack?: (res: unknown) => void) => {
@@ -957,7 +1037,11 @@ export async function registerRealtime(
         }
         // #68 — the stop-choice UI needs this session's live dispatches.
         realtime.assistantDispatch.pushFor(socket.data.userId as string, result.sessionId);
-        ack?.({ sessionId: result.sessionId, assistantName: result.assistantName });
+        ack?.({
+          sessionId: result.sessionId,
+          assistantId: result.assistantId,
+          assistantName: result.assistantName,
+        });
       })();
     });
 

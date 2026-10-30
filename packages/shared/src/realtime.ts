@@ -540,6 +540,35 @@ export const availableCommandViewSchema = z.object({
 });
 
 /**
+ * #92 — the approvals slice synthesized into `session_config` (the daemon
+ * merges it like the W13 option rewrite; the SERVER owns the truth and
+ * forwards changes over /ctl). `providerName`/`modelId` are display
+ * provenance ("answered by …"); the responder is the ONLY behavioral bit.
+ */
+export const chatApprovalsViewSchema = z.object({
+  responder: z.enum(['manual', 'delegated']),
+  providerName: z.string().min(1).max(64).optional(),
+  modelId: z.string().min(1).max(128).optional(),
+});
+export type ChatApprovalsView = z.infer<typeof chatApprovalsViewSchema>;
+
+/**
+ * #92 — why a delegated answer denied. Small by design: the taxonomy is
+ * legible to the human (settled line, audit) AND the agent (denyMessage /
+ * correction note). `policy` = the never-allow floor; everything else comes
+ * from the model's own `why` choice.
+ */
+export const delegationDenialReasonSchema = z.enum([
+  'policy',
+  'not_covered',
+  'destructive',
+  'sensitive',
+  'risky',
+  'other',
+]);
+export type DelegationDenialReason = z.infer<typeof delegationDenialReasonSchema>;
+
+/**
  * The `session_config` stream event — PATCH semantics: `availableModes` /
  * `configOptions` replace when present; a lone `currentModeId` patches the
  * current mode. The daemon emits full merged snapshots; the load-replay
@@ -553,6 +582,9 @@ export const sessionConfigPatchSchema = z.object({
     })
     .optional(),
   configOptions: z.array(sessionConfigOptionSchema).max(64).optional(),
+  /** #92 — the synthesized delegated-approvals slice (present when the
+   *  machine has a decision provider; absent = the manual default). */
+  approvals: chatApprovalsViewSchema.optional(),
 });
 
 /**
@@ -602,6 +634,50 @@ export const chatStreamEventSchema = z.discriminatedUnion('kind', [
     requestId: z.string().min(1).max(128),
     outcome: z.enum(['selected', 'cancelled', 'timeout']),
     optionId: z.string().min(1).max(128).optional(),
+    /**
+     * #92 — who settled this card. Absent on every pre-#92 emit = a human
+     * (or a watchdog) did; `delegated` carries the gate's attribution.
+     */
+    responder: z.enum(['human', 'delegated']).optional(),
+    decidedBy: z.enum(['floor', 'model']).optional(),
+    delegated: z
+      .object({
+        providerName: z.string().min(1).max(64),
+        modelId: z.string().min(1).max(128),
+        confidence: z.number().min(0).max(1).optional(),
+        denial: z
+          .object({
+            reason: delegationDenialReasonSchema,
+            /** Reserved for text-capable providers; SystemOne is choice-only. */
+            note: z.string().min(1).max(200).optional(),
+          })
+          .optional(),
+      })
+      .optional(),
+  }),
+  // #92 — the gate could not decide and escalated to the human; the card
+  // stays a normal pending card, this only attaches the model's lean as a
+  // clearly-advisory muted line (never a decision). v2: `severity` (1..7,
+  // the probability-weighted score) and `intent` (0..1, the outcome-match
+  // noul) ride along as context for the human's decision.
+  z.object({
+    kind: z.literal('permission_advisory'),
+    requestId: z.string().min(1).max(128),
+    lean: z.enum(['allow', 'reject']),
+    confidence: z.number().min(0).max(1),
+    reason: delegationDenialReasonSchema.optional(),
+    severity: z.number().min(1).max(7).optional(),
+    intent: z.number().min(0).max(1).optional(),
+  }),
+  // #104 — delegation was ON but the gate could not conclude (no resolvable
+  // decision model, or the call timed out / errored / returned a shape we
+  // cannot use). The card stays pending for the human; this muted line says
+  // WHY the delegated review did not happen (the old silent fallback read as
+  // "the second card was never delegated"). Server → room only.
+  z.object({
+    kind: z.literal('permission_escalated'),
+    requestId: z.string().min(1).max(128),
+    reason: z.enum(['no-model', 'timeout', 'http', 'shape']),
   }),
   // 9 W14.1 — the agent asked the user a structured question (ACP
   // `elicitation/create`, form mode; claude's AskUserQuestion and
@@ -780,6 +856,13 @@ export const chatSessionStartEventSchema = z.object({
    * parse, so purely additive.
    */
   prewarm: z.boolean().optional(),
+  /**
+   * #92 — the delegated-approvals view at open time (the machine default).
+   * The daemon does not act on it beyond synthesizing the `session_config`
+   * slice for the sender's switch; the gate itself lives SERVER-side.
+   * Absent = manual (or a pre-#92 server).
+   */
+  approvals: chatApprovalsViewSchema.optional(),
 });
 
 // ---- adapter pre-warm (Issue #3) ----
@@ -834,14 +917,47 @@ export const chatSessionResyncEventSchema = z.object({
  * model) keeps live and history on ONE fold path in the browser.
  */
 export const historyItemSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('user'), blocks: z.array(promptBlockSchema).min(1).max(16) }),
-  z.object({ type: z.literal('event'), event: chatStreamEventSchema }),
+  z.object({
+    type: z.literal('user'),
+    blocks: z.array(promptBlockSchema).min(1).max(16),
+    /** Ring sequence number (monotonic per channel); the paging cursor. */
+    seq: z.number().int().min(1).optional(),
+  }),
+  z.object({
+    type: z.literal('event'),
+    event: chatStreamEventSchema,
+    seq: z.number().int().min(1).optional(),
+  }),
 ]);
 
-/** daemon → server (relayed to the channel room): the transcript batch for a (re)joined channel. */
+/**
+ * daemon → server (relayed to the channel room): the transcript batch for a
+ * (re)joined channel. `hasMore` — the ring holds older items beyond this
+ * batch (the initial sync ships a bounded window; the browser pages older
+ * with `chat:history.fetch`).
+ */
 export const chatHistoryEventSchema = z.object({
   sessionId: z.string().min(1).max(64),
   items: z.array(historyItemSchema).min(1).max(2000),
+  hasMore: z.boolean().optional(),
+});
+
+/**
+ * browser → server → daemon: page older history for a live channel. Absent
+ * `beforeSeq` = the oldest page; `limit` bounds the page (the "load
+ * everything" control passes a huge one).
+ */
+export const chatHistoryFetchRequestSchema = z.object({
+  sessionId: z.string().min(1).max(64),
+  beforeSeq: z.number().int().min(1).optional(),
+  limit: z.number().int().min(1).max(20_000).optional(),
+});
+
+/** daemon → server → browser: one older-than-loaded page (prepend-only). */
+export const chatHistoryPageEventSchema = z.object({
+  sessionId: z.string().min(1).max(64),
+  items: z.array(historyItemSchema).min(1).max(20_000),
+  hasMore: z.boolean().optional(),
 });
 
 /** browser → server: send a turn prompt. */
@@ -893,8 +1009,53 @@ export const chatPermissionRespondRequestSchema = z.object({
   optionId: z.string().min(1).max(128).optional(),
 });
 
+/**
+ * #92 — the gate's attribution riding the forwarded decision (server → daemon
+ * only; the browser never sends these). `meta.denyMessage` becomes the ACP
+ * response's `_meta.denyMessage` (the patched claude adapter feeds it to the
+ * model as the deny feedback); `attribution` re-enters the daemon's history
+ * ring so a resync replays the settled card WITH its provenance.
+ */
+export const chatPermissionRespondMetaSchema = z.object({
+  denyMessage: z.string().min(1).max(512).optional(),
+});
+
+export const chatPermissionRespondAttributionSchema = z.object({
+  responder: z.literal('delegated'),
+  decidedBy: z.enum(['floor', 'model']),
+  providerName: z.string().min(1).max(64),
+  modelId: z.string().min(1).max(128),
+  confidence: z.number().min(0).max(1).optional(),
+  denial: z
+    .object({
+      reason: delegationDenialReasonSchema,
+      note: z.string().min(1).max(200).optional(),
+    })
+    .optional(),
+});
+
 /** server → daemon: forwarded permission decision (or timeout/user cancel). */
-export const chatPermissionRespondEventSchema = chatPermissionRespondRequestSchema;
+export const chatPermissionRespondEventSchema = chatPermissionRespondRequestSchema.extend({
+  meta: chatPermissionRespondMetaSchema.optional(),
+  attribution: chatPermissionRespondAttributionSchema.optional(),
+});
+
+/**
+ * #92 — browser → server: switch the LIVE session's approvals responder
+ * (next-REQUEST effect, like the W9 selects). The server validates against
+ * the machine's configured provider and keeps the truth; the daemon only
+ * re-synthesizes the `session_config` slice for the viewers.
+ */
+export const chatApprovalsSetRequestSchema = z.object({
+  sessionId: z.string().min(1).max(64),
+  responder: z.enum(['manual', 'delegated']),
+});
+
+/** server → daemon: the resolved view after a responder switch. */
+export const chatApprovalsSetEventSchema = z.object({
+  sessionId: z.string().min(1).max(64),
+  approvals: chatApprovalsViewSchema,
+});
 
 /**
  * 9 W14.1 — browser → server: answer an elicitation. `accept` carries the
@@ -1207,6 +1368,8 @@ export type ChatSessionFailedPush = z.infer<typeof chatSessionFailedPushSchema>;
 export type ChatSessionClosedPush = z.infer<typeof chatSessionClosedPushSchema>;
 export type HistoryItem = z.infer<typeof historyItemSchema>;
 export type ChatHistoryEvent = z.infer<typeof chatHistoryEventSchema>;
+export type ChatHistoryFetchRequest = z.infer<typeof chatHistoryFetchRequestSchema>;
+export type ChatHistoryPageEvent = z.infer<typeof chatHistoryPageEventSchema>;
 export type NativeSessionView = z.infer<typeof nativeSessionViewSchema>;
 export type SessionsListRequest = z.infer<typeof sessionsListRequestSchema>;
 export type SessionsListResultEvent = z.infer<typeof sessionsListResultEventSchema>;

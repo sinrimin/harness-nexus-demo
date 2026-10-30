@@ -18,12 +18,14 @@ import { registerRealtime } from './plugins/realtime.js';
 import { healthRoutes } from './modules/health.js';
 import { systemRoutes } from './modules/system.js';
 import { statusRoutes, PostureCache } from './modules/status.js';
+import { ModelCapabilities } from './services/model-capabilities.js';
 import { authRoutes } from './modules/auth.js';
 import { usersRoutes } from './modules/users.js';
 import { patsRoutes } from './modules/pats.js';
 import { settingsRoutes } from './modules/settings.js';
 import { credentialsRoutes } from './modules/credentials.js';
 import { mcpServersRoutes } from './modules/mcp-servers.js';
+import { apiToolsRoutes } from './modules/api-tools.js';
 import { profilesRoutes } from './modules/profiles.js';
 import { resourcesRoutes } from './modules/resources.js';
 import { skillsRoutes } from './modules/skills.js';
@@ -37,6 +39,8 @@ import { clientConfigRoutes } from './modules/client-config.js';
 import { mountMcpProxy } from './mcp/proxy.js';
 import { marketplaceRoutes } from './modules/marketplace.js';
 import { assistantRoutes } from './modules/assistant.js';
+import { notesRoutes } from './modules/notes.js';
+import { decisionRecordRoutes } from './modules/decision-records.js';
 import { MarketplaceEmitter } from './marketplace/emitter.js';
 import { SkillCatalogService } from './infra/source-fetchers/catalog-service.js';
 import { parseAllowlist, type MarketplaceEntry } from './infra/source-fetchers/allowlist.js';
@@ -153,6 +157,14 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
   const marketplaceAllowlist: MarketplaceEntry[] = parseAllowlist(config.marketplaceAllowlist);
   app.decorate('skillCatalog', skillCatalog);
   app.decorate('marketplaceAllowlist', marketplaceAllowlist);
+  // #100 — the per-owner decision-model breaker (process memory by design).
+  app.decorate(
+    'modelCapabilities',
+    new ModelCapabilities({
+      threshold: config.capabilityBreakerThreshold,
+      cooldownMs: config.capabilityBreakerCooldownMs,
+    }),
+  );
 
   // Phase 7.4 — multi-source skill search. The same fetcher backs every
   // outbound source (fixture reader in test mode, globalThis.fetch in prod).
@@ -226,6 +238,11 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
     chatReconnectGraceMs: config.chatReconnectGraceMs,
     chatIdleTtlMs: config.chatIdleTtlMs,
     chatViewerGraceMs: config.chatViewerGraceMs,
+    chatApprovalsTimeoutMs: config.chatApprovalsTimeoutMs,
+    approvalsIntentThreshold: config.approvalsIntentThreshold,
+    approvalsAnswerConfidenceFloor: config.approvalsAnswerConfidenceFloor,
+    approvalsPromptWindow: config.approvalsPromptWindow,
+    approvalsPromptCharCap: config.approvalsPromptCharCap,
   });
   app.realtime.jobs.start();
   app.addHook('onClose', async () => {
@@ -275,6 +292,7 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
     await patsRoutes(api);
     await credentialsRoutes(api);
     await mcpServersRoutes(api);
+    await apiToolsRoutes(api);
     await profilesRoutes(api);
     await resourcesRoutes(api);
     await skillsRoutes(api);
@@ -287,6 +305,8 @@ export async function buildApp(config: ServerConfig): Promise<FastifyInstance> {
     await clientConfigRoutes(api);
     await marketplaceRoutes(api);
     await assistantRoutes(api);
+    await notesRoutes(api);
+    await decisionRecordRoutes(api);
   });
 
   await mountMcpProxy(app);

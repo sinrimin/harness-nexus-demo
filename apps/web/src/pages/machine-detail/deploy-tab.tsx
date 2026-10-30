@@ -251,7 +251,7 @@ function DeploymentsPanel({
                 <span className="flex items-center gap-2">
                   {/* Job type is an enum → Badge; the timestamp is numeric data →
                       the data role (02-content.md §4). */}
-                  <Badge variant="outline" className="font-mono text-[10px]">
+                  <Badge variant="secondary" className="role-data-sm">
                     {job.type}
                   </Badge>
                   <span className="text-muted-foreground role-data-sm">
@@ -415,7 +415,7 @@ function AdaptersPanel({
           {(rows ?? []).map((a) => (
             <TableRow key={a.wireSessionId}>
               <TableCell>
-                <Badge variant="outline" className="font-mono text-[10px]">
+                <Badge variant="secondary" className="role-data-sm">
                   {a.target}
                 </Badge>
               </TableCell>
@@ -423,7 +423,9 @@ function AdaptersPanel({
                 {a.nativeSessionId === null ? (
                   <span className="text-muted-foreground">—</span>
                 ) : (
-                  <Well copy={a.nativeSessionId}>{a.nativeSessionId}</Well>
+                  <Well variant="chip" copy={a.nativeSessionId}>
+                    {a.nativeSessionId}
+                  </Well>
                 )}
               </TableCell>
               <TableCell className="nums text-sm">{adapterUptime(a.startedAt, lang)}</TableCell>
@@ -508,19 +510,19 @@ function AgentsTable({ agents }: { agents: AgentInstanceView[] }) {
               <span className="flex items-center gap-2">
                 <span className="truncate font-medium">{a.name}</span>
                 {a.source === 'detected' ? (
-                  <Badge variant="secondary" className="text-[10px]">
-                    {t('machineDetail.detectedSource')}
-                  </Badge>
+                  <Badge variant="secondary">{t('machineDetail.detectedSource')}</Badge>
                 ) : null}
               </span>
             </TableCell>
             <TableCell>
-              <Badge variant="outline" className="font-mono text-[10px]">
+              <Badge variant="secondary" className="role-data-sm">
                 {a.target}
               </Badge>
             </TableCell>
             <TableCell className="max-w-64">
-              <Well copy={a.directory}>{a.directory}</Well>
+              <Well variant="chip" copy={a.directory}>
+                {a.directory}
+              </Well>
             </TableCell>
             <TableCell className="text-right">
               <Button asChild variant="ghost" size="sm">

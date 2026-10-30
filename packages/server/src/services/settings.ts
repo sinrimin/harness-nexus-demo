@@ -6,6 +6,7 @@ import type { SystemSettings } from '@harness-nexus/core';
 import { IMAGE_RETENTION_MAX, IMAGE_RETENTION_MIN } from '@harness-nexus/core';
 import {
   AppError,
+  type UpdateApiToolOutboundInput,
   type UpdateImageRetentionInput,
   type UpdateRegistrationInput,
 } from '@harness-nexus/shared';
@@ -81,4 +82,29 @@ export async function updateImageRetentionSettings(
  */
 export function imageExpiryFrom(settings: SystemSettings, now: Date): string {
   return new Date(now.getTime() + settings.imageRetentionDays * 86_400_000).toISOString();
+}
+
+/**
+ * #85 — set the API tool outbound policy atomically: the DEFAULT action
+ * (`allow` = the rule lists are blacklists; `deny` = whitelists) plus the
+ * external/internal rule lists (host / `*.domain` / IP / CIDR). Admin-only.
+ */
+export async function updateApiToolOutbound(
+  deps: ServiceDeps,
+  principal: Principal,
+  input: UpdateApiToolOutboundInput,
+): Promise<SystemSettings> {
+  if (principal.role !== 'admin') {
+    throw new AppError('Admin role required', 403, 'FORBIDDEN');
+  }
+  const current = await deps.uow.settings.get();
+  return deps.uow.settings.save({
+    ...current,
+    apiToolOutbound: input.mode,
+    apiToolOutboundRules: {
+      external: [...new Set(input.rules.external)],
+      internal: [...new Set(input.rules.internal)],
+    },
+    updatedAt: new Date().toISOString(),
+  });
 }

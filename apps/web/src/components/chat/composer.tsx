@@ -3,11 +3,13 @@
 // SPDX-License-Identifier: MIT
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Link } from 'react-router-dom';
 import {
   ArrowUpIcon,
   BotIcon,
   BoxIcon,
   BrainIcon,
+  ChevronDownIcon,
   CircleStopIcon,
   ImageIcon,
   PaperclipIcon,
@@ -34,6 +36,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import type { DraftAttachment } from './image-attach.js';
 import type {
@@ -42,6 +45,173 @@ import type {
   PromptBlock,
   SessionConfigOption,
 } from '@/realtime';
+
+/**
+ * #92 — the permissions popover: the agent's OWN modes on top (behavior
+ * unchanged — DANGEROUS_MODES still confirms via the composer's held-pick),
+ * the delegated-approvals switch below a divider. One control for one
+ * concept ("everything about permissions lives under the shield"); the
+ * Sender gains no new control. The trigger rides the bare ConfigSelect
+ * contract — same `--control-h-sm` geometry, icon at every size, on phone
+ * the icon-only square (the delegated state rides a dot on the shield) —
+ * so the row of dropdowns stays one device in every skin.
+ */
+function PermissionsControl({
+  modeValue,
+  modeChoices,
+  approvals,
+  disabled,
+  hint,
+  onPickMode,
+  onApprovalsToggle,
+}: {
+  modeValue: string | undefined;
+  modeChoices: SelectChoice[];
+  approvals: NonNullable<ComposerConfig['approvals']>;
+  disabled: boolean;
+  hint?: string;
+  onPickMode: (modeId: string) => void;
+  /** The composer-owned switch handler: enabling goes through the confirm. */
+  onApprovalsToggle: (on: boolean) => void;
+}) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const delegated = approvals.responder === 'delegated';
+  // #95 — the axis is advertised even when no decision model resolves; the
+  // switch is then disabled and points at the provider defaults instead of
+  // hiding the capability entirely.
+  const delegateReady = approvals.modelId !== undefined;
+  const modeName = modeChoices.find((c) => c.value === modeValue)?.name ?? modeValue;
+  // Modes that rarely surface a permission request make delegated moot —
+  // say so instead of enforcing anything (the axes stay orthogonal).
+  const quietMode = modeValue !== undefined && DANGEROUS_MODES.has(modeValue) ? true : false;
+  const label =
+    modeChoices.length > 0 ? (modeName ?? t('chat.modeLabel')) : t('chat.approvalsLabelShort');
+  const pickMode = (modeId: string): void => {
+    setOpen(false);
+    onPickMode(modeId);
+  };
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-slot="select-trigger"
+          data-size="sm"
+          data-variant="bare"
+          aria-label={t('chat.permissionsControlLabel')}
+          title={hint ?? t('chat.permissionsControlLabel')}
+          disabled={disabled}
+          className={cn(
+            'text-muted-foreground hover:text-foreground',
+            'inline-flex h-(--control-h-sm) items-center gap-1 rounded-md px-1.5 text-xs font-normal',
+            'disabled:cursor-not-allowed disabled:opacity-50',
+            // Phone: the same icon-only square as every ConfigSelect — the
+            // label and chevron drop out, the dot keeps the delegated state.
+            'max-sm:min-w-(--control-h-sm) max-sm:justify-center max-sm:gap-0 max-sm:px-0',
+          )}
+        >
+          <span className="relative shrink-0">
+            <ShieldCheckIcon className="size-4" />
+            {delegated ? (
+              <span
+                data-slot="approvals-dot"
+                data-state={delegated ? 'delegated' : 'manual'}
+                className="bg-primary absolute -right-0.5 -top-0.5 size-1.5 rounded-full"
+                aria-hidden="true"
+              />
+            ) : null}
+          </span>
+          <span className="max-w-32 truncate max-sm:hidden">
+            {label}
+            {delegated ? (
+              <span className="text-muted-foreground/80"> · {t('chat.approvalsBadge')}</span>
+            ) : null}
+          </span>
+          <ChevronDownIcon
+            aria-hidden="true"
+            className="size-4 shrink-0 opacity-50 max-sm:hidden"
+          />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-72 p-0">
+        {modeChoices.length > 0 ? (
+          <div className="border-b p-2">
+            <p className="text-muted-foreground px-2 pb-1 text-[11px] font-medium">
+              {t('chat.modeLabel')}
+            </p>
+            <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+              {modeChoices.map((c) => (
+                <button
+                  key={c.value}
+                  type="button"
+                  onClick={() => pickMode(c.value)}
+                  title={c.description}
+                  className={cn(
+                    'focus-visible:ring-ring/50 flex min-w-0 items-start gap-2 rounded-sm px-2 py-1.5 text-left text-xs',
+                    'hover:bg-muted focus-visible:ring-[3px] focus-visible:outline-none',
+                    c.value === modeValue && 'bg-muted font-medium',
+                  )}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      'mt-0.5 size-2 shrink-0 rounded-full border',
+                      c.value === modeValue
+                        ? 'border-primary bg-primary'
+                        : 'border-muted-foreground/40',
+                    )}
+                  />
+                  <span className="min-w-0">
+                    <span className="block truncate">{c.name}</span>
+                    {c.description !== undefined ? (
+                      <span className="text-muted-foreground block truncate text-[11px] font-normal">
+                        {c.description}
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        <div className="flex items-start justify-between gap-3 p-3">
+          <div className="min-w-0">
+            <p className="text-xs font-medium">{t('chat.approvalsSwitchTitle')}</p>
+            <p className="text-muted-foreground mt-0.5 text-[11px] leading-snug">
+              {t('chat.approvalsSwitchDesc')}
+            </p>
+            {delegated && approvals.providerName !== undefined ? (
+              <p className="text-muted-foreground/80 mt-1 truncate font-mono text-[10px]">
+                {approvals.providerName}
+                {approvals.modelId !== undefined ? `/${approvals.modelId}` : ''}
+              </p>
+            ) : null}
+            {quietMode && !delegated ? (
+              <p className="text-muted-foreground/80 mt-1 text-[10px]">
+                {t('chat.approvalsQuietModeHint')}
+              </p>
+            ) : null}
+          </div>
+          <Switch
+            aria-label={t('chat.approvalsSwitchTitle')}
+            disabled={disabled || !delegateReady}
+            checked={delegated}
+            onCheckedChange={onApprovalsToggle}
+          />
+        </div>
+        {!delegateReady ? (
+          <p className="text-muted-foreground border-t px-3 pb-2.5 pt-2 text-[11px] leading-snug">
+            {t('chat.approvalsNoModel')}{' '}
+            <Link to="/llm-providers" className="text-signal underline underline-offset-2">
+              {t('chat.approvalsConfigure')}
+            </Link>
+          </p>
+        ) : null}
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 /**
  * The chat Sender (Phase 9 W8; controls added 9 W9). One card: the attachment
@@ -64,6 +234,8 @@ export interface ComposerConfig {
   currentModeId?: string;
   availableModes?: { id: string; name: string; description?: string }[];
   configOptions?: SessionConfigOption[];
+  /** #92 — present when the machine has a decision provider configured. */
+  approvals?: { responder: 'manual' | 'delegated'; providerName?: string; modelId?: string };
 }
 
 /** A pending file reference chip (`resource_link` once sent). */
@@ -97,6 +269,9 @@ interface ComposerProps {
   imageSupported: boolean;
   config: ComposerConfig;
   onConfigSet: (set: ChatConfigSetPayload) => void;
+  /** #92 — switch the approvals responder (next-request effect). Optional —
+   *  the assistant 端 has no approvals axis and omits it. */
+  onApprovalsSet?: (responder: 'manual' | 'delegated') => void;
   /** 9 W15 — the agent's advertised slash commands (fold slice). */
   commands: CommandView[];
 }
@@ -297,8 +472,10 @@ interface SelectChoice {
  * (dsh's per-provider model lists).
  *
  * Two shapes, because the phone has no room for three opaque values plus a
- * meter plus Send: from `sm` up it is the value and a chevron; below it is the
- * control's ICON (the picker is where the current value is read — the selected
+ * meter plus Send: the control's ICON rides at every size (one glyph per
+ * dropdown, so the row reads as controls, not words); from `sm` up the value
+ * and chevron join it, below it the icon is the whole square (the picker is
+ * where the current value is read — the selected
  * row carries the check) at the compact control's size, with the fingertip
  * supplied by an overlay hit area rather than a bigger box. Naming the three
  * with a label above each was tried and rejected in review: it made an
@@ -320,7 +497,7 @@ function ConfigSelect({
   onPick,
 }: {
   label: string;
-  /** Shown instead of the value on phones — the adapter's control as an icon. */
+  /** The adapter's control as an icon — always visible, the phone's whole trigger. */
   icon: ReactNode;
   value: string | undefined;
   choices: SelectChoice[];
@@ -367,7 +544,7 @@ function ConfigSelect({
           'max-sm:[&_[data-slot=select-value]]:hidden max-sm:[&_[data-slot=select-chevron]]:hidden',
         )}
       >
-        <span className="sm:hidden" aria-hidden="true">
+        <span className="shrink-0" aria-hidden="true">
           {icon}
         </span>
         <SelectValue placeholder={label} />
@@ -484,6 +661,7 @@ export function Composer({
   imageSupported,
   config,
   onConfigSet,
+  onApprovalsSet = () => {},
   commands,
 }: ComposerProps) {
   const { t } = useI18n();
@@ -561,9 +739,29 @@ export function Composer({
   // #52 — the assistant 端 rides the same option surface with OPAQUE extra
   // selects (e.g. configId 'agent'): every option in no known category
   // renders as a generic labeled select, values compared by equality only.
+  // #79's permissionMode is special-cased below (localized labels + a
+  // designed confirm on the weakening pick), so it leaves this pool.
   const extraOptions = (config.configOptions ?? []).filter(
-    (o) => o.category === undefined && o.id !== 'model',
+    (o) => o.category === undefined && o.id !== 'model' && o.id !== 'permissionMode',
   );
+  // #79 — the assistant session's write-policy switch (the config's value is
+  // only the default). Choice names localize by VALUE — the two declared
+  // modes — while the wire stays opaque.
+  const permOption = config.configOptions?.find((o) => o.id === 'permissionMode');
+  const permName = (value: string, wire: string): string =>
+    value === 'prompt'
+      ? t('assistants.permPrompt')
+      : value === 'autoWrite'
+        ? t('assistants.permAutoWrite')
+        : value === 'delegated'
+          ? t('assistants.permDelegated')
+          : wire;
+  const permChoices: SelectChoice[] =
+    permOption?.options?.map((o) => ({
+      value: o.value,
+      name: permName(o.value, o.name),
+      description: o.description,
+    })) ?? [];
   const modeChoices: SelectChoice[] =
     modeFromOptions?.options?.map((o) => ({
       value: o.value,
@@ -580,21 +778,52 @@ export function Composer({
 
   // P6 — a mode that weakens the permission gate is confirmed in a designed
   // dialog instead of a native prompt: the pick is held here, and only
-  // `confirmMode` writes it through.
-  const [pendingMode, setPendingMode] = useState<{ id: string; name: string } | null>(null);
+  // `confirmMode` writes it through. #79 — the assistant's `autoWrite` policy
+  // weakens the same gate, so it rides the same held-pick confirm.
+  const [pendingMode, setPendingMode] = useState<{
+    kind: 'mode' | 'permission' | 'approvals' | 'perm-delegated';
+    value: string;
+    name: string;
+  } | null>(null);
   const pickMode = (modeId: string): void => {
     const name = modeChoices.find((c) => c.value === modeId)?.name ?? modeId;
     if (DANGEROUS_MODES.has(modeId)) {
-      setPendingMode({ id: modeId, name });
+      setPendingMode({ kind: 'mode', value: modeId, name });
       return;
     }
     onConfigSet({ kind: 'mode', modeId });
+  };
+  const pickPermission = (value: string): void => {
+    if (permOption === undefined) return;
+    if (value === 'autoWrite' && permOption.currentValue !== 'autoWrite') {
+      setPendingMode({ kind: 'permission', value, name: permName(value, value) });
+      return;
+    }
+    // #95 follow-up — handing answers to a decision model delegates the
+    // owner's authority; same designed confirm as the chat switch.
+    if (value === 'delegated' && permOption.currentValue !== 'delegated') {
+      setPendingMode({ kind: 'perm-delegated', value, name: permName(value, value) });
+      return;
+    }
+    onConfigSet({ kind: 'option', configId: permOption.id, value });
   };
   const confirmMode = (): void => {
     const next = pendingMode;
     if (next === null) return;
     setPendingMode(null);
-    onConfigSet({ kind: 'mode', modeId: next.id });
+    if (next.kind === 'mode') {
+      onConfigSet({ kind: 'mode', modeId: next.value });
+    } else if (next.kind === 'approvals') {
+      // #92 — enabling delegated approvals delegates the owner's answering
+      // authority; the same designed confirm as a weakening mode pick.
+      onApprovalsSet('delegated');
+    } else if (next.kind === 'perm-delegated') {
+      // #95 follow-up — the assistant's third write policy: same authority
+      // hand-off, expressed on the sender's permissionMode option.
+      onConfigSet({ kind: 'option', configId: 'permissionMode', value: next.value });
+    } else {
+      onConfigSet({ kind: 'option', configId: 'permissionMode', value: next.value });
+    }
   };
 
   return (
@@ -774,7 +1003,8 @@ export function Composer({
               type="button"
               variant="ghost"
               size="icon"
-              className="text-muted-foreground hover:text-foreground size-7 shrink-0"
+              data-tool="attach"
+              className="text-muted-foreground hover:text-foreground size-(--control-h-sm) shrink-0"
               disabled={disabled}
               title={t('chat.addMenuAria')}
               aria-label={t('chat.addMenuAria')}
@@ -800,15 +1030,48 @@ export function Composer({
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <ConfigSelect
-          label={t('chat.modeLabel')}
-          icon={<ShieldCheckIcon className="size-4" />}
-          value={modeValue}
-          choices={modeChoices}
-          disabled={controlsDisabled}
-          hint={turnActive ? t('chat.appliesNextTurn') : undefined}
-          onPick={pickMode}
-        />
+        {config.approvals === undefined ? (
+          <ConfigSelect
+            label={t('chat.modeLabel')}
+            icon={<ShieldCheckIcon className="size-4" />}
+            value={modeValue}
+            choices={modeChoices}
+            disabled={controlsDisabled}
+            hint={turnActive ? t('chat.appliesNextTurn') : undefined}
+            onPick={pickMode}
+          />
+        ) : (
+          <PermissionsControl
+            modeValue={modeValue}
+            modeChoices={modeChoices}
+            approvals={config.approvals}
+            disabled={controlsDisabled}
+            hint={turnActive ? t('chat.appliesNextTurn') : undefined}
+            onPickMode={pickMode}
+            onApprovalsToggle={(on) => {
+              if (on) {
+                setPendingMode({
+                  kind: 'approvals',
+                  value: 'delegated',
+                  name: t('chat.approvalsSwitchTitle'),
+                });
+              } else {
+                onApprovalsSet('manual');
+              }
+            }}
+          />
+        )}
+        {permOption === undefined ? null : (
+          <ConfigSelect
+            label={t('chat.permModeLabel')}
+            icon={<ShieldCheckIcon className="size-4" />}
+            value={permOption.currentValue}
+            choices={permChoices}
+            disabled={controlsDisabled}
+            hint={turnActive ? t('chat.appliesNextTurn') : undefined}
+            onPick={pickPermission}
+          />
+        )}
         {modelOption === undefined ? null : (
           <ConfigSelect
             label={t('chat.modelLabel')}
@@ -923,8 +1186,26 @@ export function Composer({
             if (!o) setPendingMode(null);
           }}
           title={t('chat.modeSwitchAction')}
-          consequence={t('chat.modeConsequence', { name: pendingMode.name })}
-          impact={[{ label: 'mode', value: pendingMode.id }]}
+          consequence={
+            pendingMode.kind === 'mode'
+              ? t('chat.modeConsequence', { name: pendingMode.name })
+              : pendingMode.kind === 'approvals'
+                ? t('chat.approvalsConsequence')
+                : pendingMode.kind === 'perm-delegated'
+                  ? t('chat.permDelegatedConsequence')
+                  : t('chat.permConsequence', { name: pendingMode.name })
+          }
+          impact={[
+            {
+              label:
+                pendingMode.kind === 'mode'
+                  ? 'mode'
+                  : pendingMode.kind === 'approvals'
+                    ? 'approvals'
+                    : 'write policy',
+              value: pendingMode.value,
+            },
+          ]}
           actionLabel={t('chat.modeSwitchAction')}
           // Danger edge without the irreversible line: flipping the mode back
           // restores the gate, so claiming "cannot be undone" would be false.

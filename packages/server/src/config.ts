@@ -115,6 +115,24 @@ export interface ServerConfig {
    * of chatReconnectGraceMs. 0 = legacy immediate reap on last-socket-gone.
    */
   chatViewerGraceMs: number;
+  /** #92 — delegated-approvals decision-model budget (ms). */
+  chatApprovalsTimeoutMs: number;
+  /**
+   * #92 v2 — the verdict-matrix bands (severity × intent), server-wide ENV
+   * constants. Deliberately NOT machine-level knobs: bands mis-tuned
+   * per-machine degrade safety silently. See wiki
+   * design-delegated-approvals-v2.md §Configuration.
+   */
+  approvalsIntentThreshold: number;
+  /** Answer-quality floor ("did the model understand the question"). */
+  approvalsAnswerConfidenceFloor: number;
+  /** How many of the owner's prompts the decision model may see. */
+  approvalsPromptWindow: number;
+  /** Per-prompt character budget after the head/tail cut. */
+  approvalsPromptCharCap: number;
+  /** #100 — the model-capability breaker knobs (see config for defaults). */
+  capabilityBreakerThreshold: number;
+  capabilityBreakerCooldownMs: number;
   /**
    * Phase 8 C2 — marketplace emitter `.mcp.json` shape. `client` (default):
    * one stdio `hnx mcp serve` entry per profile. `server`: the pre-C2
@@ -209,6 +227,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     // legacy immediate reap. Presence-based, orthogonal to CHAT_IDLE_TTL_MS
     // (activity-based).
     chatViewerGraceMs: Number(env.CHAT_VIEWER_GRACE_MS ?? '300000'),
+    // #92 — the delegated-approvals decision-model budget. Far under the
+    // permission watchdog; a miss escalates to the human card. #104: 4s was
+    // tight enough that a normally-fast provider (>90th-percentile stalls)
+    // silently dropped a card to manual; 8s keeps the card answerable the
+    // whole time while giving a slow call room to conclude.
+    chatApprovalsTimeoutMs: Number(env.CHAT_APPROVALS_TIMEOUT_MS ?? '8000'),
+    // #100 — the decision-model capability breaker: consecutive transient
+    // failures that degrade the slot, and how long the degradation lasts.
+    capabilityBreakerThreshold: Number(env.CAPABILITY_BREAKER_THRESHOLD ?? '3'),
+    capabilityBreakerCooldownMs: Number(env.CAPABILITY_BREAKER_COOLDOWN_MS ?? '600000'),
+    // #92 v2 — verdict bands: intent ≥ threshold at severity 3–6 allows;
+    // any VERDICT-USED answer flatter than the floor escalates (fail-closed
+    // on uncertainty, never on policy). The window/char-cap bound the only
+    // free-text the model ever sees (8 prompts, 600 chars, head ¾ + tail ¼).
+    approvalsIntentThreshold: Number(env.APPROVALS_INTENT_THRESHOLD ?? '0.6'),
+    approvalsAnswerConfidenceFloor: Number(env.APPROVALS_ANSWER_CONFIDENCE_FLOOR ?? '0.6'),
+    approvalsPromptWindow: Number(env.APPROVALS_PROMPT_WINDOW ?? '8'),
+    approvalsPromptCharCap: Number(env.APPROVALS_PROMPT_CHAR_CAP ?? '600'),
     emitterMode: (env.EMITTER_MODE as ServerConfig['emitterMode']) ?? 'client',
     demoMode: env.DEMO_MODE === 'true',
   };
