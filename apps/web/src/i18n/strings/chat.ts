@@ -17,6 +17,8 @@ const en = {
   cardEnter: 'Open sessions',
   // P5: the phone's session-list drawer.
   railOpen: 'Sessions',
+  railCollapse: 'Collapse session rail',
+  railExpand: 'Expand session rail',
   sourceDeploy: 'deployed',
   sourceDetected: 'detected',
   // P5: the machine group's nameplate — the machine's NAME is prose in the body.
@@ -38,6 +40,14 @@ const en = {
   deleteSessionConsequence:
     'The conversation and all its messages are permanently removed from its store.',
   deleteFailed: 'Delete failed: {error}',
+  // #110 — rail row actions: the pin toggle, the rename menu item + inline
+  // input (empty restores the automatic title), and the toggle's failure.
+  pinAction: 'Pin',
+  unpinAction: 'Unpin',
+  pinToggleFailed: 'Pin action failed: {error}',
+  renameAction: 'Rename',
+  renamePlaceholder: 'Empty restores the automatic title',
+  renameFailed: 'Rename failed: {error}',
   // The rail's group header: the comp's `.sgroup-h` label over the directory.
   workingDirectory: 'Working directory',
   staleModel: 'pinned {model} no longer configured — not resumable',
@@ -69,6 +79,7 @@ const en = {
   thinking: 'thinking…',
   stopped: 'Stopped',
   captureToNote: 'Save as note',
+  copyStep: 'Copy',
   running: 'running…',
   // #99 — the session-rail status words (no ellipsis: they sit beside a title).
   sessionRunning: 'running',
@@ -81,7 +92,7 @@ const en = {
   todoPending: '{count} pending',
   commandsAria: 'Commands',
   commandsNone: 'No matching commands',
-  diffFiles: '{count} file(s)',
+  diffStatTitle: '{added} lines added, {removed} lines removed',
   noOutput: 'No output',
   searchPaths: '{count} path(s)',
   searchMatches: '{count} match(es) · {files} file(s)',
@@ -105,6 +116,7 @@ const en = {
   delegationReasonTimeout: 'the decision model timed out',
   delegationReasonHttp: 'the decision-model provider returned an error',
   delegationReasonShape: 'the decision model returned an unusable answer',
+  delegationReasonDegraded: 'the decision model is cooling down after repeated failures',
   approvalsReason: {
     policy: 'never-allow floor',
     not_covered: 'not covered by your request',
@@ -141,6 +153,35 @@ const en = {
   contextUsed: 'Context: {used} of {size} tokens',
   contextWindow: 'Context window',
   contextPct: '{pct}% used',
+  // #123 — the inline toolbar form: the ring plus this number. The full
+  // figures stay in the popover, so this is the bare qualifier.
+  contextPctShort: '{pct}%',
+  contextShort: '{pct}% context',
+  // #124 — the session HUD is an engraved instrument face: English in BOTH
+  // locales by design (the same exception as the nav-group labels). These
+  // values are intentionally identical in `zh`; do not translate them.
+  hudAria: 'Session telemetry',
+  hudContext: 'CTX',
+  hudTokens: 'TOK',
+  hudIn: 'IN',
+  hudOut: 'OUT',
+  hudHit: 'HIT',
+  hudReq: 'REQ',
+  hudFiles: 'FILES',
+  hudContextTitle: 'Context: {used} of {size} tokens ({pct}%)',
+  // #128 — the qualifier "(daemon run)" is gone: the assistant page shares
+  // these strings and its totals come from the SERVER-side accumulator
+  // (lifetime semantics live in the wiki, not on the strip).
+  hudTokensTitle: 'Session tokens: {total} total · {turns} turns · in {in} · out {out} (cache included)',
+  hudInTitle: 'Input side: {input} input + {cacheRead} cache read',
+  hudOutTitle: 'Output side: {output} output + {cacheWrite} cache write',
+  hudHitTitle: 'Prompt cache hit rate: {pct}%',
+  hudReqTitle: 'Turns in this session: {count}',
+  hudNoData: 'No data yet',
+  hudFilesTitle: 'Files in the loaded transcript: {files} · +{added} / −{removed}',
+  hudFilesPathless: 'some diffs carried no path — file count is a lower bound',
+  hudFilesPartial: 'older history not loaded — the count is a lower bound',
+  hudFilesMore: '+{count} more',
   permissionAsk: 'The agent asks permission',
   permissionAskTitle: 'The agent asks permission: {title}',
   // ---- 9 W14.1: agent questions (ACP elicitation) ----
@@ -217,6 +258,11 @@ const en = {
   errMachineBusy: 'Too many sessions are generating on this machine — let one finish first.',
   errSessionGone:
     'This channel is no longer live (the server or agent restarted) — open a new one.',
+  // #119 — the assistant pane's dead-channel wording (idle too long past the
+  // viewer grace, or a server restart): recovery reopens the session, this is
+  // the last-resort surface when that could not land.
+  errAssistantSessionGone:
+    'This conversation was disconnected (idle too long or the server restarted) and is being reopened — resend your message.',
   errWorkspaceNotSet: 'This machine has no base workspace — set one in the picker first.',
   errWorkspaceInvalid: 'That directory is outside the machine base workspace.',
   subagentTaskLabel: 'Task',
@@ -233,6 +279,8 @@ const zh: typeof en = {
   cardChatOff: '远程聊天未开启',
   cardEnter: '进入会话',
   railOpen: '会话列表',
+  railCollapse: '收起会话栏',
+  railExpand: '展开会话栏',
   sourceDeploy: '部署',
   sourceDetected: '检测',
   machineGroupLabel: '对话',
@@ -250,6 +298,12 @@ const zh: typeof en = {
   deleteSessionAction: '删除会话',
   deleteSessionConsequence: '会话及其全部消息将从所属存储中永久删除。',
   deleteFailed: '删除失败：{error}',
+  pinAction: '置顶',
+  unpinAction: '取消置顶',
+  pinToggleFailed: '置顶操作失败：{error}',
+  renameAction: '重命名',
+  renamePlaceholder: '留空恢复自动标题',
+  renameFailed: '重命名失败：{error}',
   workingDirectory: '工作目录',
   staleModel: '固定模型 {model} 已不在当前配置——无法恢复',
   untitled: '未命名会话',
@@ -276,6 +330,7 @@ const zh: typeof en = {
   thinking: '思考中…',
   stopped: '已停止',
   captureToNote: '保存为笔记',
+  copyStep: '复制',
   running: '运行中…',
   sessionRunning: '运行中',
   sessionOpen: '已打开',
@@ -287,7 +342,7 @@ const zh: typeof en = {
   todoPending: '待办 {count}',
   commandsAria: '命令列表',
   commandsNone: '无匹配命令',
-  diffFiles: '{count} 个文件',
+  diffStatTitle: '新增 {added} 行，删除 {removed} 行',
   noOutput: '无输出',
   searchPaths: '{count} 个路径',
   searchMatches: '{count} 处匹配 · {files} 个文件',
@@ -311,6 +366,7 @@ const zh: typeof en = {
   delegationReasonTimeout: '决策模型超时',
   delegationReasonHttp: '决策模型供应商报错',
   delegationReasonShape: '决策模型返回了无法使用的结果',
+  delegationReasonDegraded: '决策模型连续失败后熔断冷却中（稍后自动恢复）',
   approvalsReason: {
     policy: '命中永不放行底线',
     not_covered: '不在你的请求范围内',
@@ -343,6 +399,33 @@ const zh: typeof en = {
   contextUsed: '上下文：已用 {used} / {size} tokens',
   contextWindow: '上下文窗口',
   contextPct: '已用 {pct}%',
+  // #123 — the inline toolbar form: the ring plus this number. The full
+  // figures stay in the popover, so this is the bare qualifier.
+  contextPctShort: '{pct}%',
+  contextShort: '上下文 {pct}%',
+  // #124 — English-only instrument face (see the `en` block): identical values
+  // in both locales, deliberately untranslated.
+  hudAria: 'Session telemetry',
+  hudContext: 'CTX',
+  hudTokens: 'TOK',
+  hudIn: 'IN',
+  hudOut: 'OUT',
+  hudHit: 'HIT',
+  hudReq: 'REQ',
+  hudFiles: 'FILES',
+  hudContextTitle: '上下文：{used} / {size} tokens（{pct}%）',
+  // #128 — the tooltips are localized copy; only the engraved LABELS stay
+  // English (the instrument-face exception).
+  hudTokensTitle: '会话 tokens：共 {total} · {turns} 轮 · 入 {in} · 出 {out}（含缓存）',
+  hudInTitle: '输入侧：输入 {input} + 缓存读 {cacheRead}',
+  hudOutTitle: '输出侧：输出 {output} + 缓存写 {cacheWrite}',
+  hudHitTitle: '缓存命中率：{pct}%',
+  hudReqTitle: '本会话轮数：{count}',
+  hudNoData: '暂无数据',
+  hudFilesTitle: '已加载记录中的文件：{files} · +{added} / −{removed}',
+  hudFilesPathless: '部分 diff 无路径——文件数为下界',
+  hudFilesPartial: '更早的历史未加载——计数为下界',
+  hudFilesMore: '还有 {count} 个',
   permissionAsk: '代理请求权限',
   permissionAskTitle: '代理请求权限：{title}',
   // ---- 9 W14.1: agent questions (ACP elicitation) ----
@@ -410,6 +493,7 @@ const zh: typeof en = {
   errSessionLimit: '此机器上所有打开的会话都在生成中——请等一个完成或先断开一个。',
   errMachineBusy: '此机器上同时生成中的会话过多——请先等其中一个完成。',
   errSessionGone: '该通道已不再在线（服务器或 Agent 重启过）—— 请重新打开一个。',
+  errAssistantSessionGone: '会话已断开（长时间空闲或服务器重启过），正在重新打开——请重新发送。',
   errWorkspaceNotSet: '此机器未设置基础工作区——请先在选择器中设置。',
   errWorkspaceInvalid: '该目录不在机器基础工作区内。',
   subagentTaskLabel: '任务',

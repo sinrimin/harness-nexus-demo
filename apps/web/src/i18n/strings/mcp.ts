@@ -48,23 +48,26 @@ const en = {
   connect: 'Connect',
   reconnect: 'Reconnect',
   connecting: 'Connecting…',
-  expandTools: 'Expand tools',
-  collapseTools: 'Collapse tools',
+  expandTools: 'Inspect tools',
   // Dial-site badge vocabulary.
   dialAutoDerived: 'auto → {site}',
   dialClient: 'client',
   dialServer: 'server',
   dialedByShim: 'dialed by hnx shim',
+  // Built-in service row (#106, profile-gated since #107).
+  builtinName: 'Built-in tools',
+  builtinHint:
+    "Platform-native tools served in-process on the /mcp outlet — global, always available, not editable. Add this service to a profile to expose its tools to that profile's agents.",
   // Status badge tool count.
   toolOne: '{count} tool',
   toolMany: '{count} tools',
-  // Tool inspection panel.
-  toolsHeader: 'Tools',
-  toolsHeaderCount: 'Tools ({count})',
+  // Tool inspector drawer (#112).
+  searchTools: 'Search tools…',
+  noMatchingTools: 'No tools matching "{query}".',
+  rawSchema: 'Raw input schema',
   refresh: 'Refresh',
   loadingTools: 'Loading tools…',
   noTools: 'No tools exposed by this server.',
-  toolsAdminOnly: 'Tool inspection and connect controls on a global server are admin-only.',
   refreshedToast: 'Refreshed tools for "{name}"',
   refreshFailed: 'Refresh failed',
   loadToolsFailed: 'Failed to load tools',
@@ -158,23 +161,26 @@ const zh: typeof en = {
   connect: '连接',
   reconnect: '重新连接',
   connecting: '连接中…',
-  expandTools: '展开工具',
-  collapseTools: '收起工具',
+  expandTools: '查看工具',
   // 拨号端徽章词汇。
   dialAutoDerived: '自动 → {site}',
   dialClient: '客户端',
   dialServer: '服务端',
   dialedByShim: '由 hnx shim 拨号',
+  // 内置服务行（#106，自 #107 起按配置集门控）。
+  builtinName: '内置工具',
+  builtinHint:
+    '由平台在 /mcp 出口上直接提供的内置工具——全局、恒可用、不可修改；将其加入配置集后，该配置集的端侧才会看到这些工具。',
   // 状态徽章工具计数。
   toolOne: '{count} 个工具',
   toolMany: '{count} 个工具',
-  // 工具检查面板。
-  toolsHeader: '工具',
-  toolsHeaderCount: '工具（{count}）',
+  // 工具检查抽屉（#112）。
+  searchTools: '搜索工具…',
+  noMatchingTools: '没有匹配“{query}”的工具。',
+  rawSchema: '原始 input schema',
   refresh: '刷新',
   loadingTools: '工具加载中…',
   noTools: '此服务器未暴露任何工具。',
-  toolsAdminOnly: '全局服务器的工具查看与连接控制仅管理员可用。',
   refreshedToast: '已刷新“{name}”的工具',
   refreshFailed: '刷新失败',
   loadToolsFailed: '加载工具失败',

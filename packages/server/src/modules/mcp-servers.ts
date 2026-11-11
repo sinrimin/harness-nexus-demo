@@ -13,8 +13,10 @@ import {
 } from '@harness-nexus/shared';
 import { principalOf } from './principal.js';
 import { RegistryError } from '../mcp/registry.js';
+import { builtinMcpService } from '../mcp/builtin.js';
 import {
   assertServerDialedOwned,
+  assertServerDialedVisible,
   createMcpServer,
   deleteMcpServer,
   listMcpServers,
@@ -52,6 +54,16 @@ export async function mcpServersRoutes(app: FastifyInstance): Promise<void> {
     const includeDeleted = (req.query as { includeDeleted?: string }).includeDeleted === '1';
     const mcpServers = await listMcpServers(deps(), principalOf(req), { includeDeleted });
     return { mcpServers };
+  });
+
+  // ---- GET /api/mcp-servers/builtin ----
+  // The platform's own toolset as ONE service descriptor (#106) — global and
+  // non-modifiable by construction: no DB row exists, and the id-based routes
+  // below (connect/tools/refresh/PATCH/DELETE) 404 on `builtin`. Deliberately
+  // separate from the list above — that array feeds pickers (profile editor,
+  // assistants, CLI resolver) that must only ever see referencable rows.
+  app.get('/api/mcp-servers/builtin', guard, async () => {
+    return { builtin: builtinMcpService() };
   });
 
   // ---- GET /api/mcp-servers/status ----
@@ -98,8 +110,12 @@ export async function mcpServersRoutes(app: FastifyInstance): Promise<void> {
 
   // GET /api/mcp-servers/:id/tools — cached tool list (original names).
   // Not connected → [] (not an error); the UI gates the panel on status.
+  // Visibility-gated, NOT admin-gated (#114): every viewer of the row can
+  // read its tool cache — toolCount rides the public /status rows and profile
+  // sessions already list+call these tools. Refresh (a re-dial) stays
+  // operator-only below.
   app.get<{ Params: { id: string } }>('/api/mcp-servers/:id/tools', guard, async (req) => {
-    await assertServerDialedOwned(deps(), principalOf(req), req.params.id);
+    await assertServerDialedVisible(deps(), principalOf(req), req.params.id);
     // #53 residue: cached tools are registry (live connection) truth.
     try {
       const tools = app.mcpRegistry!.listServerTools(req.params.id);

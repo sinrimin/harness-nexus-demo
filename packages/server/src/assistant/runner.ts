@@ -54,6 +54,13 @@ export interface AssistantRunnerDeps extends AssistantToolDeps {
     modelId: string;
     ownerId: string;
   }) => Promise<{ model: GatewayModel['model']; streamFn: GatewayModel['streamFn'] }>;
+  /**
+   * #109 test seam: the background title refine rides the SAME buildModel
+   * seam the turn uses, so a unit harness scripting one response would feed
+   * the refine instead of the turn. Harnesses set `titleRefine: false`;
+   * production leaves it unset (the refine runs).
+   */
+  titleRefine?: boolean;
   /** M2 — the MCP registry seam (server-dialed pool). Absent = no MCP tools. */
   mcp?: AssistantMcpDeps;
 }
@@ -159,11 +166,18 @@ export function startAssistantTurn(
     prompt: readonly AssistantPromptBlock[];
     /** The transcript BEFORE this turn (rebuild context — prompt rides separately). */
     rows: readonly AssistantMessageRow[];
+    /**
+     * #128 — the current binding's registry context window. Present ⇒ each
+     * persisted assistant row carries the derived occupancy (contextUsed /
+     * contextSize) for the HUD's restore path; absent ⇒ the row keeps the
+     * reported counts only (the CTX reading stays unknown).
+     */
+    contextWindow?: number;
     emit: AssistantEmit;
     /** Persist helper (seq-allocated by the caller's uow access). */
     append: (row: AssistantMessageRow) => Promise<void>;
     /** Called with the final session stamp fields when the turn settles. */
-    settle: (summary: { lastMessageAt: string; title?: string }) => Promise<void>;
+    settle: (summary: { lastMessageAt: string }) => Promise<void>;
     /**
      * M3 — the write-tool approval seam. Absent (tests, default) = writes run
      * ungated; the realtime layer supplies one that surfaces a
@@ -487,7 +501,15 @@ export function startAssistantTurn(
           const usage = event.message.usage;
           if (usage !== undefined && (usage.input > 0 || usage.output > 0)) {
             lastUsage = { inputTokens: usage.input, outputTokens: usage.output };
-            emit({ kind: 'usage', inputTokens: usage.input, outputTokens: usage.output });
+            // #128 — the cache fields ride along for the realtime layer's
+            // session accumulator (the shared schema already allows them).
+            emit({
+              kind: 'usage',
+              inputTokens: usage.input,
+              outputTokens: usage.output,
+              cacheReadTokens: usage.cacheRead,
+              cacheWriteTokens: usage.cacheWrite,
+            });
           }
           if (event.message.stopReason === 'error' && event.message.errorMessage !== undefined) {
             emit({
@@ -559,7 +581,27 @@ export function startAssistantTurn(
                   ? 'error'
                   : 'end_turn',
           ...(m.usage !== undefined && (m.usage.input > 0 || m.usage.output > 0)
-            ? { usage: { inputTokens: m.usage.input, outputTokens: m.usage.output } }
+            ? {
+                usage: {
+                  inputTokens: m.usage.input,
+                  outputTokens: m.usage.output,
+                  // #128 persistence amendment — the cache counts and the
+                  // derived occupancy ride the row so a reopened session
+                  // restores the HUD's READ/WRITE/HIT/CTX readings.
+                  cacheReadTokens: m.usage.cacheRead,
+                  cacheWriteTokens: m.usage.cacheWrite,
+                  ...(input.contextWindow !== undefined
+                    ? {
+                        contextUsed:
+                          m.usage.input +
+                          m.usage.cacheRead +
+                          m.usage.cacheWrite +
+                          m.usage.output,
+                        contextSize: input.contextWindow,
+                      }
+                    : {}),
+                },
+              }
             : {}),
           ...(m.errorMessage !== undefined ? { error: m.errorMessage } : {}),
         });
@@ -607,21 +649,11 @@ export function startAssistantTurn(
     });
     emit({ kind: 'session_status', state: 'idle' });
 
-    // Optimistic title from the first prompt (same stance as the machine
-    // rail's #14); a manual rename (session.title) always wins. This turn IS
-    // the first when the rebuilt transcript holds no earlier user row.
-    const hadEarlierTurn = input.rows.some((r) => r.type === 'user');
-    const title =
-      session.title === '' && !hadEarlierTurn
-        ? input.prompt
-            .filter((b): b is Extract<AssistantPromptBlock, { type: 'text' }> => b.type === 'text')
-            .map((b) => b.text)
-            .join(' ')
-            .slice(0, 80)
-        : undefined;
+    // #109 — the title is no longer derived here: the fallback is written at
+    // TURN START (the first prompt's append, realtime/assistant.ts) and the
+    // refine runs beside the turn. Settle only stamps the activity clock.
     await input.settle({
       lastMessageAt: new Date().toISOString(),
-      ...(title !== undefined && title !== '' ? { title } : {}),
     });
   })();
 

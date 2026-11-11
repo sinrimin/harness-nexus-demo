@@ -133,7 +133,7 @@ export interface PermissionCardState {
    * human's to answer. Rendered as one muted reason line (never an error:
    * the fallback is safe, it was just silent before).
    */
-  escalation?: { reason: 'no-model' | 'timeout' | 'http' | 'shape' };
+  escalation?: { reason: 'no-model' | 'timeout' | 'http' | 'shape' | 'degraded' };
   /** #92 — how it settled (`undefined` on pre-#92 events = a human did). */
   resolution?: {
     responder: 'human' | 'delegated';
@@ -194,6 +194,14 @@ export interface FoldState {
     contextSize?: number;
   } | null;
   /**
+   * #124 — bumps ONLY when a tool call is added/patched (never on text
+   * deltas). The composer HUD derives file-change totals from the tool rows
+   * and memoizes on this counter: `rows` identity changes on every streamed
+   * token (patchStep slices), so it is the wrong dependency for a walk over
+   * every Edit card's diff.
+   */
+  toolRevision: number;
+  /**
    * #10 — the server-owned send queue (depth 1) as a fold slice: the parked
    * prompt renders as a chip floating above the composer, never a transcript
    * row. Pure slot projection — the flushed row comes from the user_message
@@ -230,6 +238,7 @@ export function createFoldState(): FoldState {
     elicitations: [],
     turnActive: false,
     queued: null,
+    toolRevision: 0,
   };
 }
 
@@ -316,7 +325,13 @@ function patchToolRow(state: FoldState, call: ChatToolCallView): FoldState {
     ];
     const toolRowIndex = new Map(state.toolRowIndex);
     toolRowIndex.set(node.callId, rows.length - 1);
-    return settleCurrentStep({ ...state, rows, toolRowIndex, stepClosed: true });
+    return settleCurrentStep({
+      ...state,
+      rows,
+      toolRowIndex,
+      stepClosed: true,
+      toolRevision: state.toolRevision + 1,
+    });
   }
   const row = state.rows[idx];
   if (row === undefined || row.row !== 'tool') return state;
@@ -335,7 +350,7 @@ function patchToolRow(state: FoldState, call: ChatToolCallView): FoldState {
   };
   const rows = state.rows.slice();
   rows[idx] = { ...row, root };
-  return { ...state, rows };
+  return { ...state, rows, toolRevision: state.toolRevision + 1 };
 }
 
 // ---- #71 — native sub-agent rows ----
@@ -449,6 +464,10 @@ function startUserTurn(state: FoldState, blocks: UserBlock[]): FoldState {
 
 function applyEvent(state: FoldState, event: ChatStreamEvent): FoldState {
   switch (event.kind) {
+    // #124 — session telemetry rides its own page state (the HUD), not the
+    // transcript; the fold must ignore it so a history rebuild never owns it.
+    case 'session_usage':
+      return state;
     case 'message_delta':
     case 'thought_delta': {
       const block: ContentBlock =
@@ -546,9 +565,7 @@ function applyEvent(state: FoldState, event: ChatStreamEvent): FoldState {
       return {
         ...state,
         permissions: state.permissions.map((p) =>
-          p.requestId === event.requestId
-            ? { ...p, escalation: { reason: event.reason } }
-            : p,
+          p.requestId === event.requestId ? { ...p, escalation: { reason: event.reason } } : p,
         ),
       };
     case 'permission_resolved':

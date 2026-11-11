@@ -588,6 +588,22 @@ export const sessionConfigPatchSchema = z.object({
 });
 
 /**
+ * #124 — a session's token totals as the daemon's UsageLedger sees them. The
+ * daemon is the only place that knows a target's cumulative-vs-per-turn
+ * dialect, so clients consume these totals instead of summing stream events.
+ * A field is present only when the target ever reported it: 0 is a report,
+ * absence is unknown (never render it as zero). `turns` counts turn_result
+ * signals, which every target emits.
+ */
+export const sessionUsageSnapshotSchema = z.object({
+  turns: z.number().int().min(0),
+  inputTokens: z.number().int().min(0).optional(),
+  outputTokens: z.number().int().min(0).optional(),
+  cacheReadTokens: z.number().int().min(0).optional(),
+  cacheWriteTokens: z.number().int().min(0).optional(),
+});
+
+/**
  * The semantic chat stream (`chat:event` → `{ sessionId, event }`). Produced by
  * the daemon (mapped from ACP `session/update` etc.) plus `permission_resolved`
  * which the SERVER emits so every viewer's permission card settles. `raw` is
@@ -623,6 +639,13 @@ export const chatStreamEventSchema = z.discriminatedUnion('kind', [
     contextUsed: z.number().int().min(0).optional(),
     contextSize: z.number().int().min(0).optional(),
   }),
+  /**
+   * #124 — the daemon's session-cumulative token/cache snapshot (UsageLedger).
+   * Emitted after a countable `usage`/`turn_result`; the server stores the
+   * latest and re-pushes it on `chat:session.ready`, so a rejoin does not
+   * blank the HUD. Not part of history: it is derived state.
+   */
+  sessionUsageSnapshotSchema.extend({ kind: z.literal('session_usage') }),
   z.object({
     kind: z.literal('permission_request'),
     requestId: z.string().min(1).max(128),
@@ -677,7 +700,7 @@ export const chatStreamEventSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('permission_escalated'),
     requestId: z.string().min(1).max(128),
-    reason: z.enum(['no-model', 'timeout', 'http', 'shape']),
+    reason: z.enum(['no-model', 'timeout', 'http', 'shape', 'degraded']),
   }),
   // 9 W14.1 — the agent asked the user a structured question (ACP
   // `elicitation/create`, form mode; claude's AskUserQuestion and
@@ -839,6 +862,17 @@ export const chatSessionStartEventSchema = z.object({
    */
   modelOptions: z.array(z.string().min(1).max(128)).max(32).optional(),
   /**
+   * #125 — the same stored RuntimeConfig's `providerLabel` (the LLM
+   * provider's name at apply time). The daemon-side model-option rewrite
+   * relabels dsh's grouped model options with it, so the sender's picker
+   * reads the real vendor instead of the managed route key
+   * `DSH_PROVIDER_ID` (the option VALUES stay the catalog's opaque tuples).
+   * Absent = no stored config (or a pre-#125 server) → the adapter's own
+   * group labels stand. Optional + stripped by old daemons' non-strict
+   * parse, so purely additive.
+   */
+  providerLabel: z.string().min(1).max(64).optional(),
+  /**
    * Issue #49 — the machine's default chat permission mode for this target,
    * stamped by the SERVER from the machine's `chatDefaultMode`. OPAQUE
    * adapter mode id; the daemon applies it via one `session/set_mode` right
@@ -903,6 +937,13 @@ export const chatSessionReadyEventSchema = z.object({
   nativeSessionId: z.string().min(1).max(128).optional(),
   /** 9 W9 B — prompt content capabilities from the initialize handshake. */
   promptCapabilities: promptCapabilitiesSchema.optional(),
+  /**
+   * #124 — the daemon's UsageLedger totals for this session at ready time
+   * (present only when the channel re-establishes after countable turns; the
+   * ordinary first open has none yet). The server keeps it as the rejoin
+   * snapshot.
+   */
+  sessionUsage: sessionUsageSnapshotSchema.optional(),
   error: z.string().max(512).optional(),
 });
 
@@ -1350,6 +1391,7 @@ export type PlanEntryStatus = z.infer<typeof planEntryStatusSchema>;
 export type PlanEntry = z.infer<typeof planEntrySchema>;
 export type AvailableCommandView = z.infer<typeof availableCommandViewSchema>;
 export type PromptCapabilities = z.infer<typeof promptCapabilitiesSchema>;
+export type SessionUsageSnapshot = z.infer<typeof sessionUsageSnapshotSchema>;
 export type ChatConfigSetRequest = z.infer<typeof chatConfigSetRequestSchema>;
 export type ChatConfigSetEvent = z.infer<typeof chatConfigSetEventSchema>;
 export type ChatStreamEventEnvelope = z.infer<typeof chatStreamEventEnvelopeSchema>;

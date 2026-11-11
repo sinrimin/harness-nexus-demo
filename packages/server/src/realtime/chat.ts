@@ -16,6 +16,7 @@ import type {
   DelegationDenialReason,
   PromptBlock,
   PromptCapabilities,
+  SessionUsageSnapshot,
 } from '@harness-nexus/shared';
 import { generateId } from '../infra/crypto.js';
 import type { SystemOneFetch } from '../infra/systemone.js';
@@ -173,6 +174,8 @@ interface LiveSession {
   nativeSessionId?: string | undefined;
   /** 9 W9 B — prompt-content capabilities (gates the attach UI). */
   promptCapabilities?: PromptCapabilities | undefined;
+  /** #124 — latest daemon token/cache snapshot for the session HUD. */
+  sessionUsage?: SessionUsageSnapshot | undefined;
   /** Socket of the browser that opened the channel; joined on ready. */
   openerSocketId: string | null;
   /**
@@ -405,6 +408,10 @@ export class ChatService {
     // row we can't read must never block the open (the daemon then leaves
     // adapter options untouched).
     let modelOptions: string[] | undefined;
+    // #125 — the spec's provider label rides along so the daemon-side rewrite
+    // can name dsh's model group after the real vendor instead of the managed
+    // route key. Same best-effort contract as modelOptions.
+    let providerLabel: string | undefined;
     if (isRuntimeTarget(agent.target)) {
       try {
         const rc = await this.deps.uow.runtimeConfigs.findByMachineAndTarget(
@@ -413,6 +420,7 @@ export class ChatService {
         );
         if (rc !== null) {
           modelOptions = [...new Set([rc.spec.model, ...(rc.spec.models ?? [])])];
+          providerLabel = rc.spec.providerLabel;
         }
       } catch {
         modelOptions = undefined;
@@ -446,6 +454,7 @@ export class ChatService {
       // #70 — the directory may not exist yet: the daemon mkdir -p's it.
       ...(createDirectory === true ? { createDirectory: true } : {}),
       ...(modelOptions !== undefined ? { modelOptions } : {}),
+      ...(providerLabel !== undefined ? { providerLabel } : {}),
       ...(defaultMode !== undefined ? { defaultMode } : {}),
       ...(prewarm ? { prewarm: true } : {}),
       // #92/#95 — the approvals view for the daemon's session_config
@@ -527,6 +536,8 @@ export class ChatService {
       ...(existing.promptCapabilities !== undefined
         ? { promptCapabilities: existing.promptCapabilities }
         : {}),
+      // #124 — a refreshed page's HUD starts from the last known totals.
+      ...(existing.sessionUsage !== undefined ? { sessionUsage: existing.sessionUsage } : {}),
     });
     this.pushApprovalsConfig(existing);
     // 9 W7 — the refreshed page lost its local fold; the daemon re-emits the
@@ -638,6 +649,8 @@ export class ChatService {
       agentVersion?: string | undefined;
       nativeSessionId?: string | undefined;
       promptCapabilities?: PromptCapabilities | undefined;
+      /** #124 — daemon ledger totals when the channel re-established. */
+      sessionUsage?: SessionUsageSnapshot | undefined;
       error?: string | undefined;
     },
   ): Promise<void> {
@@ -659,6 +672,9 @@ export class ChatService {
     session.agentVersion = evt.agentVersion;
     session.nativeSessionId = evt.nativeSessionId;
     session.promptCapabilities = evt.promptCapabilities;
+    // #124 — a re-established channel carries its totals; a fresh one has
+    // none yet (live `session_usage` events fill it after the first turn).
+    if (evt.sessionUsage !== undefined) session.sessionUsage = evt.sessionUsage;
     // #67 — the dispatch sends its prompt on this tap (the in-process
     // consumer has no room to observe the ready push from).
     this.emitTap(session.sessionId, {
@@ -693,6 +709,7 @@ export class ChatService {
       ...(evt.promptCapabilities !== undefined
         ? { promptCapabilities: evt.promptCapabilities }
         : {}),
+      ...(session.sessionUsage !== undefined ? { sessionUsage: session.sessionUsage } : {}),
     });
     this.pushApprovalsConfig(session);
     // Re-push the history AFTER ready as well: a browser that attached its
@@ -712,6 +729,14 @@ export class ChatService {
   ): Promise<{ ok: boolean }> {
     const session = this.live.get(sessionId);
     if (!session || session.machineId !== machineId) return { ok: false };
+
+    // #124 — keep the latest daemon token snapshot on the session so a
+    // rejoin's ready push restores the HUD; the relay below still forwards
+    // the event to the room as-is.
+    if (event.kind === 'session_usage') {
+      const { kind: _kind, ...snapshot } = event;
+      session.sessionUsage = snapshot;
+    }
 
     // A daemon-side settlement (user answered in another viewer is impossible
     // — answers route through us — but the daemon itself settles cards on

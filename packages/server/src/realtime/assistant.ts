@@ -20,6 +20,7 @@ import type {
 } from '@harness-nexus/shared';
 import { generateId } from '../infra/crypto.js';
 import { rowsToHistoryItems } from '../assistant/history.js';
+import { SessionUsageAccumulator } from '../assistant/usage.js';
 import { imageExpiryFrom } from '../services/settings.js';
 import {
   startAssistantTurn,
@@ -27,6 +28,7 @@ import {
   type AssistantRunnerDeps,
   type RunningTurn,
 } from '../assistant/runner.js';
+import { deriveFallbackTitle, refineSessionTitle } from '../assistant/titles.js';
 import type { AssistantMcpDeps } from '../assistant/context.js';
 import type { SystemOneFetch } from '../infra/systemone.js';
 import {
@@ -75,6 +77,13 @@ interface LiveChannel {
   /** Current model id on that provider. */
   modelId: string;
   /**
+   * #128 — the current model's registry contextWindow (the HUD CTX
+   * denominator). Resolved wherever the provider/model binding moves (open,
+   * config rebind, model pick); a registry entry without a window clears it
+   * (CTX then stays honestly blank — the denominator is unknown).
+   */
+  contextWindow?: number;
+  /**
    * #79 — the conversation's OWN write-policy (the sender switch). Stamped at
    * open from the session row (legacy rows: the config default), moved only by
    * `assistant:config.set permissionMode`. Unlike provider/model, a rebind to
@@ -109,6 +118,18 @@ interface LiveChannel {
    * the channel when the turn ends instead.
    */
   closeWhenIdle?: boolean;
+  /**
+   * #128 — session-cumulative token/cache totals (the HUD's TOK/CACHE cells).
+   * Seeded from the persisted rows when the channel is created (the session's
+   * history survives everything), then fed by the turn loop's `usage` events.
+   * Title refine and delegated-approvals calls never touch the turn's emit
+   * path, so they are excluded by construction. The rows persist the cache
+   * counts and the derived occupancy (#128 persistence amendment), so a
+   * reopen re-seeds everything the strip reads.
+   */
+  usage: SessionUsageAccumulator;
+  /** #128 — last emitted session_usage JSON (a no-delta step must not re-emit). */
+  usageJson?: string;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -152,6 +173,12 @@ export interface AssistantApprovalAnswer {
 export interface AssistantRealtimeDeps extends AssistantRunnerDeps {
   /** #100 — the decision-model breaker, shared with the machine axis. */
   capabilities?: ModelCapabilities;
+  /**
+   * #120 — operator-visible logging for turn failures the transcript alone
+   * cannot explain (the route layer passes the Fastify logger; structural,
+   * like the approvals dep's).
+   */
+  log?: { error: (msg: string) => void };
   approvals?: {
     timeoutMs: number;
     log?: { warn: (msg: string) => void };
@@ -217,6 +244,49 @@ export class AssistantRealtimeService {
     }
   }
 
+  /**
+   * #128 — fold one model response into the channel's accumulator and push
+   * the derived `session_usage` snapshot to the room. The snapshot BYPASSES
+   * the reconnect ring on purpose (the chat axis's rule: derived telemetry is
+   * live-socket state — a resync rebuilds the transcript, never the totals;
+   * the ready push restores them instead), and an unchanged snapshot is not
+   * re-sent (JSON compare, the daemon-side dedupe).
+   */
+  private recordUsage(
+    ch: LiveChannel,
+    report: {
+      inputTokens?: number | undefined;
+      outputTokens?: number | undefined;
+      cacheReadTokens?: number | undefined;
+      cacheWriteTokens?: number | undefined;
+      contextUsed?: number | undefined;
+      contextSize?: number | undefined;
+    },
+  ): void {
+    ch.usage.record(report);
+    const snapshot = ch.usage.snapshot();
+    if (snapshot === null) return;
+    const json = JSON.stringify(snapshot);
+    if (ch.usageJson === json) return;
+    ch.usageJson = json;
+    this.io.toChannel(ch.sessionId, 'assistant:event', {
+      sessionId: ch.sessionId,
+      event: { kind: 'session_usage', ...snapshot },
+    });
+  }
+
+  /**
+   * #128 — resolve the current binding's contextWindow from the provider
+   * registry. One resolution path for every binding move; an entry without
+   * a window clears the field.
+   */
+  private async refreshContextWindow(ch: LiveChannel): Promise<void> {
+    const row = await this.deps.uow.llmProviders.findById(ch.providerId);
+    const contextWindow = row?.models.find((m) => m.id === ch.modelId)?.contextWindow;
+    if (contextWindow !== undefined) ch.contextWindow = contextWindow;
+    else delete ch.contextWindow;
+  }
+
   private channelOf(userId: string, sessionId: string): LiveChannel | null {
     const ch = this.live.get(sessionId);
     return ch !== undefined && ch.ownerId === userId ? ch : null;
@@ -271,9 +341,12 @@ export class AssistantRealtimeService {
         // #79 — the sender's write-policy switch. The names are protocol-side
         // labels; the web renders this option by its `id` with localized
         // strings, values stay the declared modes. #95 follow-up — the third
-        // value hands answers to the owner's default decision model, so the
-        // option is advertised even when no model resolves (picking it then
-        // returns ASSISTANT_APPROVALS_NO_PROVIDER, the discoverable failure).
+        // value hands answers to the owner's default decision model. #108:
+        // the option is advertised even when no model resolves, but the WEB
+        // now renders that choice DISABLED with its reason (capabilities
+        // view); this advertisement only feeds the list, and the
+        // ASSISTANT_APPROVALS_NO_PROVIDER refusal below stays as the
+        // render→pick race backstop.
         {
           id: 'permissionMode',
           name: 'Write policy',
@@ -403,6 +476,13 @@ export class AssistantRealtimeService {
       session.permissionMode ?? config.permissionMode ?? 'prompt';
 
     this.io.joinChannel(socketId, session.id);
+    // #128 — the rows load BEFORE the channel/ready push: a FRESH channel
+    // seeds its usage accumulator from the persisted transcript, and the
+    // ready push carries the snapshot (a rejoin must not blank the HUD —
+    // the chat axis's `chat:session.ready` contract). A LIVE channel keeps
+    // its own accumulator (no re-seed: the in-flight turn's responses are
+    // not in the rows yet).
+    const rows = await this.deps.uow.assistants.listMessages(session.id);
     let ch = this.live.get(session.id);
     if (ch === undefined) {
       ch = {
@@ -416,16 +496,21 @@ export class AssistantRealtimeService {
         run: null,
         openedAt: Date.now(),
         ring: [],
+        usage: SessionUsageAccumulator.fromRows(rows),
         ...(sessionId === undefined ? { pending: session } : {}),
       };
       this.live.set(session.id, ch);
+      await this.refreshContextWindow(ch);
     }
+    const usageSnapshot = ch.usage.snapshot();
+    const contextSnapshot = ch.usage.contextSnapshot();
     this.io.toChannel(session.id, 'assistant:session.ready', {
       sessionId: session.id,
       assistantId: ch.assistantId,
       assistantName: config.name,
+      ...(usageSnapshot !== null ? { sessionUsage: usageSnapshot } : {}),
+      ...(contextSnapshot !== null ? { contextUsage: contextSnapshot } : {}),
     });
-    const rows = await this.deps.uow.assistants.listMessages(session.id);
     this.io.toChannel(session.id, 'assistant:history', {
       sessionId: session.id,
       items: await rowsToHistoryItems(rows, this.historyResolver()),
@@ -693,8 +778,9 @@ export class AssistantRealtimeService {
         return { ok: false, code: 'ASSISTANT_BAD_PERMISSION_MODE' };
       }
       // #95 follow-up — delegation needs a resolvable decision model at the
-      // moment it is picked; the option stays advertised so the failure is
-      // discoverable (the web turns the code into a "configure one" toast).
+      // moment it is picked. #108 — the web gates the choice itself
+      // (disabled + reason) off the same resolution, so this refusal is the
+      // backstop for the model being removed between render and pick.
       if (set.value === 'delegated' && (await this.resolveDecisionView(ch.ownerId)) === null) {
         return { ok: false, code: 'ASSISTANT_APPROVALS_NO_PROVIDER' };
       }
@@ -723,6 +809,7 @@ export class AssistantRealtimeService {
         // previous provider override belonged to the old config's session.
         ch.providerId = config.providerId;
         ch.modelId = config.defaultModel;
+        await this.refreshContextWindow(ch);
         // #82 — a LAZY (un-persisted) session has no row to note into (the
         // append would die on the assistant_messages FK); the rebind just
         // re-stamps the pending row, so the first message persists under the
@@ -750,6 +837,7 @@ export class AssistantRealtimeService {
       }
       ch.providerId = provider.id;
       ch.modelId = model.id;
+      await this.refreshContextWindow(ch);
     }
     this.emit(sessionId, await this.sessionConfigEvent(ch));
     return { ok: true };
@@ -796,6 +884,23 @@ export class AssistantRealtimeService {
     // #11 — the echo is the single source of the user row for every viewer.
     // #59 — the echo carries the WIRE view (refs resolved inline, transient).
     this.emit(ch.sessionId, { kind: 'user_message', blocks: await this.wireView(prompt) });
+    // #128 — a user turn began (the HUD's `turns`; queued flushes re-enter
+    // here and count as their own turn, matching the persisted user rows).
+    ch.usage.countTurn();
+
+    // #109 — the title's fallback lands at TURN START (the first prompt's
+    // append), not at settle: the rail shows a real title even on the
+    // turn-error path. "First" = no user row existed BEFORE this append; the
+    // queued-prompt flush re-enters startTurn later and is not first.
+    if (!rowsBefore.some((r) => r.type === 'user') && session.title === '') {
+      const fallback = deriveFallbackTitle(prompt);
+      if (fallback !== '') {
+        session = { ...session, title: fallback };
+        await this.deps.uow.assistants.saveSession(session);
+        void this.pushSessions(ch.ownerId);
+        if (this.deps.titleRefine !== false) this.refineTitleInBackground(ch, fallback, prompt);
+      }
+    }
 
     const turn = startAssistantTurn(
       this.mcp === undefined ? this.deps : { ...this.deps, mcp: this.mcp },
@@ -809,7 +914,38 @@ export class AssistantRealtimeService {
         permissionMode: ch.permissionMode,
         prompt,
         rows: rowsBefore,
-        emit: (event) => this.emit(ch.sessionId, event),
+        // #128 — the persisted rows carry the derived occupancy (the HUD's
+        // CTX restore path); absent window = the row keeps counts only.
+        ...(ch.contextWindow !== undefined ? { contextWindow: ch.contextWindow } : {}),
+        // #128 — the turn's emit path is the ONLY place usage is counted:
+        // the title refine and the delegated-approvals decision model build
+        // their own calls outside this wrapper, so they never land here.
+        emit: (event) => {
+          // #128 CTX — no adapter reports the assistant's window, so the
+          // response's own token counts DERIVE it: the request the model
+          // just answered (input + cache read/written — pi-ai normalizes
+          // input to EXCLUDE the cached parts on every dialect) plus the
+          // response it produced is the context as it now stands. The
+          // registry's contextWindow is the denominator; without one the
+          // fields stay absent (CTX honestly blank).
+          if (
+            event.kind === 'usage' &&
+            ch.contextWindow !== undefined &&
+            (event.inputTokens !== undefined || event.outputTokens !== undefined)
+          ) {
+            event = {
+              ...event,
+              contextUsed:
+                (event.inputTokens ?? 0) +
+                (event.cacheReadTokens ?? 0) +
+                (event.cacheWriteTokens ?? 0) +
+                (event.outputTokens ?? 0),
+              contextSize: ch.contextWindow,
+            };
+          }
+          this.emit(ch.sessionId, event);
+          if (event.kind === 'usage') this.recordUsage(ch, event);
+        },
         // The seam's prompt window must include THIS turn's prompt:
         // rowsBefore was read before the append above, so without the
         // synthesized row a first-message session handed the decision model
@@ -829,15 +965,15 @@ export class AssistantRealtimeService {
         },
         settle: async (summary) => {
           const now = new Date().toISOString();
+          // #79/#109 — write onto the LIVE row, not the turn-start snapshot:
+          // `permissionMode` follows the channel (a mid-turn sender switch),
+          // while title ownership stays with whoever wrote it last (a user
+          // rename or the #109 refine landing mid-turn must survive).
+          const live = await this.deps.uow.assistants.findSessionById(ch.sessionId);
+          if (live === null) return; // deleted mid-turn — nothing to settle
           await this.deps.uow.assistants.saveSession({
-            ...session,
-            // #79 — persist the channel's CURRENT policy: a mid-turn sender
-            // switch updated ch after this turn captured `session`, and the
-            // row must keep the user's latest choice, not the stale snapshot.
+            ...live,
             permissionMode: ch.permissionMode,
-            ...(summary.title !== undefined && session.title === ''
-              ? { title: summary.title }
-              : {}),
             updatedAt: now,
             lastMessageAt: summary.lastMessageAt,
           });
@@ -849,23 +985,46 @@ export class AssistantRealtimeService {
     try {
       await turn.done;
     } catch (err) {
-      if (!(err instanceof TurnSetupError)) throw err;
+      // #120 — the turn is fired with `void` (the send ack must not wait on
+      // a generation), so a rethrow here is an UNHANDLED rejection and kills
+      // the whole process — one undecryptable credential (a key rotation
+      // without re-encryption) took the entire instance down. Every failure
+      // now ends the turn honestly; the unexpected ones are logged for the
+      // operator.
+      const message = err instanceof Error ? err.message : String(err);
+      const setup = err instanceof TurnSetupError;
+      if (!setup) {
+        this.deps.log?.error(
+          `assistant turn failed unexpectedly (session ${ch.sessionId}): ${message}`,
+        );
+      }
       // Setup failures (provider/credential/model drift) end the turn
-      // honestly: an error row + system note, never a wedged busy gate.
-      await this.transact(ch.sessionId, async () => {
-        const rowsNow = await this.deps.uow.assistants.listMessages(ch.sessionId);
-        const seq = rowsNow.reduce((max, r) => Math.max(max, r.seq), 0) + 1;
-        await this.deps.uow.assistants.appendMessage(ch.sessionId, {
-          seq,
-          type: 'note',
-          text: `error: ${err.message}`,
+      // honestly: an error row + system note, never a wedged busy gate. The
+      // settle is guarded — a DB failure while reporting a failure must not
+      // re-enter the rethrow this fix removed.
+      const text = `error: ${setup ? message : `internal error: ${message}`}`;
+      try {
+        await this.transact(ch.sessionId, async () => {
+          const rowsNow = await this.deps.uow.assistants.listMessages(ch.sessionId);
+          const seq = rowsNow.reduce((max, r) => Math.max(max, r.seq), 0) + 1;
+          await this.deps.uow.assistants.appendMessage(ch.sessionId, {
+            seq,
+            type: 'note',
+            text,
+          });
         });
-      });
-      this.emit(ch.sessionId, {
-        kind: 'raw',
-        method: 'hnx/prompt-error',
-        params: { message: err.message },
-      });
+        this.emit(ch.sessionId, {
+          kind: 'raw',
+          method: 'hnx/prompt-error',
+          params: { message: text.slice('error: '.length) },
+        });
+      } catch (settleErr) {
+        this.deps.log?.error(
+          `assistant turn settle failed (session ${ch.sessionId}): ${
+            settleErr instanceof Error ? settleErr.message : String(settleErr)
+          }`,
+        );
+      }
       this.emit(ch.sessionId, { kind: 'turn_result', stopReason: 'end_turn' });
       this.emit(ch.sessionId, { kind: 'session_status', state: 'idle' });
     } finally {
@@ -886,6 +1045,44 @@ export class AssistantRealtimeService {
       void this.pushSessions(ch.ownerId);
       await this.flushQueue(ch.ownerId);
     }
+  }
+
+  /**
+   * #109 — one fire-and-forget titling call on the session's OWN
+   * provider/model, fired beside the first turn. The stored title is
+   * replaced ONLY while it still equals the fallback this refine was fired
+   * with — a user rename in between always wins. Every failure keeps the
+   * fallback; nothing here ever surfaces to the turn.
+   */
+  private refineTitleInBackground(
+    ch: LiveChannel,
+    fallback: string,
+    prompt: AssistantPromptBlock[],
+  ): void {
+    void (async () => {
+      const provider = await this.deps.uow.llmProviders.findById(ch.providerId);
+      if (provider === null) return;
+      const refined = await refineSessionTitle(this.deps, {
+        ownerId: ch.ownerId,
+        provider,
+        modelId: ch.modelId,
+        firstPrompt: prompt
+          .filter((b): b is Extract<AssistantPromptBlock, { type: 'text' }> => b.type === 'text')
+          .map((b) => b.text)
+          .join(' '),
+      });
+      if (refined === '') return;
+      const row = await this.deps.uow.assistants.findSessionById(ch.sessionId);
+      if (row === null || row.title !== fallback) return;
+      await this.deps.uow.assistants.saveSession({ ...row, title: refined });
+      void this.pushSessions(ch.ownerId);
+    })().catch((err) => {
+      // #120's lesson, applied to this tail: a floating promise must never
+      // reject — a DB hiccup between the refine and the save would otherwise
+      // be an unhandled rejection that kills the process. The fallback title
+      // stays; only the operator log learns why.
+      this.deps.log?.error(`assistant title refine failed: ${String(err)}`);
+    });
   }
 
   /** Flush the user's OLDEST parked slot once the turn ended. */
@@ -969,10 +1166,15 @@ export class AssistantRealtimeService {
     if (ch === undefined || ch.ownerId !== userId) return false;
     this.io.joinChannel(socketId, sessionId);
     const config = await this.configOf(ch.ownerId, ch.assistantId);
+    const usageSnapshot = ch.usage.snapshot();
+    const contextSnapshot = ch.usage.contextSnapshot();
     this.io.toChannel(sessionId, 'assistant:session.ready', {
       sessionId,
       assistantId: ch.assistantId,
       assistantName: config?.name ?? '',
+      // #128 — the live accumulator's snapshot (a resync must not blank the HUD).
+      ...(usageSnapshot !== null ? { sessionUsage: usageSnapshot } : {}),
+      ...(contextSnapshot !== null ? { contextUsage: contextSnapshot } : {}),
     });
     const rows = await this.deps.uow.assistants.listMessages(sessionId);
     this.io.toChannel(sessionId, 'assistant:history', {

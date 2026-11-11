@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import { toast } from 'sonner';
 import {
   ServerIcon,
@@ -32,6 +33,7 @@ import {
   Well,
   tableState,
 } from '@/components/kit';
+import { cn } from '@/lib/utils';
 import {
   effectiveSort,
   matchesQuery,
@@ -44,6 +46,14 @@ import { PageAction } from '@/components/shell/page-action';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible';
+import {
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerDescription,
+  DrawerHeader,
+  DrawerTitle,
+} from '@/components/ui/drawer';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
@@ -85,6 +95,7 @@ import {
   type DialSite,
   type McpServerStatus,
   type McpToolInfo,
+  type BuiltinMcpService,
   type CredentialView,
 } from '@harness-nexus/sdk';
 
@@ -130,6 +141,9 @@ export function McpManagementPage() {
   const { logout, user } = useAuth();
   const { t } = useI18n();
   const [items, setItems] = useState<McpServer[] | null>(null);
+  // The platform's own toolset (#106) — a pinned fixture row, not a McpServer
+  // row; null until fetched (or if the fetch fails — the row simply hides).
+  const [builtin, setBuiltin] = useState<BuiltinMcpService | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [statuses, setStatuses] = useState<Map<string, McpServerStatus>>(new Map());
   // name → distributable, for deriving `auto` dial sites client-side (display
@@ -148,11 +162,13 @@ export function McpManagementPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [servers, creds] = await Promise.all([
+      const [servers, creds, builtinService] = await Promise.all([
         withAuthGuard(() => api.listMcpServers(), logout),
         api.listCredentials().catch(() => [] as CredentialView[]),
+        api.getBuiltinMcpService().catch(() => null),
       ]);
       setItems(servers);
+      setBuiltin(builtinService);
       setError(null);
       const map = new Map<string, boolean>();
       for (const c of creds) if (!map.has(c.name)) map.set(c.name, c.distributable);
@@ -250,6 +266,14 @@ export function McpManagementPage() {
     [],
   );
 
+  // The built-in service is a pinned fixture, not a managed asset: it ignores
+  // the transport/dial/scope filters (vocabulary mismatch — it has no
+  // upstream, no dial decision, no owner) and only the search query can hide
+  // it. It is deliberately not counted in the filter bar's shown/total.
+  const builtinVisible =
+    builtin !== null &&
+    matchesQuery(query.q, [t('mcp.builtinName'), ...builtin.tools.map((tool) => tool.name)]);
+
   return (
     <>
       <PageSlot slot="actions">
@@ -337,6 +361,7 @@ export function McpManagementPage() {
           </TableRow>
         </TableHeader>
         <TableBody>
+          {builtinVisible && builtin !== null ? <BuiltinServiceRow service={builtin} /> : null}
           {visible?.map((s) => (
             <ServerRow
               key={s.id}
@@ -409,10 +434,11 @@ export function McpManagementPage() {
 }
 
 /**
- * One server row. Proxy rows are wrapped in a Collapsible: the row itself is the
- * trigger (Name cell carries a chevron when connected), and the tool-inspection
- * panel expands below it. Direct rows render as a plain, non-expandable row with
- * a neutral status hint (Harness Nexus never dials them).
+ * One server row. Proxy rows' tool-count readout opens the tool-inspection
+ * drawer (#112) while connected — the row itself stays single-line, so the
+ * table can never be stretched by upstream tool descriptions. Direct rows
+ * render as a plain, non-expandable row with a neutral status hint (Harness
+ * Nexus never dials them).
  *
  * Defined at module scope (React perf rule — never nest component definitions).
  */
@@ -438,7 +464,7 @@ function ServerRow({
   logout: () => void;
 }) {
   const { t } = useI18n();
-  const [open, setOpen] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
   const [pendingConnect, setPendingConnect] = useState(false);
 
   const isServerDialed = site === 'server';
@@ -537,139 +563,201 @@ function ServerRow({
     );
   }
 
-  // ---- server-dialed row: expandable when connected ----
+  // ---- server-dialed row: single-line; tools inspect in the drawer ----
+  // Inspection is VISIBILITY-gated (#114): every row the caller can see lists
+  // its tools — the count, /status and profile sessions already agree with
+  // that. REFRESH stays a manager action (it re-dials the upstream), so the
+  // drawer's Refresh button hides for non-managers of the row.
+  const canManage = isAdmin || server.scope === 'personal';
+  const { tools, refreshing, refresh } = useServerTools(server.id, server.name, inspecting, logout);
+  const lampState: McpServerStatus['status'] = connState ?? 'disconnected';
   return (
     <>
-      <Collapsible asChild open={open} onOpenChange={setOpen}>
-        <>
-          <TableRow data-state={open ? 'open' : 'closed'}>
-            <TableCell className="pl-6 font-medium">
-              <div className="flex items-center gap-2">
-                {/* The trigger is the chevron + name; only meaningful when
-                 * connected. Non-admins on a global row MAY expand — the
-                 * panel then explains that inspection is admin-only instead
-                 * of fetching into a 404. */}
-                <CollapsibleTrigger asChild>
-                  <button
-                    type="button"
-                    className="text-muted-foreground hover:text-foreground flex items-center gap-1 disabled:opacity-30"
-                    disabled={!isConnected}
-                    aria-label={open ? t('mcp.collapseTools') : t('mcp.expandTools')}
-                  >
-                    <ChevronRightIcon
-                      className={`size-4 transition-transform ${open ? 'rotate-90' : ''}`}
-                    />
-                  </button>
-                </CollapsibleTrigger>
-                <span>{server.name}</span>
-              </div>
-            </TableCell>
-            <TableCell>{dialSiteCell}</TableCell>
-            <TableCell>
-              <StatusBadge status={connState} detail={status?.detail} toolCount={toolCount} />
-            </TableCell>
-            <TableCell>{transportCell}</TableCell>
-            <TableCell>{scopeCell}</TableCell>
-            <TableCell className="pr-6 text-right">
-              <div className="flex items-center justify-end gap-1">
+      <TableRow>
+        <TableCell className="pl-6 font-medium">{server.name}</TableCell>
+        <TableCell>{dialSiteCell}</TableCell>
+        <TableCell>
+          {/* The count IS the drawer's entry (#112) — it only renders while
+           * connected, and opens for every viewer of the row (#114). */}
+          <StatusBadge
+            status={connState}
+            detail={status?.detail}
+            toolCount={toolCount}
+            onInspect={() => setInspecting(true)}
+          />
+        </TableCell>
+        <TableCell>{transportCell}</TableCell>
+        <TableCell>{scopeCell}</TableCell>
+        <TableCell className="pr-6 text-right">
+          <div className="flex items-center justify-end gap-1">
+            {isConnected ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted-foreground h-(--row-ctl-h)"
+                disabled={server.scope === 'global' && !isAdmin}
+                onClick={() => onAsk('disconnect', server)}
+              >
+                <PlugZapIcon className="size-4" />
+                {t('mcp.disconnect')}
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-(--row-ctl-h)"
+                disabled={isConnecting || (server.scope === 'global' && !isAdmin)}
+                onClick={connect}
+              >
+                {isConnecting ? (
+                  <LoaderIcon className="size-4 animate-spin" />
+                ) : (
+                  <PlugIcon className="size-4" />
+                )}
+                {isConnecting
+                  ? t('mcp.connecting')
+                  : connState === 'error'
+                    ? t('mcp.reconnect')
+                    : t('mcp.connect')}
+              </Button>
+            )}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" className="size-(--row-ctl-h)">
+                  <MoreHorizontalIcon className="size-4" />
+                  <span className="sr-only">{t('common.openMenu')}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
                 {isConnected ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-muted-foreground h-(--row-ctl-h)"
+                  <DropdownMenuItem
                     disabled={server.scope === 'global' && !isAdmin}
                     onClick={() => onAsk('disconnect', server)}
                   >
-                    <PlugZapIcon className="size-4" />
-                    {t('mcp.disconnect')}
-                  </Button>
-                ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-(--row-ctl-h)"
-                    disabled={isConnecting || (server.scope === 'global' && !isAdmin)}
-                    onClick={connect}
-                  >
-                    {isConnecting ? (
-                      <LoaderIcon className="size-4 animate-spin" />
-                    ) : (
-                      <PlugIcon className="size-4" />
-                    )}
-                    {isConnecting
-                      ? t('mcp.connecting')
-                      : connState === 'error'
-                        ? t('mcp.reconnect')
-                        : t('mcp.connect')}
-                  </Button>
-                )}
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="icon" className="size-(--row-ctl-h)">
-                      <MoreHorizontalIcon className="size-4" />
-                      <span className="sr-only">{t('common.openMenu')}</span>
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    {isConnected ? (
-                      <DropdownMenuItem
-                        disabled={server.scope === 'global' && !isAdmin}
-                        onClick={() => onAsk('disconnect', server)}
-                      >
-                        <PlugZapIcon /> {t('mcp.disconnect')}
-                      </DropdownMenuItem>
-                    ) : null}
-                    <DropdownMenuItem
-                      disabled={server.scope === 'global' && !isAdmin}
-                      onClick={() => onEdited(server)}
-                    >
-                      <PencilIcon /> {t('common.edit')}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      variant="destructive"
-                      disabled={server.scope === 'global' && !isAdmin}
-                      onClick={() => onAsk('delete', server)}
-                    >
-                      <TrashIcon /> {t('common.delete')}
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            </TableCell>
-          </TableRow>
-          <CollapsibleContent asChild>
-            <TableRow className="hover:bg-transparent">
-              <TableCell colSpan={6} className="bg-muted/30 px-6 py-4">
-                {server.scope === 'global' && !isAdmin ? (
-                  <p className="text-muted-foreground text-xs">{t('mcp.toolsAdminOnly')}</p>
-                ) : (
-                  <ToolList serverId={server.id} serverName={server.name} logout={logout} />
-                )}
-              </TableCell>
-            </TableRow>
-          </CollapsibleContent>
-        </>
-      </Collapsible>
+                    <PlugZapIcon /> {t('mcp.disconnect')}
+                  </DropdownMenuItem>
+                ) : null}
+                <DropdownMenuItem
+                  disabled={server.scope === 'global' && !isAdmin}
+                  onClick={() => onEdited(server)}
+                >
+                  <PencilIcon /> {t('common.edit')}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  variant="destructive"
+                  disabled={server.scope === 'global' && !isAdmin}
+                  onClick={() => onAsk('delete', server)}
+                >
+                  <TrashIcon /> {t('common.delete')}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </TableCell>
+      </TableRow>
+      <ToolInspectorDrawer
+        open={inspecting}
+        onOpenChange={setInspecting}
+        title={server.name}
+        lamp={
+          <Lamp
+            state={lampState === 'disconnected' ? 'offline' : lampState}
+            word={lampState}
+            pulse={lampState === 'connecting'}
+          />
+        }
+        canRefresh={canManage}
+        tools={tools}
+        refreshing={refreshing}
+        onRefresh={refresh}
+      />
+    </>
+  );
+}
+
+/**
+ * The platform's built-in MCP service (#106) — pinned first row of the table.
+ * Global and non-modifiable: no connect/edit/delete actions, always available
+ * (the tools are served in-process on the /mcp outlet). The tool-count readout
+ * opens the same tool-inspection drawer as the pooled rows, fed straight from
+ * the descriptor — no registry round-trip, no refresh (#112).
+ *
+ * Defined at module scope (React perf rule — never nest component definitions).
+ */
+function BuiltinServiceRow({ service }: { service: BuiltinMcpService }) {
+  const { t } = useI18n();
+  const [inspecting, setInspecting] = useState(false);
+  return (
+    <>
+      <TableRow>
+        <TableCell className="pl-6 font-medium">{t('mcp.builtinName')}</TableCell>
+        <TableCell>
+          <Badge variant="default">server</Badge>
+        </TableCell>
+        <TableCell>
+          <div className="flex items-center gap-2">
+            {/* Status words stay English (wire vocabulary, like every other
+             * row); the service is in-process, so "built-in" IS its state. */}
+            <Lamp state="connected" word="built-in" />
+            <button
+              type="button"
+              className="text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current nums text-xs underline-offset-2 hover:underline"
+              aria-label={t('mcp.expandTools')}
+              onClick={() => setInspecting(true)}
+            >
+              {service.tools.length === 1
+                ? t('mcp.toolOne', { count: 1 })
+                : t('mcp.toolMany', { count: service.tools.length })}
+            </button>
+          </div>
+        </TableCell>
+        <TableCell>
+          <Badge variant="secondary" className="role-data-sm">
+            built-in
+          </Badge>
+        </TableCell>
+        <TableCell>
+          <ScopeBadge scope="global" />
+        </TableCell>
+        <TableCell className="pr-6" />
+      </TableRow>
+      <ToolInspectorDrawer
+        open={inspecting}
+        onOpenChange={setInspecting}
+        title={t('mcp.builtinName')}
+        lamp={<Lamp state="connected" word="built-in" />}
+        hint={t('mcp.builtinHint')}
+        tools={service.tools}
+      />
     </>
   );
 }
 
 /**
  * Live connection status — the two-channel status device (`Lamp`: the lamp
- * carries the tone, the word the state) plus a tool-count badge when
- * connected and the error detail when present.
+ * carries the tone, the word the state) plus the tool-count readout when
+ * connected, and the error detail when present. With `onInspect` the count IS
+ * the tool drawer's entry (#112) — the row keeps a single affordance instead
+ * of a chevron + link pair.
  */
 function StatusBadge({
   status,
   detail,
   toolCount,
+  onInspect,
 }: {
   status: McpServerStatus['status'] | undefined;
   detail: string | undefined;
   toolCount: number;
+  /** Present = clicking the count opens the tool-inspection drawer. */
+  onInspect?: () => void;
 }) {
   const { t } = useI18n();
   const resolved: McpServerStatus['status'] = status ?? 'disconnected';
+  const count =
+    toolCount === 1
+      ? t('mcp.toolOne', { count: toolCount })
+      : t('mcp.toolMany', { count: toolCount });
   return (
     <>
       <div className="flex items-center gap-2">
@@ -679,11 +767,18 @@ function StatusBadge({
           pulse={resolved === 'connecting'}
         />
         {resolved === 'connected' ? (
-          <span className="text-muted-foreground nums text-xs">
-            {toolCount === 1
-              ? t('mcp.toolOne', { count: toolCount })
-              : t('mcp.toolMany', { count: toolCount })}
-          </span>
+          onInspect ? (
+            <button
+              type="button"
+              className="text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current nums text-xs underline-offset-2 hover:underline"
+              aria-label={t('mcp.expandTools')}
+              onClick={onInspect}
+            >
+              {count}
+            </button>
+          ) : (
+            <span className="text-muted-foreground nums text-xs">{count}</span>
+          )
         ) : null}
         {resolved === 'error' && detail ? (
           <span className="text-muted-foreground truncate text-xs" title={detail}>
@@ -695,21 +790,15 @@ function StatusBadge({
   );
 }
 
+/** Tool lists at or above this size get the inspector's search box. */
+const TOOL_SEARCH_THRESHOLD = 8;
+
 /**
- * The expandable tool-inspection panel for a connected proxy server. Lazily
- * fetches the tool list when first opened, then caches locally; the Refresh
- * button re-pulls from the upstream. Each tool can expand to show its
- * inputSchema parameters.
+ * Lazily fetch a server's cached tool list while the inspector drawer is open
+ * (fetch on first open, then cache locally); `refresh` re-pulls from the
+ * upstream. The Phase 2.4 panel's data logic, relocated into the drawer (#112).
  */
-function ToolList({
-  serverId,
-  serverName,
-  logout,
-}: {
-  serverId: string;
-  serverName: string;
-  logout: () => void;
-}) {
+function useServerTools(serverId: string, serverName: string, active: boolean, logout: () => void) {
   const { t } = useI18n();
   const [tools, setTools] = useState<McpToolInfo[] | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -724,8 +813,9 @@ function ToolList({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- t is stable per language; dep array kept as-is
   }, [serverId, logout]);
 
-  // Fetch once on mount (the panel only renders when the row is expanded).
+  // Fetch once when the drawer first opens (the list stays cached afterwards).
   useEffect(() => {
+    if (!active) return;
     let cancelled = false;
     void (async () => {
       const loaded = await load();
@@ -734,7 +824,7 @@ function ToolList({
     return () => {
       cancelled = true;
     };
-  }, [load]);
+  }, [load, active]);
 
   async function refresh() {
     setRefreshing(true);
@@ -749,89 +839,215 @@ function ToolList({
     }
   }
 
+  return { tools, refreshing, refresh };
+}
+
+/**
+ * The tool-inspection drawer (#112) — the right-side sheet each row's
+ * tool-count readout opens. Tall content (long upstream descriptions,
+ * parameter lists, raw input schemas) belongs here, not in a colSpan table
+ * cell whose min-content width stretched the whole table: the row stays
+ * single-line and the table keeps its width. Server rows pass a lazily
+ * fetched list plus refresh; the built-in service row passes its static
+ * descriptor and no refresh.
+ */
+function ToolInspectorDrawer({
+  open,
+  onOpenChange,
+  title,
+  lamp,
+  hint,
+  canRefresh,
+  tools,
+  refreshing,
+  onRefresh,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  /** The status device (Lamp) for the drawer's description line. */
+  lamp: ReactNode;
+  /** A one-line note pinned above the list (the built-in service's hint). */
+  hint?: string;
+  /** False hides the Refresh button (viewing is open, re-dialing is a
+   * manager action — #114). Default true; moot when onRefresh is omitted. */
+  canRefresh?: boolean;
+  /** The tool list; null = still loading (server rows fetch on open). */
+  tools: McpToolInfo[] | null;
+  refreshing?: boolean;
+  /** Omit for a static list (the built-in service) — no refresh renders. */
+  onRefresh?: () => void;
+}) {
+  const { t } = useI18n();
+  const [query, setQuery] = useState('');
+  // A fresh open (or another server's drawer) starts unfiltered.
+  useEffect(() => {
+    if (open) setQuery('');
+  }, [open]);
+  const needle = query.trim().toLowerCase();
+  const filtered = useMemo(() => {
+    if (tools === null || needle === '') return tools;
+    return tools.filter(
+      (tool) =>
+        tool.name.toLowerCase().includes(needle) ||
+        (tool.description ?? '').toLowerCase().includes(needle),
+    );
+  }, [tools, needle]);
+
   return (
-    <>
-      <div>
-        <div className="mb-2 flex items-center gap-2">
-          <span className="text-muted-foreground text-xs font-medium">
-            {tools ? t('mcp.toolsHeaderCount', { count: tools.length }) : t('mcp.toolsHeader')}
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-muted-foreground h-7"
-            disabled={refreshing}
-            onClick={refresh}
-          >
-            <RefreshCwIcon className={`size-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-            {t('mcp.refresh')}
-          </Button>
-        </div>
-        {tools === null ? (
-          <p className="text-muted-foreground text-xs">{t('mcp.loadingTools')}</p>
-        ) : tools.length === 0 ? (
-          <p className="text-muted-foreground text-xs">{t('mcp.noTools')}</p>
-        ) : (
-          <ul className="flex flex-col gap-1">
-            {tools.map((tool) => (
-              <ToolRow key={tool.name} tool={tool} />
-            ))}
-          </ul>
-        )}
-      </div>
-    </>
+    <Drawer open={open} onOpenChange={onOpenChange}>
+      <DrawerContent>
+        <DrawerHeader>
+          <div className="flex items-center justify-between gap-2 pr-1">
+            <DrawerTitle className="min-w-0 truncate">{title}</DrawerTitle>
+            {onRefresh && canRefresh !== false ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted-foreground h-7 shrink-0"
+                disabled={refreshing}
+                onClick={onRefresh}
+              >
+                <RefreshCwIcon className={cn('size-3.5', refreshing && 'animate-spin')} />
+                {t('mcp.refresh')}
+              </Button>
+            ) : null}
+          </div>
+          <DrawerDescription asChild>
+            <div className="flex items-center gap-2">
+              {lamp}
+              {tools !== null ? (
+                <span className="text-muted-foreground nums text-xs">
+                  {tools.length === 1
+                    ? t('mcp.toolOne', { count: tools.length })
+                    : t('mcp.toolMany', { count: tools.length })}
+                </span>
+              ) : null}
+            </div>
+          </DrawerDescription>
+        </DrawerHeader>
+        <DrawerBody className="flex flex-col gap-2">
+          {hint ? <p className="text-muted-foreground text-xs">{hint}</p> : null}
+          {filtered === null ? (
+            <p className="text-muted-foreground text-xs">{t('mcp.loadingTools')}</p>
+          ) : filtered.length === 0 ? (
+            <p className="text-muted-foreground text-xs">
+              {needle !== '' ? t('mcp.noMatchingTools', { query: query.trim() }) : t('mcp.noTools')}
+            </p>
+          ) : (
+            <>
+              {needle !== '' || filtered.length >= TOOL_SEARCH_THRESHOLD ? (
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder={t('mcp.searchTools')}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="h-8"
+                />
+              ) : null}
+              <ul className="flex flex-col gap-0.5">
+                {filtered.map((tool) => (
+                  <ToolRow key={tool.name} tool={tool} />
+                ))}
+              </ul>
+            </>
+          )}
+        </DrawerBody>
+      </DrawerContent>
+    </Drawer>
   );
 }
 
-/** One tool row with an expandable parameter detail. */
+/**
+ * One tool item in the inspector: the trigger line is the name plus the
+ * description — clamped to two lines while collapsed, full when expanded
+ * (the drawer has the room the table cell never did); expanding reveals the
+ * parameter list and, behind a disclosure, the raw JSON schema.
+ */
 function ToolRow({ tool }: { tool: McpToolInfo }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const [schemaOpen, setSchemaOpen] = useState(false);
   const params = extractParams(tool.inputSchema);
+  const schemaJson = JSON.stringify(tool.inputSchema, null, 2);
   return (
-    <>
-      <li>
-        <Collapsible open={open} onOpenChange={setOpen}>
-          <div className="flex items-center gap-2">
-            <CollapsibleTrigger asChild>
-              <button
-                type="button"
-                className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-left"
-              >
+    <li>
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className="hover:bg-muted/40 -mx-1.5 flex w-full items-start gap-1.5 rounded-xs px-1.5 py-1 text-left select-none"
+          >
+            <span className="min-w-0 flex-1">
+              {/* The name line is its own items-center row so the 14px chevron
+               * centers against the 16px text line — no hand-tuned top margin
+               * (a mt guess is exactly how they drifted 1px apart). */}
+              <span className="flex items-center gap-1.5">
                 <ChevronRightIcon
-                  className={`size-3.5 transition-transform ${open ? 'rotate-90' : ''}`}
+                  className={cn(
+                    'text-muted-foreground size-3.5 shrink-0 transition-transform',
+                    open && 'rotate-90',
+                  )}
                 />
-                <code className="text-foreground text-xs font-medium">{tool.name}</code>
-              </button>
-            </CollapsibleTrigger>
-            {tool.description ? (
-              <span className="text-muted-foreground truncate text-xs" title={tool.description}>
-                — {tool.description}
+                <code className="text-foreground text-xs font-medium break-all">{tool.name}</code>
               </span>
-            ) : null}
+              {tool.description ? (
+                <span
+                  className={cn(
+                    // No `block` here on purpose: `line-clamp-2` carries its
+                    // own -webkit-box display, and `.block` sorts AFTER
+                    // `.line-clamp-*` in the built sheet — pairing them
+                    // silently unclamps the paragraph.
+                    'text-muted-foreground mt-0.5 text-xs leading-5',
+                    !open && 'line-clamp-2',
+                  )}
+                >
+                  {tool.description}
+                </span>
+              ) : null}
+            </span>
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="mt-1 ml-5 flex flex-col gap-2 pb-1">
+            {params.length === 0 ? (
+              <p className="text-muted-foreground text-xs">{t('mcp.noParams')}</p>
+            ) : (
+              <ul className="flex flex-col gap-0.5">
+                {params.map((p) => (
+                  <li key={p.name} className="nums text-xs">
+                    <code className="text-foreground">{p.name}</code>
+                    <span className="text-muted-foreground"> : {p.type}</span>
+                    {p.required ? (
+                      <span className="text-warn ml-2 font-medium">{t('mcp.required')}</span>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Collapsible open={schemaOpen} onOpenChange={setSchemaOpen}>
+              <CollapsibleTrigger asChild>
+                <button
+                  type="button"
+                  className="text-muted-foreground hover:text-foreground flex w-fit items-center gap-1 text-xs select-none"
+                >
+                  <ChevronRightIcon
+                    className={cn('size-3 transition-transform', schemaOpen && 'rotate-90')}
+                  />
+                  {t('mcp.rawSchema')}
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <Well variant="code" copy={schemaJson} className="mt-1.5 max-h-64 overflow-y-auto">
+                  {schemaJson}
+                </Well>
+              </CollapsibleContent>
+            </Collapsible>
           </div>
-          <CollapsibleContent>
-            <div className="ml-5 mt-1">
-              {params.length === 0 ? (
-                <p className="text-muted-foreground text-xs">{t('mcp.noParams')}</p>
-              ) : (
-                <ul className="flex flex-col gap-0.5">
-                  {params.map((p) => (
-                    <li key={p.name} className="nums text-xs">
-                      <code className="text-foreground">{p.name}</code>
-                      <span className="text-muted-foreground"> : {p.type}</span>
-                      {p.required ? (
-                        <span className="text-warn ml-2 font-medium">{t('mcp.required')}</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
-      </li>
-    </>
+        </CollapsibleContent>
+      </Collapsible>
+    </li>
   );
 }
 

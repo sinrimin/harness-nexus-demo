@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT
 
 import { memo, useEffect, useRef, useState } from 'react';
-import { BrainIcon, ChevronDownIcon, FileTextIcon, NotebookPenIcon } from 'lucide-react';
+import { BrainIcon, CheckIcon, CopyIcon, FileTextIcon, NotebookPenIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/i18n';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { MarkdownText } from './markdown-text.js';
+import { RowHeader } from './row-header.js';
 import type { TurnStats, UserBlock } from './fold.js';
 
 /**
@@ -95,7 +96,11 @@ export const SystemNote = memo(function SystemNote({
   return (
     <div
       className={cn(
-        'rounded-md border px-3 py-1.5 text-xs',
+        // #116 — error bodies carry unbreakable tokens (hex request ids,
+        // long JSON keys); `anywhere` (not `break-word`) also shrinks the
+        // row's intrinsic min-content, so a wide note can no longer stretch
+        // the flex chain into a page-level horizontal scroll on phones.
+        'rounded-md border px-3 py-1.5 text-xs [overflow-wrap:anywhere]',
         tone === 'error'
           ? 'text-destructive border-danger/40 bg-danger/5'
           : tone === 'success'
@@ -171,37 +176,27 @@ function ReasoningRow({ text, running }: { text: string; running: boolean }) {
     el.scrollLeft = running ? el.scrollWidth - el.clientWidth : 0;
   }, [running, summary]);
 
+  // #121 — the same header as a tool card (chevron before the title, title in
+  // the tool ink and size) inside the same header row — a bare flex-1 button
+  // in the column would take basis 0 over its h-6 and shrink to 16px. Only
+  // the live text breathes, not the open body.
   return (
-    <div className="text-muted-foreground text-xs" data-state={running ? 'running' : 'ok'}>
-      <button
-        type="button"
-        disabled={empty}
-        aria-expanded={expanded && !empty}
-        onClick={() => setExpanded((v) => !v)}
-        className={cn(
-          'flex h-6 w-full items-center gap-1.5 rounded-sm text-left',
-          !empty && 'hover:text-foreground',
-          running && 'lamp-breath',
-        )}
-      >
-        <BrainIcon className="size-3.5 shrink-0" />
-        <span className="shrink-0 text-[11px] font-medium">{t('chat.thought')}</span>
-        {!empty ? (
-          <ChevronDownIcon
-            className={cn('size-3 shrink-0 transition-transform', expanded && 'rotate-180')}
-          />
-        ) : null}
-        <span className="min-w-0 flex-1" />
-        <span
-          ref={summaryRef}
-          className="max-w-[60%] truncate overflow-hidden whitespace-nowrap"
-          title={summary}
-        >
-          {summary}
-        </span>
-      </button>
+    <div className="flex flex-col text-xs" data-state={running ? 'running' : 'ok'}>
+      <div className="flex min-w-0 items-center gap-1">
+        <RowHeader
+          lead={<BrainIcon className="size-3.5" />}
+          title={t('chat.thought')}
+          summary={summary}
+          summaryRef={summaryRef}
+          summaryTitle={summary}
+          breathing={running}
+          expandable={!empty}
+          open={expanded && !empty}
+          onToggle={() => setExpanded((v) => !v)}
+        />
+      </div>
       {expanded && !empty ? (
-        <div className="border-border/60 mt-1 mb-2 ml-5 max-h-48 overflow-y-auto rounded-md border px-3 py-2 whitespace-pre-wrap">
+        <div className="border-border/60 text-muted-foreground mt-1 mb-2 ml-5 max-h-48 overflow-y-auto rounded-md border px-3 py-2 whitespace-pre-wrap">
           {text}
         </div>
       ) : null}
@@ -210,30 +205,68 @@ function ReasoningRow({ text, running }: { text: string; running: boolean }) {
 }
 
 /**
- * One assistant step: ordered blocks + the interrupted marker. A settled
- * step with text carries the #88 capture action (保存为笔记) — the parent
- * owns the dialog; this row only hands the step's markdown up.
+ * A step is capturable when it settled with text — the save-as-note and copy
+ * actions ride it. Exported for the stream's turn-tail merge decision.
  */
-export const AssistantStepRow = memo(function AssistantStepRow({
-  step,
-  onCapture,
-}: {
+export function stepCapturable(
+  step: AssistantStepRowProps['step'],
+  onCapture: ((markdown: string) => void) | undefined,
+): boolean {
+  return (
+    onCapture !== undefined &&
+    step.status === 'settled' &&
+    step.blocks.some((b) => b.type === 'text' && b.text.trim() !== '')
+  );
+}
+
+export interface AssistantStepRowProps {
   step: {
     status: 'running' | 'settled' | 'interrupted';
     blocks: { type: 'text' | 'reasoning'; text: string }[];
   };
   /** Present only where the surface supports capture (both chat rails). */
   onCapture?: (markdown: string) => void;
-}) {
+  /**
+   * The turn's tail stats when this step is the turn's LAST row — the tail
+   * merges into the action row (actions left, telemetry right) instead of
+   * riding below it as its own line.
+   */
+  tailStats?: TurnStats;
+}
+
+/**
+ * One assistant step: ordered blocks + the interrupted marker. A settled
+ * step with text carries the #88 actions — save-as-note and copy, ICON-ONLY
+ * (a text label read as if the note were already saved) — with the turn's
+ * telemetry right-aligned in the same row. The parent owns the capture
+ * dialog; this row only hands the step's markdown up.
+ */
+export const AssistantStepRow = memo(function AssistantStepRow({
+  step,
+  onCapture,
+  tailStats,
+}: AssistantStepRowProps) {
   const { t } = useI18n();
   const streaming = step.status === 'running';
   const last = step.blocks.length - 1;
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const id = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(id);
+  }, [copied]);
   if (step.blocks.length === 0 && !streaming) return null;
   const text = step.blocks
     .filter((b) => b.type === 'text')
     .map((b) => b.text)
     .join('\n');
-  const capturable = onCapture !== undefined && step.status === 'settled' && text.trim() !== '';
+  const capturable = stepCapturable(step, onCapture);
+  const copy = (): void => {
+    navigator.clipboard?.writeText(text).catch(() => {
+      /* no focus / policy denial — the optimistic check is harmless */
+    });
+    setCopied(true);
+  };
   return (
     <div className="flex min-w-0 flex-col gap-2">
       {step.blocks.map((b, i) =>
@@ -250,14 +283,32 @@ export const AssistantStepRow = memo(function AssistantStepRow({
         </span>
       ) : null}
       {capturable ? (
-        <button
-          type="button"
-          onClick={() => onCapture?.(text)}
-          className="text-muted-foreground hover:text-foreground mr-auto inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] transition-colors"
-        >
-          <NotebookPenIcon className="size-3" />
-          {t('chat.captureToNote')}
-        </button>
+        // One row: the action icons left, the turn's telemetry right.
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <div className="flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => onCapture?.(text)}
+              aria-label={t('chat.captureToNote')}
+              title={t('chat.captureToNote')}
+              className="text-muted-foreground hover:text-foreground inline-flex size-6 items-center justify-center rounded transition-colors"
+            >
+              <NotebookPenIcon className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={copy}
+              aria-label={t('chat.copyStep')}
+              title={t('chat.copyStep')}
+              className="text-muted-foreground hover:text-foreground inline-flex size-6 items-center justify-center rounded transition-colors"
+            >
+              {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+            </button>
+          </div>
+          {tailStats !== undefined ? <TurnTail stats={tailStats} /> : null}
+        </div>
+      ) : tailStats !== undefined ? (
+        <TurnTail stats={tailStats} />
       ) : null}
     </div>
   );

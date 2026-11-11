@@ -12,6 +12,7 @@ import type {
 } from '@harness-nexus/core';
 import {
   AppError,
+  BUILTIN_MCP_SERVICE_ID,
   resolveDialSite,
   resolvePlaceholders,
   runtimeTargetSchema,
@@ -20,6 +21,7 @@ import {
 } from '@harness-nexus/shared';
 import { decryptSecret } from '../infra/crypto.js';
 import { findCredentialForOwner } from '../infra/credential-scope.js';
+import { builtinMcpServerRow } from '../mcp/builtin.js';
 import type { ServiceDeps } from './principal.js';
 
 /**
@@ -120,8 +122,10 @@ async function getVisibleProfile(
 /**
  * `GET /api/client/mcp-config?profile=` — the world model a `hnx mcp serve`
  * shim boots from: client-dialed servers with RESOLVED transports (plaintext
- * included), server-dialed servers by name only, plus the outlet arm when any
- * server is server-dialed.
+ * included), server-dialed servers by name only, plus the outlet arm when the
+ * profile carries outlet-resident content — a server-dialed entry OR the
+ * built-in service entry (#107: `notes__`/`api__`-style platform namespaces
+ * ride the outlet, and the built-in tools are profile-gated).
  */
 export async function buildClientMcpConfig(
   deps: ClientConfigDeps,
@@ -166,9 +170,21 @@ export async function buildClientMcpConfig(
     });
 
   const servers: ClientMcpConfig['servers'] = [];
-  let anyServerDialed = false;
+  let outletResident = false;
   for (const entry of profile.entries) {
     if (entry.kind !== 'mcp') continue;
+    // #107 — the built-in service has no row; it rides the outlet (name-only,
+    // exactly like a server-dialed upstream) and is what arms the outlet for
+    // otherwise client-only profiles.
+    if (entry.resourceId === BUILTIN_MCP_SERVICE_ID) {
+      outletResident = true;
+      servers.push({
+        id: BUILTIN_MCP_SERVICE_ID,
+        name: 'Built-in tools',
+        dialSite: 'server',
+      });
+      continue;
+    }
     const server = await deps.uow.mcpServers.findById(entry.resourceId);
     // Soft-deleted (or already physically removed) rows are skipped, not
     // fatal — two-stage delete keeps profiles deployable with dangling refs.
@@ -182,7 +198,7 @@ export async function buildClientMcpConfig(
     }
     const site = await dialSiteFor(server);
     if (site === 'server') {
-      anyServerDialed = true;
+      outletResident = true;
       servers.push({ id: server.id, name: server.name, dialSite: 'server' });
       continue;
     }
@@ -193,12 +209,21 @@ export async function buildClientMcpConfig(
       transport: await resolveTransport(server.transport, (input) =>
         resolve(input, server.ownerId),
       ),
+      // #113 — the entry's pinned subset rides along so the SHIM can enforce
+      // it at list/call time; this path bypasses the platform outlet (the
+      // upstream is dialed locally), so the config is the only carrier.
+      ...(entry.tools ? { tools: entry.tools } : {}),
     });
   }
 
+  // The outlet is armed iff the profile carries outlet-resident entries — a
+  // server-dialed upstream or the built-in service. A client-only profile
+  // without the built-in entry keeps `platform: null` (nothing it carries
+  // lives server-side), and an unreachable outlet still degrades in the shim
+  // exactly like a failed upstream (warned + skipped).
   return {
     profileId: profile.id,
-    platform: anyServerDialed ? { baseUrl: deps.publicBaseUrl } : null,
+    platform: outletResident ? { baseUrl: deps.publicBaseUrl } : null,
     servers,
   };
 }
@@ -231,6 +256,18 @@ export async function buildDeployBundle(
     // Soft-deleted (or already physically removed) rows are skipped, not
     // fatal — two-stage delete keeps profiles deployable with dangling refs.
     if (entry.kind === 'mcp') {
+      // #107 — the built-in service rides as a synthetic server-dialed row:
+      // the install adapters key on `kind === 'mcp'` artifact presence to
+      // emit the ONE `hnx mcp serve` shim entry, and the shim fetches the
+      // real config from the server at spawn.
+      if (entry.resourceId === BUILTIN_MCP_SERVICE_ID) {
+        artifacts.push({
+          entryId: BUILTIN_MCP_SERVICE_ID,
+          kind: 'mcp',
+          mcpServer: builtinMcpServerRow(deps.publicBaseUrl),
+        });
+        continue;
+      }
       const server = await deps.uow.mcpServers.findById(entry.resourceId);
       if (!server || server.deletedAt !== undefined) continue;
       if (!visibleServer(server, caller.userId)) {

@@ -64,6 +64,7 @@ import { AssistantDispatchService } from '../realtime/assistant-dispatch.js';
 import { AssistantRealtimeService } from '../realtime/assistant.js';
 import { ReconnectGuard } from '../realtime/reconnect.js';
 import { JobService } from '../jobs/service.js';
+import { gcSessionPins } from '../services/session-pins.js';
 
 /** #68 — a send's text (string or blocks) for the dispatch backflow note. */
 function chatTextOf(content: string | unknown[]): string {
@@ -214,6 +215,8 @@ export async function registerRealtime(
     {
       uow: app.uow,
       credentialEncryptionKey: app.credentialEncryptionKey,
+      // #120 — unexpected turn failures log instead of crashing the process.
+      log: app.log,
       skills: {
         search: app.skillSearch,
         catalog: app.skillCatalog,
@@ -253,9 +256,13 @@ export async function registerRealtime(
     },
     // M2 — the MCP registry seam. LAZY on purpose: mountMcpProxy decorates
     // `app.mcpRegistry` AFTER registerRealtime runs, so the closures resolve
-    // it per call (turn time), never at wiring time.
+    // it per call (turn time), never at wiring time. The seam's per-id
+    // contract maps onto the registry's selection world (#113) as 'all' per
+    // id — dispatch sees whole servers, never pinned subsets (profile tool
+    // selection is an outlet concern).
     {
-      listTools: (serverIds) => app.mcpRegistry.listTools(serverIds),
+      listTools: (serverIds) =>
+        app.mcpRegistry.listTools(new Map(serverIds.map((id) => [id, 'all']))),
       callTool: (namespacedName, args) => app.mcpRegistry.callTool(namespacedName, args),
     },
     // M3 — write-gate watchdog; #57 — the SAME viewer grace the chat axis
@@ -1048,7 +1055,22 @@ export async function registerRealtime(
     // A freshly MOUNTED rail asks for the current snapshot (the connect-time
     // push predates SPA navigations — the socket survives them).
     socket.on('assistant:sessions.sync', (_payload: unknown, ack?: (res: unknown) => void) => {
-      void realtime.assistant.snapshotFor(socket.data.userId as string).then((snap) => ack?.(snap));
+      void realtime.assistant.snapshotFor(socket.data.userId as string).then((snap) => {
+        ack?.(snap);
+        // #110 — the sync is also a REFRESH (e.g. after a rename, whose PATCH
+        // carries no push of its own): re-push the room so every mounted rail
+        // re-renders even when the emitter discarded the ack.
+        void realtime.assistant.pushSessions(socket.data.userId as string);
+        // #110 — mount-time orphan GC for the assistant axis, fire-and-forget
+        // (the ack must not wait on it). Only the rail's OWN visible set may
+        // prune: the snapshot is the full owner listing this sync asked for.
+        void gcSessionPins(
+          { uow: app.uow },
+          socket.data.userId as string,
+          { kind: 'assistant' },
+          snap.sessions.map((s) => s.id),
+        );
+      });
     });
 
     // Re-push one session's open bundle (the open-ack/listener race).

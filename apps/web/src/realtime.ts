@@ -67,6 +67,19 @@ export function dropAppSocket(): void {
 
 // ---- chat (Phase 8 C5) — mirrors shared/realtime.ts ----
 
+/**
+ * #124 — a session's token/cache totals as the daemon's UsageLedger sees them.
+ * Absent fields are unknown (never rendered as 0); `turns` counts
+ * turn_result signals.
+ */
+export interface ChatSessionUsage {
+  turns: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
 /** One semantic chat event (`chat:event` → `{ sessionId, event }`). */
 export type ChatStreamEvent =
   | { kind: 'message_delta'; delta: string }
@@ -79,10 +92,16 @@ export type ChatStreamEvent =
       kind: 'usage';
       inputTokens?: number;
       outputTokens?: number;
+      /** #128 — the assistant runner reports the cache fields too (the HUD's
+       * session totals accumulate them SERVER-side; the fold ignores them). */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
       /** dsh dialect: context occupancy instead of per-turn token counts. */
       contextUsed?: number;
       contextSize?: number;
     }
+  /** #124 — derived totals; live socket only, never in history. */
+  | ({ kind: 'session_usage' } & ChatSessionUsage)
   | {
       kind: 'permission_request';
       requestId: string;
@@ -119,7 +138,7 @@ export type ChatStreamEvent =
       /** #104 — delegation was on but could not conclude; the card stays. */
       kind: 'permission_escalated';
       requestId: string;
-      reason: 'no-model' | 'timeout' | 'http' | 'shape';
+      reason: 'no-model' | 'timeout' | 'http' | 'shape' | 'degraded';
     }
   | {
       /** 9 W14.1 — the agent asked a structured question (ACP elicitation). */
@@ -298,6 +317,8 @@ export interface ChatSessionReadyPush {
   nativeSessionId?: string;
   /** 9 W9 B — prompt-content capabilities (gates the attach affordance). */
   promptCapabilities?: { image: boolean; audio?: boolean; embeddedContext?: boolean };
+  /** #124 — the last daemon token snapshot, re-pushed on a rejoin. */
+  sessionUsage?: ChatSessionUsage;
 }
 export interface ChatSessionFailedPush {
   sessionId: string;
@@ -414,6 +435,13 @@ export interface AssistantReadyPush {
   sessionId: string;
   assistantId: string;
   assistantName: string;
+  /** #128 — the server-side session accumulator's snapshot (rejoin restore). */
+  sessionUsage?: ChatSessionUsage;
+  /**
+   * #128 — the last turn's derived occupancy (the HUD's CTX restore). The
+   * live usage events carry the same fields; this is the reopen path.
+   */
+  contextUsage?: { contextUsed: number; contextSize: number };
 }
 
 export interface AssistantEventEnvelope {

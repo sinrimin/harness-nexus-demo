@@ -226,6 +226,18 @@ log('\n--- [3.1] list mcp-servers (2 personal) ---');
 r = await req('GET', '/api/mcp-servers', { token: userToken });
 expect('user lists own mcp-servers', r.json.mcpServers.length, 2);
 
+log('\n--- [106] built-in MCP service descriptor — notes tools, outside the row set ---');
+r = await req('GET', '/api/mcp-servers/builtin', { token: userToken });
+expect('builtin descriptor ok', r.status, 200);
+expect('builtin id', r.json.builtin.id, 'builtin');
+expect(
+  'builtin lists the notes tools',
+  r.json.builtin.tools.map((t) => t.name).join(','),
+  'notes__search,notes__get,notes__annotations,notes__create,notes__update',
+);
+r = await req('PATCH', '/api/mcp-servers/builtin', { token: userToken, body: { name: 'x' } });
+expect('builtin non-modifiable (404)', r.status, 404);
+
 log('\n--- [2.1] delete own mcp-server (200) ---');
 r = await req('DELETE', `/api/mcp-servers/${acmeId}`, { token: userToken });
 expect('delete own mcp-server', r.status, 200);
@@ -1141,6 +1153,26 @@ expect(
 expect('stdio resolved', byName.get('smoke-stdio-mine').transport.args[0], 'mine-plaintext');
 expect('server-dialed has NO transport', byName.get('smoke-api-corp').transport, undefined);
 expect('platform block present', cfg.platform !== null, true);
+
+log('\n--- [#107] built-in entry is profile-gated and arms the outlet ---');
+r = await req('POST', '/api/profiles', {
+  token: userToken,
+  body: {
+    name: 'smoke-builtin-kit',
+    target: 'claude-code',
+    scope: 'personal',
+    entries: [{ mcpServerId: 'builtin' }],
+  },
+});
+expect('profile with built-in entry created', r.status, 201);
+const builtinProfileId = r.json.profile.id;
+r = await req('GET', `/api/client/mcp-config?profile=${builtinProfileId}`, { token: userToken });
+expect('built-in entry arms the outlet', r.json.platform !== null, true);
+expect(
+  'built-in rides name-only (server dial)',
+  r.json.servers.some((s) => s.id === 'builtin' && s.dialSite === 'server' && !('transport' in s)),
+  true,
+);
 expect(
   'locked plaintext NEVER in response',
   JSON.stringify(cfg).includes('corp-locked-plaintext'),

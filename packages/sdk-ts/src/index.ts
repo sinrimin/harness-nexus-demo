@@ -40,6 +40,7 @@ import type {
   MarketplaceSource,
   PluginResourceSource,
   McpToolInfo,
+  BuiltinMcpService,
   ClientMcpConfig,
   InventorySnapshot,
   InventoryDiff,
@@ -86,6 +87,7 @@ import type {
   UpdateAnnotationInput,
   CreateCategoryInput,
   UpdateCategoryInput,
+  SessionPinPut,
 } from '@harness-nexus/shared';
 export {
   SCANNABLE_TARGETS,
@@ -94,6 +96,7 @@ export {
   PREWARM_ADAPTER_TARGETS,
   DEFAULT_CHAT_PREWARM_SETTINGS,
   DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+  BUILTIN_MCP_SERVICE_ID,
   providerApiToSpecApi,
   providerModelConfigWarnings,
   isChatApiKind,
@@ -121,6 +124,10 @@ export {
   skillMetaToResourceSource,
   type HookEvent,
 } from '@harness-nexus/shared';
+// #110 — the pin key builders are ONE definition shared by server and web;
+// the web reaches them through this package (it does not depend on shared).
+export { assistantPinKey, machinePinKey, sessionPinKeyOf } from '@harness-nexus/shared';
+export type { SessionPinPut, SessionPinView } from '@harness-nexus/shared';
 export type {
   ApiToolServiceView,
   ApiToolServiceBundle,
@@ -167,6 +174,7 @@ export type {
   MarketplaceSource,
   PluginResourceSource,
   McpToolInfo,
+  BuiltinMcpService,
   ClientMcpConfig,
 };
 
@@ -351,7 +359,12 @@ export interface McpServerStatus {
  *    servers are managed via /api/mcp-servers and enter via the other arm).
  */
 export type ProfileEntryInput =
-  | { mcpServerId: string; pinnedVersion?: string }
+  | {
+      mcpServerId: string;
+      pinnedVersion?: string;
+      /** #113 — absent = whole server; present non-empty = pinned tool allow-set. */
+      tools?: string[];
+    }
   | {
       resourceId: string;
       kind: Exclude<ResourceKind, 'mcp'>;
@@ -884,6 +897,26 @@ export class HarnessNexusClient {
     await this.request('DELETE', `/api/assistant-sessions/${id}`);
   }
 
+  /**
+   * #110 — the owner's session pins (both rails). One GET per rail mount;
+   * callers filter by axis prefix and the render filters orphans.
+   */
+  async listSessionPins(): Promise<{
+    pins: { sessionKey: string; pinnedAt: string }[];
+  }> {
+    return this.request('GET', '/api/session-pins');
+  }
+
+  /** #110 — pin one session (upsert; re-pinning refreshes `pinnedAt`). */
+  async pinSession(input: SessionPinPut): Promise<void> {
+    await this.request('PUT', '/api/session-pins', input);
+  }
+
+  /** #110 — unpin one session (idempotent). */
+  async unpinSession(input: SessionPinPut): Promise<void> {
+    await this.request('DELETE', '/api/session-pins', input);
+  }
+
   async listAssistantSessionMessages(id: string): Promise<{ messages: unknown[] }> {
     return this.request('GET', `/api/assistant-sessions/${id}/messages`);
   }
@@ -1134,6 +1167,17 @@ export class HarnessNexusClient {
     const q = opts?.includeDeleted ? '?includeDeleted=1' : '';
     const res = await this.request('GET', `/api/mcp-servers${q}`);
     return res.mcpServers;
+  }
+
+  /**
+   * The platform's built-in toolset as ONE service descriptor (#106) — global,
+   * non-modifiable, served in-process on the `/mcp` outlet (first group: the
+   * `notes__` tools). Separate from `listMcpServers` on purpose: that array is
+   * pickable/referencable rows, this never is.
+   */
+  async getBuiltinMcpService(): Promise<BuiltinMcpService> {
+    const res = await this.request('GET', '/api/mcp-servers/builtin');
+    return res.builtin;
   }
 
   async updateMcpServer(

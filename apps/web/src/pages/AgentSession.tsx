@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import {
@@ -10,7 +10,11 @@ import {
   BotIcon,
   ClockIcon,
   FolderIcon,
+  MoreHorizontalIcon,
+  PanelLeftCloseIcon,
   PencilIcon,
+  PinIcon,
+  PinOffIcon,
   PlusIcon,
   RefreshCwIcon,
   HistoryIcon,
@@ -34,6 +38,7 @@ import {
   type ChatSessionClosedPush,
   type ChatSessionFailedPush,
   type ChatSessionReadyPush,
+  type ChatSessionUsage,
 } from '@/realtime';
 import {
   HarnessNexusError,
@@ -46,12 +51,29 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { Dialog as DialogPrimitive } from 'radix-ui';
 import { ChatStream } from '@/components/chat/chat-stream.js';
+import { SessionHud } from '@/components/chat/session-hud.js';
+import { sessionEditStats } from '@/components/chat/hud-stats.js';
 import { CaptureNoteDialog } from '@/pages/notes/CaptureNoteDialog';
 import { WelcomePane, type WelcomeCard } from '@/components/chat/welcome-pane.js';
 import { ChannelTabs } from '@/components/chat/channel-tabs.js';
 import { EndSwitcher } from '@/components/chat/end-switcher.js';
+import {
+  CollapsedRail,
+  RailMenuHint,
+  RailMenuRow,
+  useRailCollapsed,
+} from '@/components/chat/collapsed-rail.js';
 import { SessionRow } from '@/components/chat/session-row.js';
 import { RailSessionRow } from '@/components/chat/rail-session-row.js';
+import { useSessionPins } from '@/components/chat/use-session-pins.js';
+import { machinePinKey, type AgentTarget } from '@harness-nexus/sdk';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { DecisionRecordsDialog } from '@/components/decision-records-dialog';
 import { cwdBasename, cwdParent } from '@/lib/cwd.js';
 import { useChatChannels } from '@/components/chat/use-chat-channels.js';
@@ -225,6 +247,7 @@ function QueuedMessage({
 function SessionRail({
   rail,
   groups,
+  pinnedRows,
   collapsedCwds,
   nativeSessionId,
   firstPromptText,
@@ -232,14 +255,23 @@ function SessionRail({
   channelByNative,
   onToggleCwd,
   onOpenChannel,
+  onPickSession,
   onNewSession,
   onRefresh,
   onDeleteSession,
+  onTogglePin,
+  onCollapse,
   end,
   endInDrawer,
 }: {
   rail: RailState;
   groups: SessionGroup[];
+  /**
+   * #110 — this instance's pinned rows, newest-pinned first. They LEAVE their
+   * cwd group and float above every group header, so `groups` never holds
+   * them.
+   */
+  pinnedRows: NativeSessionView[];
   collapsedCwds: Set<string>;
   nativeSessionId: string | null;
   firstPromptText: string | null;
@@ -251,6 +283,12 @@ function SessionRail({
     directory?: string,
     resume?: { sessionId: string; cwd: string },
   ) => Promise<void>;
+  /**
+   * #22/#127 — one native row's OPEN semantics (rejoin a live channel, else
+   * resume): the rail rows and the collapsed rail's floating switcher share
+   * it, so a pick from either surface behaves identically.
+   */
+  onPickSession: (session: NativeSessionView) => void;
   onNewSession: () => void;
   onRefresh: () => void;
   /**
@@ -259,6 +297,14 @@ function SessionRail({
    * the affordance entirely.
    */
   onDeleteSession?: (sessionId: string, title: string) => void;
+  /** #110 — pin/unpin a row (the leading slot + the phone's right swipe). */
+  onTogglePin: (session: NativeSessionView, next: boolean) => void;
+  /**
+   * #123 — collapse the desktop rail. Undefined in the phone drawer: there is
+   * no column to collapse (the drawer closes by scrim, Esc or a pick), so the
+   * header ends at refresh.
+   */
+  onCollapse?: () => void;
   /** The 端 switcher (both the desktop rail AND the phone drawer — the drawer
    *  is the only rail on mobile, hiding the switcher there dead-ended the
    *  machine ends). */
@@ -268,13 +314,91 @@ function SessionRail({
   endInDrawer?: boolean;
 }) {
   const { t, lang } = useI18n();
+  /**
+   * One rail row — shared by the pinned block and the cwd groups. #110: a
+   * PINNED row has left its group, so its meta line names the directory
+   * (`time · <cwd basename>`, the full path in the tooltip) instead of the
+   * short id; rows inside groups keep `time · short id` — the group already
+   * carries the directory, and the short id is the only cross-reference to
+   * agent-side logs.
+   */
+  const renderRow = (s: NativeSessionView, pinnedBlock: boolean) => {
+    const active = s.sessionId === nativeSessionId;
+    const stale = s.staleReason !== undefined;
+    // Live truth ONLY (#13 fix): the listing's `openChannelId` stamp is a
+    // moment-in-time snapshot that goes stale the moment a channel closes
+    // elsewhere (the user-wide `chat:channels` push is already realtime for
+    // every window), so consulting it left a dead blue dot on the row. The
+    // channel map IS the open state.
+    const attached = channelByNative.get(s.sessionId);
+    // #12 — RUNNING is the attached channel's live busy flag, shown even on
+    // the row being viewed; #99 — `open` is a WORD now and only on
+    // non-current rows (the edge + tint already mark the current one).
+    const running = attached?.busy === true;
+    const word = running
+      ? ('running' as const)
+      : attached !== undefined && !active
+        ? ('open' as const)
+        : null;
+    const when = relativeTime(s.updatedAt, dateLocale(lang));
+    return (
+      <SessionRow
+        key={s.sessionId}
+        pinned={pinnedBlock}
+        pinLabel={pinnedBlock ? t('chat.unpinAction') : t('chat.pinAction')}
+        onTogglePin={() => onTogglePin(s, !pinnedBlock)}
+        deleteLabel={t('chat.deleteSessionAction')}
+        onDelete={
+          attached === undefined && onDeleteSession !== undefined
+            ? () => onDeleteSession(s.sessionId, s.title ?? t('chat.untitled'))
+            : undefined
+        }
+      >
+        <RailSessionRow
+          title={
+            s.title ??
+            (s.sessionId === nativeSessionId ? firstPromptText : undefined) ??
+            t('chat.untitled')
+          }
+          meta={
+            pinnedBlock ? `${when} · ${cwdBasename(s.cwd)}` : `${when} · ${s.sessionId.slice(0, 8)}`
+          }
+          active={active}
+          word={word}
+          faded={stale}
+          disabled={stale && !active}
+          titleAttr={
+            stale
+              ? t('chat.staleModel', { model: s.model ?? '?' })
+              : attached !== undefined && !active
+                ? t('chat.channelOpenHint')
+                : pinnedBlock
+                  ? s.cwd
+                  : (s.title ?? s.cwd)
+          }
+          onClick={() => {
+            if (active || stale) return;
+            // #22 — with a live channel this is a REJOIN; without one (fresh
+            // page, or after a server restart — channels are server-memory
+            // only) it is a fresh RESUME of the same native session. Both
+            // keep the row's promise: open this conversation (the no-channel
+            // case used to be a silent no-op).
+            onPickSession(s);
+          }}
+        />
+      </SessionRow>
+    );
+  };
   return (
     <>
       {/* The rail's header band pins to the stream header's h-12 so the two
       columns' bottom borders read as one line — a hugging height rides the
       skin-scaled control tokens (52px Signal / 45px BAY) and misaligns per
-      skin against the fixed 48px stream band. */}
-      <div className="flex h-12 items-center gap-1 border-b px-2">
+      skin against the fixed 48px stream band. #123 — one row, grouped by
+      meaning: the switcher carries the default-end star (it pins THAT value),
+      the right edge carries the list action (refresh) then the panel's own
+      collapse door. */}
+      <div className="flex h-12 shrink-0 items-center gap-1 border-b px-2">
         {end !== undefined && end !== null ? (
           <EndSwitcher current={end} fromDrawer={endInDrawer} />
         ) : null}
@@ -282,12 +406,25 @@ function SessionRail({
         <Button
           variant="ghost"
           size="icon"
-          className="size-(--control-h-sm)"
+          className="size-(--control-h-sm) shrink-0"
+          aria-label={t('common.refresh')}
           title={t('common.refresh')}
           onClick={() => void onRefresh()}
         >
           <RefreshCwIcon className="size-3.5" />
         </Button>
+        {onCollapse === undefined ? null : (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-(--control-h-sm) shrink-0"
+            aria-label={t('chat.railCollapse')}
+            title={t('chat.railCollapse')}
+            onClick={onCollapse}
+          >
+            <PanelLeftCloseIcon className="size-3.5" />
+          </Button>
+        )}
       </div>
       <div className="border-b p-3">
         <Button
@@ -321,7 +458,12 @@ function SessionRail({
                 {t('chat.sessionsUnsupportedPartial')}
               </p>
             ) : null}
-            {groups.length === 0 ? (
+            {/* #110 — the pinned block floats above ALL group headers
+                (newest-pinned first); its rows have left their groups. */}
+            {pinnedRows.length > 0 ? (
+              <div className="border-b">{pinnedRows.map((s) => renderRow(s, true))}</div>
+            ) : null}
+            {groups.length === 0 && pinnedRows.length === 0 ? (
               <p className="text-muted-foreground px-3 py-4 text-xs">{t('chat.noSessions')}</p>
             ) : (
               groups.map((group) => {
@@ -368,84 +510,7 @@ function SessionRail({
                         <PlusIcon className="size-3" />
                       </button>
                     </div>
-                    {!collapsed
-                      ? group.sessions.map((s) => {
-                          const active = s.sessionId === nativeSessionId;
-                          const stale = s.staleReason !== undefined;
-                          // Live truth ONLY (#13 fix): the listing's
-                          // `openChannelId` stamp is a moment-in-time
-                          // snapshot that goes stale the moment a channel
-                          // closes elsewhere (the user-wide `chat:channels`
-                          // push is already realtime for every window), so
-                          // consulting it left a dead blue dot on the row.
-                          // The channel map IS the open state.
-                          const attached = channelByNative.get(s.sessionId);
-                          // #12 — RUNNING is the attached channel's live busy
-                          // flag, shown even on the row being viewed; #99 —
-                          // `open` is a WORD now and only on non-current rows
-                          // (the edge + tint already mark the current one).
-                          const running = attached?.busy === true;
-                          const word = running
-                            ? ('running' as const)
-                            : attached !== undefined && !active
-                              ? ('open' as const)
-                              : null;
-                          return (
-                            <SessionRow
-                              key={s.sessionId}
-                              deleteLabel={t('chat.deleteSessionAction')}
-                              onDelete={
-                                attached === undefined && onDeleteSession !== undefined
-                                  ? () =>
-                                      onDeleteSession(s.sessionId, s.title ?? t('chat.untitled'))
-                                  : undefined
-                              }
-                            >
-                              <RailSessionRow
-                                title={
-                                  s.title ??
-                                  (s.sessionId === nativeSessionId ? firstPromptText : undefined) ??
-                                  t('chat.untitled')
-                                }
-                                meta={`${relativeTime(s.updatedAt, dateLocale(lang))} · ${s.sessionId.slice(0, 8)}`}
-                                active={active}
-                                word={word}
-                                faded={stale}
-                                disabled={stale && !active}
-                                titleAttr={
-                                  stale
-                                    ? t('chat.staleModel', { model: s.model ?? '?' })
-                                    : attached !== undefined && !active
-                                      ? t('chat.channelOpenHint')
-                                      : (s.title ?? s.cwd)
-                                }
-                                onClick={() => {
-                                  if (active || stale) return;
-                                  // With a live channel this is a REJOIN;
-                                  // without one (fresh page, or after a
-                                  // server restart — channels are
-                                  // server-memory only) it is a fresh RESUME
-                                  // of the same native session. Both keep the
-                                  // row's promise: open this conversation
-                                  // (#22 — the no-channel case used to be a
-                                  // silent no-op).
-                                  if (attached !== undefined) {
-                                    void onOpenChannel(attached.sessionId, undefined, {
-                                      sessionId: s.sessionId,
-                                      cwd: s.cwd,
-                                    });
-                                  } else {
-                                    void onOpenChannel(undefined, undefined, {
-                                      sessionId: s.sessionId,
-                                      cwd: s.cwd,
-                                    });
-                                  }
-                                }}
-                              />
-                            </SessionRow>
-                          );
-                        })
-                      : null}
+                    {!collapsed ? group.sessions.map((s) => renderRow(s, false)) : null}
                   </div>
                 );
               })
@@ -470,6 +535,11 @@ export function AgentSessionPage() {
   // Phone-only drawer holding the same rail (P5) — the rail is `hidden md:flex`
   // and used to have no narrow-screen alternative at all.
   const [railOpen, setRailOpen] = useState(false);
+  // #122/#126 — the DESKTOP rail collapses to a 48px icon column (endpoints at
+  // 900px: rail 288 + plate 198 left ~410px for the transcript AND the
+  // composer's toolbar). The flag is the chat surface's shared preference
+  // (both ends, one persisted key) — see collapsed-rail.tsx.
+  const [railCollapsed, toggleRailCollapsed] = useRailCollapsed();
   const [loadFailed, setLoadFailed] = useState(false);
   const [rail, setRail] = useState<RailState>({ state: 'loading' });
   const [sessionId, setSessionId] = useState('');
@@ -477,6 +547,8 @@ export function AgentSessionPage() {
   const [recordsOpen, setRecordsOpen] = useState(false);
   const [nativeSessionId, setNativeSessionId] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>('idle');
+  /** #124 — daemon session-cumulative token/cache totals for the HUD. */
+  const [sessionUsage, setSessionUsage] = useState<ChatSessionUsage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -513,6 +585,19 @@ export function AgentSessionPage() {
   const [prependKey, setPrependKey] = useState(0);
   const conversationRef = useRef(conversation);
   conversationRef.current = conversation;
+  /**
+   * #124 — edit totals for the HUD. `rows` identity changes on EVERY streamed
+   * token (the fold slices on each delta), so the memo keys on the fold's
+   * toolRevision instead; the rows come through a ref so the walk sees the
+   * current transcript. The stats helper caches each tool node's diff.
+   */
+  const hudRowsRef = useRef(conversation.rows);
+  hudRowsRef.current = conversation.rows;
+  const hudFiles = useMemo(
+    () => sessionEditStats(hudRowsRef.current),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [conversation.toolRevision],
+  );
   /** 9 W11 B — the tab strip's live-channel truth (snapshot pushes). */
   const channels = useChatChannels();
   /** #52 M3 — the user's busy assistant turns, as tabs ahead of the channels. */
@@ -688,6 +773,10 @@ export function AgentSessionPage() {
     }
     setPhase(pendingPhaseRef.current === 'ready' ? 'ready' : 'connecting');
     pendingPhaseRef.current = null;
+    // #124 — a switch starts clean; the buffered ready below (or the live
+    // ready push) restores the server's snapshot. This must run BEFORE the
+    // buffer is applied, not in the live-wiring effect, or it clobbers it.
+    setSessionUsage(null);
     // Replay the rejoin pushes that raced ahead of this switch (see
     // SwitchRaceBuffer): the buffer holds the LATEST snapshot per session,
     // consumed here so the keyed listeners own everything live afterwards.
@@ -706,6 +795,7 @@ export function AgentSessionPage() {
         setNativeSessionId(buffered.ready.nativeSessionId);
       }
       if (buffered.ready.promptCapabilities?.image === true) setImageSupported(true);
+      setSessionUsage(buffered.ready.sessionUsage ?? null);
     }
     if (buffered.failed !== undefined) {
       setPhase('closed');
@@ -722,16 +812,31 @@ export function AgentSessionPage() {
   // #66 — silent /app reconnect (weak network, lock screen): the socket is a
   // NEW connection with no chan-room membership while this pane stays
   // mounted. Re-join the open channel on reconnect; the server re-pushes
-  // ready + resync and the daemon ring replays whatever the gap missed. A
-  // channel that died anyway (grace expiry) bounces SESSION_NOT_FOUND and
-  // the error path surfaces it — honest, never a frozen pane.
+  // ready + resync and the daemon ring replays whatever the gap missed.
+  // #119 — a channel that died anyway (grace expiry, server restart) bounces
+  // SESSION_NOT_FOUND on the bare rejoin; carry the resume arm (the channel's
+  // nativeSessionId + the rail row's cwd) so the rejoin→resume fallback
+  // reopens the SAME native session transparently. Without either (a channel
+  // that never advertised its native id, no cwd in the listing) the honest
+  // error path stays. Re-registered when nativeSessionId arrives so the
+  // closure never holds a stale null.
   useEffect(() => {
     if (sessionId === '') return;
     return onAppResubscribe(() => {
-      void openChannel(sessionId);
+      const cwd =
+        nativeSessionId !== null && rail.state === 'ready'
+          ? rail.sessions.find((s) => s.sessionId === nativeSessionId)?.cwd
+          : undefined;
+      void openChannel(
+        sessionId,
+        undefined,
+        nativeSessionId !== null && cwd !== undefined
+          ? { sessionId: nativeSessionId, cwd }
+          : undefined,
+      );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [sessionId, nativeSessionId]);
 
   // Live channel wiring — the same contract as the C5 page, plus 9 W7 history.
   useEffect(() => {
@@ -756,6 +861,12 @@ export function AgentSessionPage() {
     };
     const onEvent = (envelope: ChatEventEnvelope): void => {
       if (envelope.sessionId !== sessionId) return;
+      // #124 — derived telemetry: page state, never the transcript item base
+      // (a history rebuild must not replay the totals as a fake event).
+      if (envelope.event.kind === 'session_usage') {
+        setSessionUsage(envelope.event);
+        return;
+      }
       dispatch({ type: 'event', event: envelope.event });
       // Keep the item base complete — live events join it so a later prepend
       // rebuild replays the whole transcript, not just the ring window.
@@ -792,6 +903,8 @@ export function AgentSessionPage() {
       setError(null);
       if (push.nativeSessionId !== undefined) setNativeSessionId(push.nativeSessionId);
       setImageSupported(push.promptCapabilities?.image === true);
+      // #124 — a rejoin's ready push carries the stored totals.
+      if (push.sessionUsage !== undefined) setSessionUsage(push.sessionUsage);
       // Re-list so the just-opened row flips to its 已打开 (channel attached)
       // state instead of still offering a fresh resume.
       void refreshSessions();
@@ -1051,7 +1164,11 @@ export function AgentSessionPage() {
             ? t('chat.errMachineBusy')
             : ack.error === 'MACHINE_OFFLINE'
               ? t('chat.errMachineOffline')
-              : ack.error,
+              : // #119 — the channel died and recovery could not reopen it;
+                // mapped words, never the raw code.
+                ack.error === 'SESSION_NOT_FOUND'
+                ? t('chat.errSessionGone')
+                : ack.error,
       );
     } else if (ack.queued === true) {
       toast.info(t('chat.queuedToast'));
@@ -1167,9 +1284,57 @@ export function AgentSessionPage() {
     );
   }
 
+  // #110 — this instance's pins. The key carries machine + target, so pins
+  // from a sibling agent instance on the same machine never cross.
+  const pins = useSessionPins();
+  const pinnedAt = useCallback(
+    (nativeId: string): string | undefined =>
+      agent === null
+        ? undefined
+        : pins.pins.get(machinePinKey(agent.machineId, agent.target, nativeId)),
+    [agent, pins.pins],
+  );
+  /** The pinned block: newest-pinned first, above every group header. */
+  const pinnedRows = useMemo<NativeSessionView[]>(
+    () =>
+      rail.state === 'ready'
+        ? rail.sessions
+            .filter((s) => pinnedAt(s.sessionId) !== undefined)
+            .sort((a, b) => pinnedAt(b.sessionId)!.localeCompare(pinnedAt(a.sessionId)!))
+        : [],
+    [rail, pinnedAt],
+  );
   const groups = useMemo(
-    () => (rail.state === 'ready' ? groupSessions(rail.sessions) : []),
-    [rail],
+    () =>
+      rail.state === 'ready'
+        ? groupSessions(rail.sessions.filter((s) => pinnedAt(s.sessionId) === undefined))
+        : [],
+    [rail, pinnedAt],
+  );
+  const toggleNativePin = useCallback(
+    (nativeId: string, next: boolean) => {
+      if (agent === null) return;
+      void pins
+        .toggle(
+          {
+            axis: 'machine',
+            machineId: agent.machineId,
+            // AgentInstanceView widens target to string; the pin input wants
+            // the AgentTarget union the view's values always are.
+            target: agent.target as AgentTarget,
+            nativeSessionId: nativeId,
+          },
+          next,
+        )
+        .catch((e: unknown) =>
+          toast.error(
+            t('chat.pinToggleFailed', {
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          ),
+        );
+    },
+    [agent, pins, t],
   );
   /**
    * 9 W11 B — live-channel truth OVERLAID onto rail rows by native id: the
@@ -1183,6 +1348,23 @@ export function AgentSessionPage() {
     }
     return m;
   }, [channels]);
+  /**
+   * #22/#127 — one native row's OPEN semantics: with a live channel it is a
+   * REJOIN; without one (fresh page, or after a server restart — channels are
+   * server-memory only) a fresh RESUME of the same native session. The rail
+   * rows, the collapsed rail's tiles and its floating switcher all pick
+   * through here, so every surface keeps the row's promise.
+   */
+  // Plain function, like openChannel itself (recreated per render — no stale
+  // closures over page state).
+  const pickNative = (s: NativeSessionView) => {
+    const attached = channelByNative.get(s.sessionId);
+    if (attached !== undefined) {
+      void openChannel(attached.sessionId, undefined, { sessionId: s.sessionId, cwd: s.cwd });
+    } else {
+      void openChannel(undefined, undefined, { sessionId: s.sessionId, cwd: s.cwd });
+    }
+  };
   const currentCwd =
     rail.state === 'ready'
       ? (rail.sessions.find((s) => s.sessionId === nativeSessionId)?.cwd ?? undefined)
@@ -1255,6 +1437,70 @@ export function AgentSessionPage() {
     );
   }
 
+  /**
+   * #127 — the collapsed rail's floating switcher: the same list the expanded
+   * rail shows (pinned block above cwd groups), compacted to menu rows. The
+   * rail's honest empty/offline states print inside the menu.
+   */
+  const railMenuRow = (s: NativeSessionView, pinnedBlock: boolean) => {
+    const attached = channelByNative.get(s.sessionId);
+    const active = s.sessionId === nativeSessionId;
+    const stale = s.staleReason !== undefined;
+    const when = relativeTime(s.updatedAt, dateLocale(lang));
+    return (
+      <RailMenuRow
+        key={s.sessionId}
+        title={
+          s.title ??
+          (s.sessionId === nativeSessionId ? firstPromptText : undefined) ??
+          t('chat.untitled')
+        }
+        meta={pinnedBlock ? `${when} · ${cwdBasename(s.cwd)}` : when}
+        active={active}
+        disabled={stale && !active}
+        // every row sits under the folder rhythm — the pinned block has no
+        // header of its own, and one indent keeps the whole sheet on one grid.
+        indented
+        titleAttr={
+          stale
+            ? t('chat.staleModel', { model: s.model ?? '?' })
+            : attached !== undefined && !active
+              ? t('chat.channelOpenHint')
+              : pinnedBlock
+                ? s.cwd
+                : (s.title ?? s.cwd)
+        }
+        onPick={() => pickNative(s)}
+      />
+    );
+  };
+  const railMenu = (() => {
+    if (rail.state === 'loading') return <RailMenuHint>{t('common.loading')}</RailMenuHint>;
+    if (rail.state === 'offline') return <RailMenuHint>{t('chat.sessionsOffline')}</RailMenuHint>;
+    if (rail.state === 'daemon-old')
+      return <RailMenuHint>{t('chat.sessionsDaemonOld')}</RailMenuHint>;
+    if (rail.state === 'error') return <RailMenuHint>{rail.message}</RailMenuHint>;
+    if (groups.length === 0 && pinnedRows.length === 0)
+      return <RailMenuHint>{t('chat.noSessions')}</RailMenuHint>;
+    return (
+      <>
+        {pinnedRows.map((s) => railMenuRow(s, true))}
+        {groups.map((g) => (
+          <Fragment key={g.cwd}>
+            <DropdownMenuLabel
+              title={g.cwd}
+              className="text-muted-foreground flex items-center gap-1.5 px-2 py-1.5 text-[11px] font-semibold"
+            >
+              <FolderIcon className="size-3 shrink-0" aria-hidden="true" />
+              <span className="truncate">{cwdBasename(g.cwd)}</span>
+            </DropdownMenuLabel>
+            {g.sessions.map((s) => railMenuRow(s, false))}
+          </Fragment>
+        ))}
+      </>
+    );
+  })();
+
   return (
     <>
       <div className="flex h-full min-h-0 flex-col">
@@ -1275,22 +1521,58 @@ export function AgentSessionPage() {
               cwd. Below md it would leave the phone with NO way to reach a
               session, so the same content ships as a drawer opened from the
               session bar (P5). */}
-          <aside className="bg-sidebar/40 hidden w-72 shrink-0 flex-col border-r md:flex">
-            <SessionRail
-              rail={rail}
-              groups={groups}
-              collapsedCwds={collapsedCwds}
-              nativeSessionId={nativeSessionId}
-              firstPromptText={firstPromptText ?? null}
-              machine={machine}
-              channelByNative={channelByNative}
-              onToggleCwd={toggleCwd}
-              onOpenChannel={openChannel}
-              onNewSession={() => setPickerOpen(true)}
-              onRefresh={() => void refreshSessions(true)}
-              onDeleteSession={(sessionId, title) => setPendingDelete({ sessionId, title })}
-              end={{ agentInstanceId: agentId, agentName: agent?.name }}
-            />
+          <aside
+            className={cn(
+              'bg-sidebar/40 hidden shrink-0 flex-col border-r md:flex',
+              railCollapsed ? 'w-12' : 'w-72',
+            )}
+          >
+            {railCollapsed ? (
+              <CollapsedRail
+                tiles={pinnedRows.map((s) => {
+                  const name =
+                    s.title != null && s.title !== ''
+                      ? s.title
+                      : (s.cwd.replace(/\/+$/, '').split('/').pop() ?? s.cwd);
+                  return {
+                    id: s.sessionId,
+                    label: name,
+                    detail: s.cwd,
+                    active: s.sessionId === nativeSessionId,
+                    onClick: () => pickNative(s),
+                  };
+                })}
+                sessionMenu={railMenu}
+                newSessionLabel={t('chat.newSession')}
+                // #126 — the collapsed door follows the expanded rail's gate
+                // (machine offline / chat disabled), which it used to ignore.
+                newSessionDisabled={
+                  machine === null || !machine.online || !machine.remoteChatEnabled
+                }
+                onNewSession={() => setPickerOpen(true)}
+                onExpand={toggleRailCollapsed}
+              />
+            ) : (
+              <SessionRail
+                rail={rail}
+                groups={groups}
+                pinnedRows={pinnedRows}
+                onTogglePin={(s2, next) => toggleNativePin(s2.sessionId, next)}
+                collapsedCwds={collapsedCwds}
+                nativeSessionId={nativeSessionId}
+                firstPromptText={firstPromptText ?? null}
+                machine={machine}
+                channelByNative={channelByNative}
+                onToggleCwd={toggleCwd}
+                onOpenChannel={openChannel}
+                onPickSession={pickNative}
+                onNewSession={() => setPickerOpen(true)}
+                onRefresh={() => void refreshSessions(true)}
+                onDeleteSession={(sessionId, title) => setPendingDelete({ sessionId, title })}
+                onCollapse={toggleRailCollapsed}
+                end={{ agentInstanceId: agentId, agentName: agent?.name }}
+              />
+            )}
           </aside>
 
           {/* The phone's rail: the same component, in a drawer. Radix traps
@@ -1306,6 +1588,8 @@ export function AgentSessionPage() {
                 <SessionRail
                   rail={rail}
                   groups={groups}
+                  pinnedRows={pinnedRows}
+                  onTogglePin={(s2, next) => toggleNativePin(s2.sessionId, next)}
                   collapsedCwds={collapsedCwds}
                   nativeSessionId={nativeSessionId}
                   firstPromptText={firstPromptText ?? null}
@@ -1313,6 +1597,7 @@ export function AgentSessionPage() {
                   channelByNative={channelByNative}
                   onToggleCwd={toggleCwd}
                   onOpenChannel={openChannel}
+                  onPickSession={pickNative}
                   onNewSession={() => {
                     setRailOpen(false);
                     setPickerOpen(true);
@@ -1402,6 +1687,36 @@ export function AgentSessionPage() {
                   </Button>
                 </>
               ) : null}
+              {/* #110 — the phone's row-action stand-in: the drawer rail has
+                  no hover, so the CURRENT session's pin lives here (delete
+                  stays a swipe on non-current rows — the viewed session holds
+                  a live channel and the daemon would refuse it). */}
+              {nativeSessionId !== null && agent !== null ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-8 shrink-0 md:hidden"
+                      aria-label={t('common.openMenu')}
+                    >
+                      <MoreHorizontalIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      onClick={() =>
+                        toggleNativePin(nativeSessionId, pinnedAt(nativeSessionId) === undefined)
+                      }
+                    >
+                      {pinnedAt(nativeSessionId) === undefined ? <PinIcon /> : <PinOffIcon />}
+                      {pinnedAt(nativeSessionId) === undefined
+                        ? t('chat.pinAction')
+                        : t('chat.unpinAction')}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              ) : null}
             </div>
             {sessionId !== '' ? (
               <DecisionRecordsDialog
@@ -1465,11 +1780,24 @@ export function AgentSessionPage() {
                       />
                     ) : null}
                     <Composer
+                      // #124 — the session telemetry is the card's fused top
+                      // cap, not a widget above it: same surface, same corners,
+                      // same focus-within state. The HUD owns the context
+                      // reading on this page, so the toolbar meter is off.
+                      header={
+                        <SessionHud
+                          usage={conversation.usage}
+                          sessionUsage={sessionUsage}
+                          files={hudFiles}
+                          historyPartial={historyHasMore}
+                        />
+                      }
                       value={draft}
                       onChange={changeDraft}
                       phase={phase}
                       turnActive={conversation.turnActive}
                       usage={conversation.usage}
+                      showContextMeter={false}
                       onSend={() => void send()}
                       onCancel={() => void cancelTurn()}
                       attachments={attachments}

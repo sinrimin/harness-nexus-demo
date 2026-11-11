@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Profile } from '@harness-nexus/core';
+import { BUILTIN_MCP_SERVICE_ID } from '@harness-nexus/shared';
 import { createMemoryUnitOfWork } from '../src/infra/storage/memory/index.js';
 import { createCredential, updateCredential } from '../src/services/credentials.js';
 import { createMcpServer, deleteMcpServer } from '../src/services/mcp-servers.js';
@@ -97,7 +98,7 @@ describe('svc client-config — mcp-config shape + dial-site filtering', () => {
     expect(JSON.stringify(config)).not.toContain('CORP-LOCKED-SECRET');
   });
 
-  it('no outlet arm when every entry is client-dialed', async () => {
+  it('no outlet arm when every entry is client-dialed and the built-in service is unreferenced', async () => {
     const d = deps();
     const { stdio } = await seedWorld(d);
     const profile = await createProfile(d, alice, {
@@ -108,6 +109,42 @@ describe('svc client-config — mcp-config shape + dial-site filtering', () => {
     });
     const config = await buildClientMcpConfig(d, asCaller(alice), profile.id);
     expect(config.platform).toBeNull();
+  });
+
+  it('#107 a built-in entry arms the outlet and rides as a name-only row', async () => {
+    const d = deps();
+    const { stdio } = await seedWorld(d);
+    const profile = await createProfile(d, alice, {
+      name: 'builtin-kit',
+      target: 'claude-code',
+      scope: 'personal',
+      entries: [{ mcpServerId: stdio.id }, { mcpServerId: BUILTIN_MCP_SERVICE_ID }],
+    });
+    const config = await buildClientMcpConfig(d, asCaller(alice), profile.id);
+    expect(config.platform).toEqual({ baseUrl: BASE });
+    const builtin = config.servers.find((s) => s.id === BUILTIN_MCP_SERVICE_ID)!;
+    expect(builtin.dialSite).toBe('server');
+    expect('transport' in builtin).toBe(false);
+  });
+
+  it('#113 a pinned entry carries its tool subset; a whole-server entry omits the field', async () => {
+    const d = deps();
+    const { stdio, profile: whole } = await seedWorld(d);
+    const pinned = await createProfile(d, alice, {
+      name: 'pinned-echo',
+      target: 'claude-code',
+      scope: 'personal',
+      entries: [{ mcpServerId: stdio.id, tools: ['echo'] }],
+    });
+    const config = await buildClientMcpConfig(d, asCaller(alice), pinned.id);
+    const local = config.servers.find((s) => s.id === stdio.id)!;
+    expect(local.dialSite).toBe('client');
+    expect(local).toMatchObject({ tools: ['echo'] });
+
+    // seedWorld's own profile takes the whole server — no tools key at all.
+    const wholeConfig = await buildClientMcpConfig(d, asCaller(alice), whole.id);
+    const wholeRow = wholeConfig.servers.find((s) => s.id === stdio.id)!;
+    expect('tools' in wholeRow).toBe(false);
   });
 
   it('400s a missing profile param; hides foreign personal profiles as 404', async () => {
@@ -168,6 +205,24 @@ describe('svc client-config — mcp-config shape + dial-site filtering', () => {
 });
 
 describe('svc client-config — deploy bundle', () => {
+  it('#107 carries a built-in entry as a synthetic server-dialed mcp artifact', async () => {
+    const d = deps();
+    const profile = await createProfile(d, alice, {
+      name: 'builtin-only',
+      target: 'claude-code',
+      scope: 'personal',
+      entries: [{ mcpServerId: BUILTIN_MCP_SERVICE_ID }],
+    });
+    const bundle = await buildDeployBundle(d, asCaller(alice), profile.id);
+    expect(bundle.artifacts).toHaveLength(1);
+    const artifact = bundle.artifacts[0]!;
+    expect(artifact.kind).toBe('mcp');
+    if (artifact.kind === 'mcp') {
+      expect(artifact.mcpServer.id).toBe(BUILTIN_MCP_SERVICE_ID);
+      expect(artifact.mcpServer.dialSite).toBe('server');
+    }
+  });
+
   it('assembles mcp + resource artifacts for the visible caller', async () => {
     const d = deps();
     const { stdio } = await seedWorld(d);

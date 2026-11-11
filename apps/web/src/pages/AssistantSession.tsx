@@ -8,17 +8,30 @@ import { toast } from 'sonner';
 import {
   BotIcon,
   ListIcon,
+  MoreHorizontalIcon,
+  PanelLeftCloseIcon,
   PencilIcon,
+  PinIcon,
+  PinOffIcon,
   PlusIcon,
   RefreshCwIcon,
   ScrollTextIcon,
+  TrashIcon,
   XIcon,
 } from 'lucide-react';
 import { api } from '@/api';
 import { useAuth, withAuthGuard } from '@/auth';
 import { useI18n, dateLocale } from '@/i18n';
+import { assistantPinKey } from '@harness-nexus/sdk';
 import { StateSignal } from '@/components/state-signal';
 import { ConfirmDialog, EmptyState } from '@/components/kit';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import {
   appSocket,
   emitWithAck,
@@ -29,6 +42,7 @@ import {
   type AssistantEventEnvelope,
   type AssistantHistoryEvent,
   type AssistantReadyPush,
+  type ChatSessionUsage,
 } from '@/realtime';
 import {
   HarnessNexusError,
@@ -36,13 +50,18 @@ import {
   type LlmProviderView,
 } from '@harness-nexus/sdk';
 import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
 import { Dialog as DialogPrimitive } from 'radix-ui';
 import { ChatStream } from '@/components/chat/chat-stream.js';
+import { SessionHud } from '@/components/chat/session-hud.js';
+import type { ComposerUsage } from '@/components/chat/context-meter.js';
+import { sessionEditStats } from '@/components/chat/hud-stats.js';
 import { CaptureNoteDialog } from '@/pages/notes/CaptureNoteDialog';
 import { WelcomePane, type WelcomeCard } from '@/components/chat/welcome-pane.js';
 import { ChannelTabs } from '@/components/chat/channel-tabs.js';
 import { SessionRow } from '@/components/chat/session-row.js';
 import { RailSessionRow } from '@/components/chat/rail-session-row.js';
+import { useSessionPins } from '@/components/chat/use-session-pins.js';
 import { DecisionRecordsDialog } from '@/components/decision-records-dialog';
 import { useChatChannels } from '@/components/chat/use-chat-channels.js';
 import { useAssistantSessions } from '@/components/chat/use-assistant-sessions.js';
@@ -50,6 +69,12 @@ import { Composer, type ComposerConfig } from '@/components/chat/composer.js';
 import { usePageTitle } from '@/components/shell/page-slots';
 import { TodoPanel } from '@/components/chat/todo-panel.js';
 import { EndSwitcher } from '@/components/chat/end-switcher.js';
+import {
+  CollapsedRail,
+  RailMenuHint,
+  RailMenuRow,
+  useRailCollapsed,
+} from '@/components/chat/collapsed-rail.js';
 import { createFoldState, fold, type UserBlock } from '@/components/chat/fold.js';
 import type { ChatConfigSetPayload, PromptBlock } from '@/realtime';
 import {
@@ -83,10 +108,113 @@ type Phase = 'idle' | 'ready' | 'closed';
 interface OpenRaceBuffer {
   history?: AssistantHistoryEvent['items'];
   configDone?: boolean;
+  /** #128 — the latest ready push (its sessionUsage snapshot restores the HUD). */
+  ready?: AssistantReadyPush;
 }
 
 /** The last-used assistant config (localStorage — same stance as the 端 pin). */
 const AGENT_KEY = 'hnx.chat.agent';
+
+/**
+ * #110 — the assistant row's ⋮ menu: pin/unpin → rename → separator → delete
+ * (destructive, last) — the list pages' row-menu language. Machine rows get
+ * NO menu (their titles are agent-owned); the rail keeps their trash.
+ */
+function SessionRowMenu({
+  pinned,
+  deleteDisabled,
+  onPin,
+  onRename,
+  onDelete,
+}: {
+  pinned: boolean;
+  deleteDisabled: boolean;
+  onPin: () => void;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground flex p-0.5"
+          aria-label={t('common.openMenu')}
+          title={t('common.openMenu')}
+        >
+          <MoreHorizontalIcon className="size-3.5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onClick={onPin}>
+          {pinned ? <PinOffIcon /> : <PinIcon />}
+          {pinned ? t('chat.unpinAction') : t('chat.pinAction')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onRename}>
+          <PencilIcon />
+          {t('chat.renameAction')}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem variant="destructive" disabled={deleteDisabled} onClick={onDelete}>
+          <TrashIcon />
+          {t('chat.deleteSessionAction')}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
+ * #110 — the inline rename: the row's title swaps to an input in place (no
+ * modal — the rail is 288px). Enter/blur saves, Esc cancels; empty = restore
+ * the automatic title (the placeholder says so). The geometry mirrors
+ * RailSessionRow so the row does not jump.
+ */
+function RenameSessionRow({
+  initial,
+  placeholder,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  placeholder: string;
+  onCommit: (title: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const settled = useRef(false);
+  const commit = (): void => {
+    if (settled.current) return;
+    settled.current = true;
+    onCommit(value.trim());
+  };
+  return (
+    <div className="flex w-full items-center border-l-2 border-l-transparent py-2 pr-3 pl-[30px] md:pr-8">
+      <input
+        autoFocus
+        className="placeholder:text-muted-foreground w-full bg-transparent text-xs outline-none"
+        maxLength={256}
+        value={value}
+        placeholder={placeholder}
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commit();
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            settled.current = true;
+            onCancel();
+          }
+        }}
+        onBlur={commit}
+      />
+    </div>
+  );
+}
 
 function relativeTime(iso: string | null, locale: string): string {
   if (iso === null || iso === '') return '';
@@ -121,10 +249,37 @@ export function AssistantSessionPage() {
   /** #58-3 — the model registry (vision flags gate the composer's images). */
   const [providers, setProviders] = useState<LlmProviderView[] | null>(null);
   const [conversation, dispatch] = useReducer(fold, undefined, createFoldState);
+  /** #128 — server-side session token/cache totals (the HUD's TOK/CACHE). */
+  const [sessionUsage, setSessionUsage] = useState<ChatSessionUsage | null>(null);
+  /**
+   * #128 — the recovery copy of the CTX reading. The live usage events carry
+   * the derived occupancy, but a reopen replays history (counts only) — the
+   * ready push's contextUsage restores the last reading instead of blanking
+   * CTX until the next turn.
+   */
+  const [readyUsage, setReadyUsage] = useState<ComposerUsage | null>(null);
+  /**
+   * #128 — edit totals for the HUD's FILES cell. `rows` identity changes on
+   * every streamed token, so the memo keys on the fold's toolRevision; the
+   * rows ride a ref so the walk sees the current transcript (the
+   * AgentSession hudFiles pattern). Assistant tools are not edit-class, so
+   * this reads its zero state — honest, not absent.
+   */
+  const hudRowsRef = useRef(conversation.rows);
+  hudRowsRef.current = conversation.rows;
+  const hudFiles = useMemo(
+    () => sessionEditStats(hudRowsRef.current),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [conversation.toolRevision],
+  );
   /** 9 W11 B — the tab strip (machine channels only in M1). */
   const channels = useChatChannels();
   const sessions = useAssistantSessions();
   const [railOpen, setRailOpen] = useState(false);
+  // #126 — the DESKTOP rail collapses to the same 48px icon column as the
+  // agent end's; the flag is the chat surface's shared preference (one key),
+  // so switching ends never changes the rail's width.
+  const [railCollapsed, toggleRailCollapsed] = useRailCollapsed();
 
   const refreshAssistants = useCallback(async () => {
     try {
@@ -151,6 +306,26 @@ export function AssistantSessionPage() {
         if (!cancelled) setProviders(rows);
       } catch {
         /* keep null — image attach stays gated off */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [logout]);
+
+  // #108 — decision-model availability for the 写操作策略 模型代审 choice
+  // (#100 capabilities, registry-revalidated). null = not loaded yet (the
+  // choice renders enabled — the server refusal is the backstop); a failed
+  // load stays null for the same reason.
+  const [decisionReady, setDecisionReady] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const caps = await withAuthGuard(() => api.getModelCapabilities(), logout);
+        if (!cancelled) setDecisionReady(caps.decision.configured);
+      } catch {
+        /* unknown — leave ungated */
       }
     })();
     return () => {
@@ -240,17 +415,28 @@ export function AssistantSessionPage() {
     const onEvent = (envelope: AssistantEventEnvelope): void => {
       if (envelope.event.kind === 'session_config') entry(envelope.sessionId).configDone = true;
     };
+    // #128 — a ready push inside the open ack carries the sessionUsage
+    // snapshot; buffer the LATEST (the sessionId effect applies it).
+    const onReady = (push: AssistantReadyPush): void => {
+      entry(push.sessionId).ready = push;
+    };
     socket.on('assistant:history', onHistory);
     socket.on('assistant:event', onEvent);
+    socket.on('assistant:session.ready', onReady);
     return () => {
       socket.off('assistant:history', onHistory);
       socket.off('assistant:event', onEvent);
+      socket.off('assistant:session.ready', onReady);
     };
   }, []);
 
   // Reset the pane whenever the channel changes; replay the buffered pushes.
   useEffect(() => {
     dispatch({ type: 'reset' });
+    // #128 — a switch starts clean; the buffered ready (or the live ready
+    // push) restores the server's snapshot.
+    setSessionUsage(null);
+    setReadyUsage(null);
     if (sessionId === '') {
       setPhase('idle');
       return;
@@ -260,6 +446,10 @@ export function AssistantSessionPage() {
     if (buffered === undefined) return;
     raceBufferRef.current.delete(sessionId);
     if (buffered.history !== undefined) dispatch({ type: 'history', items: buffered.history });
+    if (buffered.ready !== undefined) {
+      setSessionUsage(buffered.ready.sessionUsage ?? null);
+      setReadyUsage(buffered.ready.contextUsage ?? null);
+    }
     // configDone: the session_config push raced ahead; ask the server to
     // re-emit it (idempotent, room-scoped).
     if (buffered.configDone === true) {
@@ -272,10 +462,18 @@ export function AssistantSessionPage() {
   // every chan-room membership while this pane stayed mounted. Re-sync the
   // open session; the server re-joins the socket, re-pushes ready + history
   // (+ the in-flight turn's ring), so the timeline continues seamlessly.
+  // #119 — a sync that answers SESSION_NOT_FOUND means the channel was
+  // reaped while the tab was away (viewer-grace expiry, server restart)
+  // while the ROW persists: transparently re-open the session instead of
+  // leaving a live-looking pane whose next send bounces with the raw code.
   useEffect(() => {
     if (sessionId === '') return;
     return onAppResubscribe(() => {
-      appSocket().emit('assistant:session.sync', { sessionId }, () => undefined);
+      appSocket().emit('assistant:session.sync', { sessionId }, (res: unknown) => {
+        if ((res as { error?: string } | null)?.error === 'SESSION_NOT_FOUND') {
+          void openSession(sessionId);
+        }
+      });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -286,6 +484,17 @@ export function AssistantSessionPage() {
     const socket = appSocket();
     const onEvent = (envelope: AssistantEventEnvelope): void => {
       if (envelope.sessionId !== sessionId) return;
+      // #128 — derived telemetry: page state, never a transcript item (the
+      // fold ignores it too, so a history rebuild never owns the totals).
+      if (envelope.event.kind === 'session_usage') {
+        setSessionUsage(envelope.event);
+        return;
+      }
+      if (envelope.event.kind === 'usage' && envelope.event.contextUsed === undefined) {
+        // The live turn reported no occupancy (the binding has no registry
+        // window) — the restored reading no longer describes this session.
+        setReadyUsage(null);
+      }
       dispatch({ type: 'event', event: envelope.event });
     };
     const onHistory = (push: AssistantHistoryEvent): void => {
@@ -296,6 +505,9 @@ export function AssistantSessionPage() {
       if (push.sessionId !== sessionId) return;
       setPhase('ready');
       setError(null);
+      // #128 — a rejoin's ready push carries the stored totals + occupancy.
+      setSessionUsage(push.sessionUsage ?? null);
+      setReadyUsage(push.contextUsage ?? null);
     };
     const onClosed = (push: AssistantClosedPush): void => {
       if (push.sessionId !== sessionId) return;
@@ -348,7 +560,11 @@ export function AssistantSessionPage() {
       setError(
         ack.error === 'ASSISTANT_NOT_FOUND' || ack.error === 'ASSISTANTS_DELETED'
           ? t('assistants.errNoAssistant')
-          : (ack.error ?? t('assistants.errUnknown')),
+          : // #119 — the row was deleted while away (another tab); the raw
+            // code is for nobody.
+            ack.error === 'SESSION_NOT_FOUND'
+            ? t('chat.errAssistantSessionGone')
+            : (ack.error ?? t('assistants.errUnknown')),
       );
       return;
     }
@@ -432,7 +648,15 @@ export function AssistantSessionPage() {
       // The turn never started — put everything back so nothing is lost.
       setDraft(text);
       setAttachments(attachments);
-      toast.error(ack.error === 'QUEUE_FULL' ? t('chat.queueFull') : ack.error);
+      // #119 — a dead channel at send time (recovery could not re-open it):
+      // mapped words, never the raw code.
+      toast.error(
+        ack.error === 'QUEUE_FULL'
+          ? t('chat.queueFull')
+          : ack.error === 'SESSION_NOT_FOUND'
+            ? t('chat.errAssistantSessionGone')
+            : ack.error,
+      );
     } else if (ack.queued === true) {
       toast.info(t('chat.queuedToast'));
     }
@@ -527,12 +751,50 @@ export function AssistantSessionPage() {
     refreshSessions();
   };
 
+  // #110 — session pins + inline rename (assistant rows are ours to name).
+  const pins = useSessionPins();
+  /** The row being renamed (its input replaces the row); null = none. */
+  const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(null);
+  const toggleAssistantPin = (sessionId: string, next: boolean): void => {
+    void pins.toggle({ axis: 'assistant', sessionId }, next).catch((e: unknown) =>
+      toast.error(
+        t('chat.pinToggleFailed', {
+          error: e instanceof HarnessNexusError ? e.message : String(e),
+        }),
+      ),
+    );
+  };
+  /** Enter/blur saves, Esc cancels; empty restores the automatic title. */
+  const commitRename = async (sessionId: string, title: string): Promise<void> => {
+    setRenaming(null);
+    try {
+      await withAuthGuard(() => api.renameAssistantSession(sessionId, title), logout);
+    } catch (e) {
+      toast.error(
+        t('chat.renameFailed', {
+          error: e instanceof HarnessNexusError ? e.message : String(e),
+        }),
+      );
+    }
+    // The rail follows the next sessions push; ask for it now.
+    refreshSessions();
+  };
+
   usePageTitle(assistant !== null ? assistant.name : t('assistants.endAssistant'));
 
   // Server order IS the display order — newest activity first (the storage
   // contract; the welcome cards below rely on the same array). #94: this rail
-  // used to .reverse() it into oldest-first.
-  const sortedSessions = sessions;
+  // used to .reverse() it into oldest-first. #110: the pinned block rides
+  // FIRST, newest-pinned at its top; the rest keeps the server order.
+  const sortedSessions = useMemo(() => {
+    const pinnedAt = (id: string): string | undefined => pins.pins.get(assistantPinKey(id));
+    return [
+      ...sessions
+        .filter((s) => pinnedAt(s.id) !== undefined)
+        .sort((a, b) => pinnedAt(b.id)!.localeCompare(pinnedAt(a.id)!)),
+      ...sessions.filter((s) => pinnedAt(s.id) === undefined),
+    ];
+  }, [sessions, pins.pins]);
 
   /** #54 — the welcome's recent cards: this config's conversations, newest
    *  first (the sessions push arrives newest-first from the server). */
@@ -558,18 +820,34 @@ export function AssistantSessionPage() {
       {/* Same contract as the machine rail's band: h-12 pinned to the stream
       header so both columns' borders align in every skin (a hugging height
       rides --control-h-sm: 52px Signal / 45px BAY vs the fixed 48px band). */}
-      <div className="flex h-12 items-center gap-1 border-b px-2">
+      <div className="flex h-12 shrink-0 items-center gap-1 border-b px-2">
         <EndSwitcher current="assistant" fromDrawer={inDrawer} />
         <span className="min-w-0 flex-1" />
         <Button
           variant="ghost"
           size="icon"
           className="size-(--control-h-sm) shrink-0"
+          aria-label={t('common.refresh')}
           title={t('common.refresh')}
           onClick={refreshSessions}
         >
           <RefreshCwIcon className="size-3.5" />
         </Button>
+        {/* #126 — the same collapse door as the agent rail's header; the
+            phone drawer keeps the full rail (no door in a sheet that opens
+            over the page). */}
+        {inDrawer ? null : (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-(--control-h-sm) shrink-0"
+            aria-label={t('chat.railCollapse')}
+            title={t('chat.railCollapse')}
+            onClick={toggleRailCollapsed}
+          >
+            <PanelLeftCloseIcon className="size-3.5" />
+          </Button>
+        )}
       </div>
       <div className="border-b p-3">
         <Button
@@ -591,14 +869,41 @@ export function AssistantSessionPage() {
             // #55 — the delete affordance skips rows the server would refuse:
             // the viewed one holds a live channel, a busy one is mid-turn.
             const deletable = !active && !s.busy;
+            const pinned = pins.pins.has(assistantPinKey(s.id));
+            // #110 — the rename input replaces the row in place.
+            if (renaming?.id === s.id) {
+              return (
+                <RenameSessionRow
+                  key={s.id}
+                  initial={s.title}
+                  placeholder={t('chat.renamePlaceholder')}
+                  onCommit={(title) => void commitRename(s.id, title)}
+                  onCancel={() => setRenaming(null)}
+                />
+              );
+            }
             return (
               <SessionRow
                 key={s.id}
+                pinned={pinned}
+                pinLabel={pinned ? t('chat.unpinAction') : t('chat.pinAction')}
+                onTogglePin={() => toggleAssistantPin(s.id, !pinned)}
                 deleteLabel={t('chat.deleteSessionAction')}
                 onDelete={
                   deletable
                     ? () => setPendingDelete({ id: s.id, title: s.title || t('chat.untitled') })
                     : undefined
+                }
+                trailing={
+                  <SessionRowMenu
+                    pinned={pinned}
+                    deleteDisabled={!deletable}
+                    onPin={() => toggleAssistantPin(s.id, !pinned)}
+                    onRename={() => setRenaming({ id: s.id, title: s.title })}
+                    onDelete={() =>
+                      setPendingDelete({ id: s.id, title: s.title || t('chat.untitled') })
+                    }
+                  />
                 }
               >
                 {/* #99 — the flat assistant rail: the SAME row device as the
@@ -653,8 +958,54 @@ export function AssistantSessionPage() {
           }}
         />
         <div className="flex h-full min-h-0">
-          <aside className="bg-sidebar/40 hidden w-72 shrink-0 flex-col border-r md:flex">
-            {rail(false)}
+          {/* #126 — the desktop rail collapses to the shared 48px column; its
+              pinned sessions are the tiles (the same shortcuts the agent end
+              keeps when collapsed). */}
+          <aside
+            className={cn(
+              'bg-sidebar/40 hidden shrink-0 flex-col border-r md:flex',
+              railCollapsed ? 'w-12' : 'w-72',
+            )}
+          >
+            {railCollapsed ? (
+              <CollapsedRail
+                tiles={sortedSessions
+                  .filter((s) => pins.pins.has(assistantPinKey(s.id)))
+                  .map((s) => ({
+                    id: s.id,
+                    label: s.title || t('chat.untitled'),
+                    active: s.id === sessionId,
+                    onClick: () => {
+                      if (s.id !== sessionId) void openSession(s.id);
+                    },
+                  }))}
+                // #127 — the flat assistant list (pinned first, same order
+                // as the rail) in the floating switcher.
+                sessionMenu={
+                  sortedSessions.length === 0 ? (
+                    <RailMenuHint>{t('assistants.noSessions')}</RailMenuHint>
+                  ) : (
+                    sortedSessions.map((s) => (
+                      <RailMenuRow
+                        key={s.id}
+                        title={s.title || t('chat.untitled')}
+                        meta={relativeTime(s.lastMessageAt ?? s.updatedAt, dateLocale(lang))}
+                        active={s.id === sessionId}
+                        onPick={() => {
+                          if (s.id !== sessionId) void openSession(s.id);
+                        }}
+                      />
+                    ))
+                  )
+                }
+                newSessionLabel={t('assistants.newAssistantSession')}
+                newSessionDisabled={assistantId === ''}
+                onNewSession={() => void openSession()}
+                onExpand={toggleRailCollapsed}
+              />
+            ) : (
+              rail(false)
+            )}
           </aside>
           <DialogPrimitive.Root open={railOpen} onOpenChange={setRailOpen}>
             <DialogPrimitive.Portal>
@@ -718,6 +1069,65 @@ export function AssistantSessionPage() {
                   <XIcon className="size-3.5" />
                   <span className="hidden sm:inline">{t('chat.disconnect')}</span>
                 </Button>
+              ) : null}
+              {/* #110 — the phone's row-action stand-in (the drawer rail has
+                  no hover): the CURRENT session's pin / rename / delete.
+                  Delete rides #75's close-then-delete; a busy turn is
+                  refused server-side and the item disables meanwhile. */}
+              {sessionId !== '' ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-8 shrink-0 md:hidden"
+                      aria-label={t('common.openMenu')}
+                    >
+                      <MoreHorizontalIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      onClick={() =>
+                        toggleAssistantPin(sessionId, !pins.pins.has(assistantPinKey(sessionId)))
+                      }
+                    >
+                      {pins.pins.has(assistantPinKey(sessionId)) ? <PinOffIcon /> : <PinIcon />}
+                      {pins.pins.has(assistantPinKey(sessionId))
+                        ? t('chat.unpinAction')
+                        : t('chat.pinAction')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => {
+                        setRenaming({
+                          id: sessionId,
+                          title: sessions.find((s) => s.id === sessionId)?.title ?? '',
+                        });
+                        // The rename input lives on the rail row — on the
+                        // phone that means the drawer.
+                        setRailOpen(true);
+                      }}
+                    >
+                      <PencilIcon />
+                      {t('chat.renameAction')}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      variant="destructive"
+                      disabled={conversation.turnActive}
+                      onClick={() =>
+                        setPendingDelete({
+                          id: sessionId,
+                          title:
+                            sessions.find((s) => s.id === sessionId)?.title || t('chat.untitled'),
+                        })
+                      }
+                    >
+                      <TrashIcon />
+                      {t('chat.deleteSessionAction')}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               ) : null}
             </div>
             {sessionId !== '' ? (
@@ -811,11 +1221,26 @@ export function AssistantSessionPage() {
                       </div>
                     ) : null}
                     <Composer
+                      // #128 — the session telemetry is the card's fused top
+                      // cap (the AgentSession form): the HUD owns the context
+                      // reading on this page now, so the toolbar meter is off.
+                      header={
+                        <SessionHud
+                          usage={
+                            conversation.usage?.contextUsed !== undefined
+                              ? conversation.usage
+                              : (readyUsage ?? conversation.usage)
+                          }
+                          sessionUsage={sessionUsage}
+                          files={hudFiles}
+                        />
+                      }
                       value={draft}
                       onChange={setDraft}
                       phase={phase}
                       turnActive={conversation.turnActive}
                       usage={conversation.usage}
+                      showContextMeter={false}
                       onSend={() => void send()}
                       onCancel={requestStop}
                       attachments={attachments}
@@ -831,6 +1256,7 @@ export function AssistantSessionPage() {
                       config={conversation.config satisfies ComposerConfig}
                       onConfigSet={(set) => void configSet(set)}
                       commands={conversation.commands}
+                      decisionReady={decisionReady ?? undefined}
                     />
                   </div>
                 </div>
